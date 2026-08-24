@@ -1,0 +1,260 @@
+"""Human-in-the-loop clarification gate (flexible option lists)."""
+
+from __future__ import annotations
+
+import re
+import threading
+import time
+from dataclasses import dataclass, field
+from typing import Any, Optional
+
+CUSTOM_CHOICE_KEY = "custom"
+MIN_ASK_OPTIONS = 2
+MAX_ASK_OPTIONS = 12
+
+# 1. / 1) / A. / A) / A、 / A：option text
+_OPTION_LINE_RE = re.compile(
+    r"^\s*(\d+|[A-Za-z])[\.\)、:：]\s*(.+?)\s*$",
+    re.MULTILINE,
+)
+_TRAILING_PROMPT_RE = re.compile(r"(你是想|请选择|你想|你想要|请选)[：:]\s*$")
+
+# Must look like the model is asking the user to pick, not listing facts/tasks.
+_CHOICE_CUE_RE = re.compile(
+    r"(请选择|请选|选一个|选哪|哪个|哪项|哪一个|还是|或者选|"
+    r"你想要哪|你更倾向|确认一下|要哪一种|"
+    r"which\s+(one|option)|please\s+choose|pick\s+one|"
+    r"do\s+you\s+want|would\s+you\s+rather)",
+    re.IGNORECASE,
+)
+
+# Numbered lists that are answers/summaries, not clarifications.
+_SUMMARY_CUE_RE = re.compile(
+    r"(如下|以下|包括|提出了|提到了|总结|回顾|任务有|任务是|"
+    r"做过|完成了|已经|本轮|本次对话|当前对话|历史|"
+    r"as\s+follows|here\s+are|the\s+tasks|you\s+asked)",
+    re.IGNORECASE,
+)
+
+
+@dataclass
+class AskRequest:
+    id: str
+    question: str
+    options: list[dict[str, str]]
+    allow_custom: bool = True
+    custom_label: str = "其他（请补充）"
+    created_at: float = field(default_factory=time.time)
+
+
+class AskGate:
+    """Blocks worker threads until the UI answers a clarification question."""
+
+    def __init__(self, timeout_sec: float = 600.0) -> None:
+        self.timeout_sec = timeout_sec
+        self._lock = threading.Lock()
+        self._events: dict[str, threading.Event] = {}
+        self._answers: dict[str, str] = {}
+        self._pending: dict[str, AskRequest] = {}
+
+    def request(
+        self,
+        ask_id: str,
+        question: str,
+        options: list[dict[str, str]],
+        *,
+        allow_custom: bool = True,
+        custom_label: str = "其他（请补充）",
+    ) -> str:
+        ev = threading.Event()
+        req = AskRequest(
+            id=ask_id,
+            question=question,
+            options=options,
+            allow_custom=allow_custom,
+            custom_label=custom_label,
+        )
+        with self._lock:
+            self._events[ask_id] = ev
+            self._pending[ask_id] = req
+            self._answers.pop(ask_id, None)
+        ok = ev.wait(timeout=self.timeout_sec)
+        with self._lock:
+            answer = self._answers.pop(ask_id, "") if ok else ""
+            self._events.pop(ask_id, None)
+            self._pending.pop(ask_id, None)
+        if not ok:
+            return "ERROR: user did not answer (timeout) — proceed with a reasonable default or ask again briefly."
+        if not answer:
+            return "ERROR: user cancelled the clarification — proceed with a reasonable default or stop."
+        return answer
+
+    def answer(
+        self,
+        ask_id: str,
+        *,
+        choice: str,
+        text: str = "",
+        option_label: str = "",
+    ) -> bool:
+        """Resolve a pending ask. choice is an option key or 'custom' for free-form text."""
+        choice_key = (choice or "").strip()
+        with self._lock:
+            ev = self._events.get(ask_id)
+            req = self._pending.get(ask_id)
+            if not ev:
+                return True  # already resolved
+
+            label = (option_label or "").strip()
+            if not label and req:
+                for opt in req.options:
+                    if str(opt.get("key") or "") == choice_key:
+                        label = str(opt.get("label") or "").strip()
+                        break
+
+            if choice_key == CUSTOM_CHOICE_KEY:
+                custom = (text or "").strip()
+                if custom:
+                    payload = f"User answered (custom): {custom}"
+                else:
+                    fallback = label or (req.custom_label if req else "其他")
+                    payload = f"User chose custom: {fallback} (no extra details)"
+            elif choice_key:
+                extra = (text or "").strip()
+                if label:
+                    payload = (
+                        f"User chose {choice_key}: {label}"
+                        + (f" — {extra}" if extra and extra != label else "")
+                    )
+                elif extra:
+                    payload = f"User chose {choice_key}: {extra}"
+                else:
+                    payload = f"User chose {choice_key}"
+            else:
+                custom = (text or "").strip()
+                payload = custom or "User answered: (empty)"
+
+            self._answers[ask_id] = payload
+            ev.set()
+            return True
+
+    def cancel_all(self) -> None:
+        with self._lock:
+            ids = list(self._events.keys())
+        for ask_id in ids:
+            with self._lock:
+                ev = self._events.get(ask_id)
+                if not ev:
+                    continue
+                self._answers[ask_id] = ""
+                ev.set()
+
+    def pending(self) -> list[dict[str, Any]]:
+        with self._lock:
+            return [
+                {
+                    "id": r.id,
+                    "question": r.question,
+                    "options": r.options,
+                    "allow_custom": r.allow_custom,
+                    "custom_label": r.custom_label,
+                    "created_at": r.created_at,
+                }
+                for r in self._pending.values()
+            ]
+
+
+def normalize_option_labels(raw: Any) -> list[str]:
+    """Coerce tool args into a clean list of option labels."""
+    if raw is None:
+        return []
+    if isinstance(raw, str):
+        text = raw.strip()
+        if not text:
+            return []
+        try:
+            import json
+
+            parsed = json.loads(text)
+            if isinstance(parsed, list):
+                return normalize_option_labels(parsed)
+        except Exception:
+            pass
+        return [text]
+    if not isinstance(raw, list):
+        return []
+    out: list[str] = []
+    for item in raw:
+        if item is None:
+            continue
+        if isinstance(item, dict):
+            label = str(item.get("label") or item.get("text") or item.get("value") or "").strip()
+        else:
+            label = str(item).strip()
+        if label:
+            out.append(label)
+    return out
+
+
+def build_ask_options(labels: list[str]) -> list[dict[str, str]]:
+    """Assign stable numeric keys 1..n to option labels."""
+    clean = [str(x).strip() for x in labels if str(x).strip()]
+    if len(clean) > MAX_ASK_OPTIONS:
+        clean = clean[:MAX_ASK_OPTIONS]
+    return [{"key": str(i), "label": label} for i, label in enumerate(clean, start=1)]
+
+
+def try_parse_inline_ask(text: str) -> Optional[dict[str, Any]]:
+    """If the model wrote a real multiple-choice clarification in plain text, parse it.
+
+    Enumerations of past tasks / facts (e.g. listing what the user already asked)
+    must NOT become an ask_user dialog.
+    """
+    raw = (text or "").strip()
+    if not raw or len(raw) < 8:
+        return None
+    matches = _OPTION_LINE_RE.findall(raw)
+    if len(matches) < MIN_ASK_OPTIONS:
+        return None
+
+    ordered: list[tuple[str, str]] = []
+    seen: set[str] = set()
+    for key, label in matches:
+        token = key.strip()
+        if token in seen:
+            continue
+        seen.add(token)
+        ordered.append((token, label.strip()))
+    if len(ordered) < MIN_ASK_OPTIONS:
+        return None
+
+    first = re.search(
+        r"^\s*(?:\d+|[A-Za-z])[\.\)、:：]",
+        raw,
+        re.MULTILINE,
+    )
+    question = raw[: first.start()].strip() if first else raw
+    question = _TRAILING_PROMPT_RE.sub("", question).strip()
+    question = re.sub(r"[\U0001F300-\U0001FAFF\U00002600-\U000027BF]+", "", question).strip()
+    if not question:
+        question = "请选择一个选项"
+
+    probe = f"{question}\n{raw[:400]}"
+    if _SUMMARY_CUE_RE.search(probe) and not _CHOICE_CUE_RE.search(probe):
+        return None
+    if not _CHOICE_CUE_RE.search(probe):
+        return None
+
+    labels = [label for _, label in ordered[:MAX_ASK_OPTIONS]]
+    allow_custom = any(k.upper() == "D" for k, _ in ordered) or any(
+        "其他" in lbl or "自定义" in lbl for _, lbl in ordered
+    )
+    return {
+        "question": question,
+        "options": labels,
+        "allow_custom": allow_custom,
+    }
+
+
+# Backward-compatible alias
+try_parse_inline_mcq = try_parse_inline_ask

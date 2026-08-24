@@ -1,0 +1,19 @@
+{
+  "name": "sidekick-desktop",
+  "private": true,
+  "version": "0.3.1",
+  "description": "Sidekick desktop shell — live embedded browser (Electron BrowserView)",
+  "author": "Sidekick",
+  "main": "main.mjs",
+  "type": "module",
+  "scripts": {
+    "start": "electron .",
+    "dev": "electron . --dev",
+    "dist": "electron-builder --win",
+    "dist:dir": "electron-builder --win dir"
+  },
+  "devDependencies": {
+    "electron": "^35.0.0",
+    "electron-builder": "^26.0.12"
+  }
+}

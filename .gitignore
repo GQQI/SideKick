@@ -1,0 +1,62 @@
+# Secrets & local env
+.env
+src/data/model.json
+src/data/workspace.json
+src/data/.local_token
+src/data/.secret_key
+src/data/auth_tokens.json
+src/data/users.json
+src/data/tenants/
+
+# Runtime data (do not commit)
+src/sessions/*
+!src/sessions/.gitkeep
+src/data/fs_undo/
+src/memory/**
+!src/memory/MEMORY.md
+src/workspace/**
+!src/workspace/.gitkeep
+
+# Legacy / accidental runtime root (never commit)
+backend/
+
+# User-installed skills (keep only the placeholder)
+src/skills/**
+!src/skills/.gitkeep
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+.venv/
+venv/
+.pytest_cache/
+tests/.scratch/
+*.log
+
+# Per-workspace codebase index
+**/.sidekick/
+
+# UI
+ui/node_modules/
+ui/dist/
+frontend/
+
+# Desktop (Electron)
+desktop/node_modules/
+desktop/dist/
+
+# Windows offline installer payload (rebuilt by scripts/build-windows.ps1)
+packaging/windows/cache/
+packaging/windows/payload/
+
+# Local Python interpreter tip (machine-specific)
+.sidekick-python
+scripts/.ensure-python.tmp
+
+# OS / editor
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
+*.swp

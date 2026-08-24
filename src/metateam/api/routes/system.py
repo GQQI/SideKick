@@ -1,0 +1,178 @@
+"""Health, bootstrap, model, MCP, skills, memory."""
+
+from __future__ import annotations
+
+from typing import Any
+
+from fastapi import APIRouter, HTTPException, Request
+
+from ...core.config import get_settings
+from ...runtime.tools import skill_tool_name
+from ...services.mcp_config import McpServerConfig, load_mcp_config, update_mcp_config
+from ...services.mcp_runtime import test_server as mcp_test_server
+from ...services.memory import read_memory, write_memory
+from ...services.model_config import load_model_config, select_model_role, update_model_config
+from ...services.local_auth import get_token
+from ...services.skills import load_skills
+from ...services.store import STORE
+from ...services.user_auth import auth_status
+from ...services.workspace_store import get_active_workspace
+from ..http import require_loopback
+from ..schemas import McpTestBody, McpUpdateBody, MemoryUpdate, ModelSelect, ModelUpdate
+
+router = APIRouter(tags=["system"])
+
+
+@router.get("/api/health")
+def health() -> dict[str, Any]:
+    s = get_settings()
+    active = get_active_workspace()
+    configured = bool(active.get("configured"))
+    return {
+        "ok": True,
+        "demo": s.demo_mode,
+        "model": s.model,
+        "base_url": s.base_url,
+        "provider": getattr(s, "provider", ""),
+        "workspace": str(active.get("path") or ""),
+        "workspace_configured": configured,
+        "thinking_enabled": getattr(s, "thinking_enabled", False),
+        "reasoning_effort": getattr(s, "reasoning_effort", ""),
+        "context_limit": s.context_limit,
+        "compress_trigger_ratio": s.compress_trigger_ratio,
+        "allow_shell": bool(getattr(s, "allow_shell", False)),
+        "shell_sandbox": bool(getattr(s, "shell_sandbox", True)),
+        "mcp_enabled": bool(getattr(s, "mcp_enabled", True)),
+    }
+
+
+@router.get("/api/bootstrap")
+def bootstrap(request: Request) -> dict[str, Any]:
+    require_loopback(request)
+    status = auth_status()
+    if status["needs_setup"]:
+        return {
+            **status,
+            "token": get_token(),
+            "token_header": "X-Sidekick-Token",
+            "auth_required": False,
+        }
+    return {
+        **status,
+        "token": None,
+        "token_header": "X-Sidekick-Token",
+        "auth_required": True,
+    }
+
+
+@router.get("/api/mcp")
+def api_mcp_get() -> dict[str, Any]:
+    return load_mcp_config().public_dict()
+
+
+@router.put("/api/mcp")
+def api_mcp_put(body: McpUpdateBody) -> dict[str, Any]:
+    setup = update_mcp_config(body.model_dump())
+    return {"status": "ok", **setup.public_dict()}
+
+
+@router.post("/api/mcp/test")
+def api_mcp_test(body: McpTestBody) -> dict[str, Any]:
+    server = McpServerConfig(
+        id=body.id or "test",
+        name=body.name or body.id or "test",
+        transport=body.transport or "stdio",
+        command=body.command or "",
+        args=list(body.args or []),
+        env=dict(body.env or {}),
+        url=body.url or "",
+        headers=dict(body.headers or {}),
+        enabled=True,
+    )
+    return mcp_test_server(server)
+
+
+@router.get("/api/model")
+def get_model() -> dict[str, Any]:
+    return load_model_config().masked()
+
+
+@router.put("/api/model")
+def put_model(body: ModelUpdate) -> dict[str, Any]:
+    patch = {k: v for k, v in body.model_dump().items() if v is not None}
+    cfg = update_model_config(patch)
+    STORE.refresh_settings(rebind_llm=True, rebind_workspace=False)
+    mode = "demo" if cfg.demo_mode else "api"
+    _, model_name, _, _ = cfg.resolve(cfg.main)
+    return {
+        "status": "ok",
+        "config": cfg.masked(),
+        "note": (
+            "已保存（Demo 模式）。"
+            if cfg.demo_mode
+            else f"已保存并生效（{mode} · {model_name or 'model'}）。"
+        ),
+    }
+
+
+@router.patch("/api/model/select")
+def patch_model_select(body: ModelSelect) -> dict[str, Any]:
+    try:
+        cfg = select_model_role(body.role, body.provider_id, body.model)
+    except ValueError as exc:
+        raise HTTPException(400, str(exc)) from exc
+    STORE.refresh_settings(rebind_llm=True, rebind_workspace=False)
+    _, model_name, _, _ = cfg.resolve(
+        cfg.main if body.role == "main" else cfg.subagent if body.role == "subagent" else cfg.compress
+    )
+    return {
+        "status": "ok",
+        "config": cfg.masked(),
+        "note": f"已切换 {body.role} → {model_name}",
+    }
+
+
+@router.get("/api/skills")
+def api_skills() -> list[dict[str, Any]]:
+    s = get_settings()
+    skills = load_skills(s.skills_dir)
+    return [
+        {
+            "name": sk.name,
+            "tool": skill_tool_name(sk.name),
+            "description": sk.description,
+            "path": str(sk.path),
+            "mode": "function_call",
+        }
+        for sk in skills
+    ]
+
+
+@router.get("/api/skills/{name}")
+def api_skill(name: str) -> dict[str, Any]:
+    s = get_settings()
+    skills = load_skills(s.skills_dir)
+    for sk in skills:
+        if sk.name == name or skill_tool_name(sk.name) == name:
+            return {
+                "name": sk.name,
+                "tool": skill_tool_name(sk.name),
+                "description": sk.description,
+                "path": str(sk.path),
+                "body": sk.read_body(),
+                "mode": "function_call",
+            }
+    raise HTTPException(404, "skill not found")
+
+
+@router.get("/api/memory")
+def api_memory() -> dict[str, str]:
+    s = get_settings()
+    return {"content": read_memory(s.memory_file, max_chars=100_000)}
+
+
+@router.put("/api/memory")
+def api_memory_put(body: MemoryUpdate) -> dict[str, str]:
+    s = get_settings()
+    write_memory(s.memory_file, body.content)
+    return {"status": "ok"}

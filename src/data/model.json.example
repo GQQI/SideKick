@@ -1,0 +1,40 @@
+{
+  "version": 3,
+  "providers": [
+    {
+      "id": "prov_deepseek_example",
+      "name": "DeepSeek",
+      "vendor": "deepseek",
+      "market_id": "deepseek",
+      "models": [
+        {
+          "id": "mdl_chat",
+          "name": "deepseek-chat",
+          "base_url": "https://api.deepseek.com",
+          "api_key": ""
+        },
+        {
+          "id": "mdl_reasoner",
+          "name": "deepseek-reasoner",
+          "base_url": "https://api.deepseek.com",
+          "api_key": ""
+        }
+      ]
+    }
+  ],
+  "main": {
+    "provider_id": "prov_deepseek_example",
+    "model_id": "mdl_chat"
+  },
+  "subagent": {
+    "provider_id": "prov_deepseek_example",
+    "model_id": "mdl_chat"
+  },
+  "compress": {
+    "provider_id": "prov_deepseek_example",
+    "model_id": "mdl_chat"
+  },
+  "reasoning_effort": "medium",
+  "thinking_enabled": true,
+  "temperature": 0.2
+}

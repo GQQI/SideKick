@@ -1,0 +1,40 @@
+appId: com.sidekick.desktop
+productName: Sidekick
+copyright: Copyright © Sidekick
+asar: true
+directories:
+  output: dist
+  buildResources: build
+files:
+  - main.mjs
+  - preload.cjs
+  - select-bootstrap.cjs
+  - package.json
+extraResources:
+  - from: ../packaging/windows/payload
+    to: sidekick
+    filter:
+      - "**/*"
+win:
+  target:
+    - target: nsis
+      arch:
+        - x64
+    - target: zip
+      arch:
+        - x64
+  artifactName: ${productName}-${version}-win-${arch}.${ext}
+nsis:
+  oneClick: false
+  perMachine: false
+  allowToChangeInstallationDirectory: true
+  allowElevation: true
+  createDesktopShortcut: true
+  createStartMenuShortcut: true
+  shortcutName: Sidekick
+  uninstallDisplayName: Sidekick
+  deleteAppDataOnUninstall: false
+  installerLanguages:
+    - zh_CN
+    - en_US
+  artifactName: ${productName}-Setup-${version}-win-${arch}.exe
