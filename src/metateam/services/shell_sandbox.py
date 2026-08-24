@@ -1,4 +1,4 @@
-"""Claude Code–style shell sandbox: real disk, path allowlist (not a copy FS).
+"""Path-allowlist shell sandbox: real disk, not a copy filesystem.
 
 Bash/cmd still runs with cwd=workspace on the host. We only restrict which
 paths the command may touch (heuristic scan + cwd fence) and scrub the env.

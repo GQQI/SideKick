@@ -77,8 +77,8 @@ export const BASE_COMMANDS: SlashCommandDef[] = [
     id: "memory",
     name: "memory",
     aliases: ["mem"],
-    description: "查看记忆；可加 edit / refresh",
-    argsHint: "[edit|refresh]",
+    description: "打开记忆库；可加 refresh",
+    argsHint: "[refresh]",
   },
   {
     id: "model",

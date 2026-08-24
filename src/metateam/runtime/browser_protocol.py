@@ -10,7 +10,7 @@ from pydantic import BaseModel, Field
 PROTOCOL_VERSION = 1
 DOM_ELEMENT_KIND = "dom-element"
 
-# Keep computed styles short for token budget (aligned with VS Code attachCSS idea).
+# Keep computed styles short for token budget.
 STYLE_KEYS = (
     "display",
     "position",

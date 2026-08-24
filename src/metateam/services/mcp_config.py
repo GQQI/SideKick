@@ -1,6 +1,6 @@
 """Per-tenant MCP server configuration (stdio + remote http/sse).
 
-Aligned with Cursor / Claude Code mcp.json shapes:
+mcp.json shapes:
 - Local:  { command, args, env }
 - Remote: { type: http|sse, url, headers }
 """

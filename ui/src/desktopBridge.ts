@@ -1,4 +1,4 @@
-/** Electron desktop bridge — Cursor-style live BrowserView. */
+/** Electron desktop bridge for a live BrowserView overlay. */
 
 import type { DomElementPayload } from "./browser/protocol";
 

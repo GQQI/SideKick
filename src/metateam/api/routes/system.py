@@ -10,7 +10,13 @@ from ...core.config import get_settings
 from ...runtime.tools import skill_tool_name
 from ...services.mcp_config import McpServerConfig, load_mcp_config, update_mcp_config
 from ...services.mcp_runtime import test_server as mcp_test_server
-from ...services.memory import read_memory, write_memory
+from ...services.memory import (
+    library_from_payload,
+    load_library,
+    read_memory,
+    save_library,
+    write_memory,
+)
 from ...services.model_config import load_model_config, select_model_role, update_model_config
 from ...services.local_auth import get_token
 from ...services.skills import load_skills
@@ -18,7 +24,7 @@ from ...services.store import STORE
 from ...services.user_auth import auth_status
 from ...services.workspace_store import get_active_workspace
 from ..http import require_loopback
-from ..schemas import McpTestBody, McpUpdateBody, MemoryUpdate, ModelSelect, ModelUpdate
+from ..schemas import MemoryLibraryUpdate, McpTestBody, McpUpdateBody, MemoryUpdate, ModelSelect, ModelUpdate
 
 router = APIRouter(tags=["system"])
 
@@ -176,3 +182,17 @@ def api_memory_put(body: MemoryUpdate) -> dict[str, str]:
     s = get_settings()
     write_memory(s.memory_file, body.content)
     return {"status": "ok"}
+
+
+@router.get("/api/memory/library")
+def api_memory_library() -> dict[str, Any]:
+    s = get_settings()
+    return load_library(s.memory_file).to_dict()
+
+
+@router.put("/api/memory/library")
+def api_memory_library_put(body: MemoryLibraryUpdate) -> dict[str, Any]:
+    s = get_settings()
+    lib = library_from_payload({"version": body.version, "categories": body.categories})
+    saved = save_library(s.memory_file, lib)
+    return {"status": "ok", "library": saved.to_dict()}

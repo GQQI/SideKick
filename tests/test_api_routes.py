@@ -16,6 +16,7 @@ def test_app_registers_core_routes() -> None:
         "/api/git/remote",
         "/api/git/file-diff",
         "/api/git/review",
+        "/api/memory/library",
         "/api/files/undo",
         "/api/sessions/{session_id}/events",
     ):

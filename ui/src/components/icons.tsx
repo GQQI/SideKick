@@ -275,3 +275,37 @@ export function IconCube(p: IconProps) {
     </svg>
   );
 }
+
+export function IconBook(p: IconProps) {
+  return (
+    <svg {...base(p)}>
+      <path d="M5 4.5A1.5 1.5 0 0 1 6.5 3H19v16H6.5A1.5 1.5 0 0 0 5 20.5V4.5Z" {...stroke} />
+      <path d="M5 19.5A1.5 1.5 0 0 1 6.5 18H19" {...stroke} />
+    </svg>
+  );
+}
+
+export function IconPencil(p: IconProps) {
+  return (
+    <svg {...base(p)}>
+      <path d="M13 5.5 18.5 11M4 20l3.2-.7L19 7.5 13.5 2 4.7 10.8 4 20Z" {...stroke} />
+    </svg>
+  );
+}
+
+export function IconEye(p: IconProps) {
+  return (
+    <svg {...base(p)}>
+      <path d="M2 12s3.5-7 10-7 10 7 10 7-3.5 7-10 7S2 12 2 12Z" {...stroke} />
+      <circle cx="12" cy="12" r="3" {...stroke} />
+    </svg>
+  );
+}
+
+export function IconEyeOff(p: IconProps) {
+  return (
+    <svg {...base(p)}>
+      <path d="M3 3l18 18M10.6 10.6A3 3 0 0 0 12 15a3 3 0 0 0 2.4-1.2M9.9 5.1A11 11 0 0 1 12 5c6.5 0 10 7 10 7a18 18 0 0 1-2.2 3.1M6.1 6.1C3.6 8 2 12 2 12s3.5 7 10 7a10 10 0 0 0 4.2-.9" {...stroke} />
+    </svg>
+  );
+}

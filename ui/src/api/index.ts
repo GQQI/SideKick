@@ -310,6 +310,31 @@ export const saveMemory = (content: string) =>
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({ content }),
   });
+export type MemoryItem = {
+  id: string;
+  title: string;
+  content: string;
+  tags: string[];
+  enabled: boolean;
+  updated_at?: number;
+};
+export type MemoryCategory = {
+  id: string;
+  name: string;
+  memories: MemoryItem[];
+};
+export type MemoryLibrary = {
+  version: number;
+  categories: MemoryCategory[];
+};
+
+export const fetchMemoryLibrary = () => json<MemoryLibrary>("/api/memory/library");
+export const saveMemoryLibrary = (library: MemoryLibrary) =>
+  json<{ status: string; library: MemoryLibrary }>("/api/memory/library", {
+    method: "PUT",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(library),
+  });
 export const fetchModel = async () =>
   normalizeModelSetup(await json<unknown>("/api/model"));
 

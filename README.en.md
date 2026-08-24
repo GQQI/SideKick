@@ -2,11 +2,10 @@
 
 [中文](README.md) · English
 
-**Sidekick** is an open-source **local multi-agent AI workspace** you run on your own machine.
-Open a folder, chat in the browser, and let a main agent plus sub-agents search and edit files — with human approval, Skills you can drop in, and Memory that sticks.
+**Sidekick** is an open-source **local multi-agent platform**.
+Open a folder, chat in the browser, and let a main agent plus sub-agents search and edit files — with human approval. Drop in Skills, keep a tagged Memory library.
 
-Built to be **forked**: clear Python + Vite layers, add a Skill or tool without fighting a black box.
-Built to be **cheap to run**: context compression, on-demand Skills, and separate main / sub / compress models so the same work burns far fewer tokens.
+Built to be **forked**: clear Python + Vite layers. Add a Skill or register a tool and you have a private workbench, without fighting a black box.
 
 **Windows · macOS · Linux** · default **http://127.0.0.1:8787**
 
@@ -16,23 +15,28 @@ Built to be **cheap to run**: context compression, on-demand Skills, and separat
 
 ![Workbench](docs/screenshots/workbench.jpg)
 
-![Dark mode](docs/screenshots/dark-mode.jpg)
-
 ---
 
-## Why Sidekick
+## Why fork this
 
 **Fork-friendly**  
-`src/` core runtime + `ui/` control interface (OpenClaw-style layout). API, agent runtime, tools, Skills, and Memory are separate layers — ship a private fork by dropping Skills or registering tools.
+`src/metateam/` is the runtime (API, agents, tools). `ui/` is the control interface. Skills, Memory, and model config are separate layers — ship a private fork by restyling the UI or adding tools.
+
+Typical customizations:
+
+- **Add a Skill** — drop a folder into `src/skills/`, invoke with `/skill <name>`
+- **Add a tool** — register a function in `src/metateam/runtime/tools.py`
+- **Restyle** — `ui/src/` and `ui/src/styles/app.css` (no backend change)
+- **Connect a model** — any OpenAI-compatible gateway (base URL + API key + model name)
 
 **Token-efficient**  
-Compress when the context fills (capped rounds). Skills are callable tools, not giant prompts pasted every turn. Point heavy work at a strong model and delegation / compression at cheaper ones.
+Compress when the context fills. Skills are callable tools, not giant prompts pasted every turn. Point heavy work at a strong model and delegation / compression at cheaper ones.
 
 **Workspace-native**  
 Content search, streaming chat, and a detail panel in one UI. Mutating actions (write, delete, shell, memory) ask for approval first.
 
 **Yours**  
-Runs locally. Bring your own API key. History, Memory, and workspace stay on disk you control.
+Runs locally. Bring your own API key (any OpenAI-compatible endpoint). History, Memory, and workspace stay on disk you control.
 
 ---
 
@@ -42,10 +46,10 @@ Runs locally. Bring your own API key. History, Memory, and workspace stay on dis
 |---|---|
 | **Chat + tools** | SSE streaming, attachments, stop cleanly, edit & resend (optionally restore files to that step) |
 | **Files** | Create / rename / delete (confirm) / drag-move; search by name **and** content with line jump |
-| **Browser sandbox** | Desktop: live Electron BrowserView; Web: Playwright screenshots; Select Mode → chat; agent `browser_*` tools |
-| **Memory** | Append, remove, or rewrite `MEMORY.md` (approval required) |
+| **Browser sandbox** | Preview local sites; Select Mode → chat; agent `browser_*` tools |
+| **Memory** | Category library; toggle which notes inject on the next turn |
 | **Skills** | Drop packs under `src/skills/`, invoke with `/skill <name>` |
-| **Models** | Separate main, sub-agent, and compress models |
+| **Models** | Any OpenAI-compatible API; separate main, sub-agent, and compress models |
 | **UI** | Chinese / English · light / dark · paginated history |
 
 ### Slash commands
@@ -85,31 +89,25 @@ python3 -m pip install -r requirements.txt
 python3 main.py
 ```
 
-Open **http://127.0.0.1:8787** → pick a workspace folder → Settings → Model → API key
+Open **http://127.0.0.1:8787** → pick a workspace folder → Settings → Model → paste an OpenAI-compatible base URL and API key.
 
-### Desktop app (live embedded browser)
+### Desktop app
 
-Double-click **`start-desktop.bat`** to create a project-local **`.venv`** (via `uv` / `py` / `python`), install Python deps and Playwright Chromium if needed, install desktop/UI npm packages, build the UI, and launch Electron with a **live BrowserView** preview (not screenshots). No machine-specific conda paths — clone and re-run on a new machine.
+Double-click **`start-desktop.bat`** to install deps and launch Electron with a live preview sidebar.
 
 ```powershell
 .\start-desktop.bat
 ```
 
-Optional override: `SIDEKICK_PYTHON` or `.sidekick-python`. Prefer `http://localhost:PORT` for local Vite apps on Windows.
-
 See [desktop/README.md](desktop/README.md) · [docs/browser-sandbox.md](docs/browser-sandbox.md).
 
 ### Windows offline installer (.exe)
 
-Build once on an **online Windows PC**, then copy the Setup exe to machines that have no internet and no Python/Node:
+Build once on an online Windows PC, then copy the Setup exe:
 
 ```powershell
 .\scripts\build-windows.bat
 ```
-
-Output: `desktop/dist/Sidekick-Setup-<version>-win-x64.exe` (plus a portable zip).
-
-Install needs no network. Chat still needs a model API (cloud, or LAN/local Ollama). Data lives in `%APPDATA%\Sidekick\`.
 
 See [packaging/windows/README.md](packaging/windows/README.md).
 
@@ -118,10 +116,9 @@ See [packaging/windows/README.md](packaging/windows/README.md).
 ### Local security (defaults)
 
 - Binds `127.0.0.1` only; non-loopback bind requires `META_ALLOW_REMOTE=1` (unsafe).
-- API requires a local token (`X-Sidekick-Token`, stored in `src/data/.local_token`); the UI fetches it via `/api/bootstrap`.
-- API keys in `model.json` are encrypted at rest (`src/data/.secret_key`).
-- Shell tools are on by default (`META_ALLOW_SHELL=1`) and still go through the agent approval gate; set `0` to disable entirely.
-- **Approval boundary:** ApprovalGate covers agent tool calls; UI file writes rely on the local token plus in-app confirm dialogs.
+- API requires a local token; the UI fetches it via `/api/bootstrap`.
+- API keys in `model.json` are encrypted at rest.
+- Shell tools are on by default and still go through the approval gate; set `META_ALLOW_SHELL=0` to disable.
 
 ### UI (optional)
 
@@ -167,19 +164,21 @@ flowchart TB
 Sidekick/
 ├── src/metateam/     # core: API, agents, tools
 ├── src/skills/       # drop-in Skills
-├── src/memory/       # MEMORY.md
+├── src/memory/       # memory library (user notes not committed)
 ├── src/data/         # model.json.example (no secrets)
 ├── src/sessions/     # sessions (local, not committed)
 ├── src/workspace/    # default workspace placeholder
 ├── ui/               # Vite control UI
-├── desktop/          # Electron shell (live embedded browser)
-├── packaging/windows/# offline installer notes (build artifacts not committed)
-├── scripts/          # Python bootstrap, Windows packager
+├── desktop/          # Electron shell
+├── packaging/windows/# offline installer notes
+├── scripts/
 ├── docs/
 ├── main.py
 ├── start.bat
-├── start-desktop.bat # one-click deps + desktop
+├── start-desktop.bat
 ├── requirements.txt
 ├── README.md
 └── README.en.md
 ```
+
+Fork it, restyle it, add Skills — make it your own multi-agent workbench.

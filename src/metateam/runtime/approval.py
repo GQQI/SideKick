@@ -194,15 +194,17 @@ def summarize_tool_call(name: str, args: dict[str, Any]) -> str:
         return f"保存技能 {args.get('name') or ''}"
     if name == "memory_append":
         note = str(args.get("note") or "")
-        return f"追加记忆: {_short(note, 80)}"
+        cat = str(args.get("category") or "")
+        return f"追加记忆{(' · ' + cat) if cat else ''}: {_short(note, 80)}"
     if name == "memory_remove":
-        match = str(args.get("match") or "")
-        return f"删除记忆: {_short(match, 80)}"
+        return f"删除记忆: {_short(str(args.get('memory_id') or args.get('match') or ''), 80)}"
     if name == "memory_write":
-        content = str(args.get("content") or "")
-        return f"覆写记忆（{len(content)} 字符）"
+        title = str(args.get("title") or args.get("memory_id") or "")
+        return f"写入记忆{(' · ' + title) if title else ''}（{len(str(args.get('content') or ''))} 字符）"
     if name == "memory_read":
-        return "读取记忆"
+        return "读取记忆库"
+    if name == "memory_list":
+        return "列出记忆库"
     if name == "delegate_task":
         goal = str(args.get("goal") or args.get("task") or "")
         return f"委派: {_short(goal, 80)}"

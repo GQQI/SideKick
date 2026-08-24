@@ -110,6 +110,8 @@ export type MessageActionsDeps = {
   editRestorePrompt: { msgId: string; text: string; keepUserTurns: number } | null;
   setCopiedId: React.Dispatch<React.SetStateAction<string | null>>;
   openSettings: (tab?: SettingsTab) => void;
+  openMemory: () => void;
+  openChat: () => void;
   openHistoryPanel: () => void;
   refreshSessions: (page?: number) => Promise<void>;
   applySessionDetail: (detail: import("../api").SessionDetail) => void;
@@ -148,7 +150,7 @@ export function useMessageActions(deps: MessageActionsDeps) {
     setSessionsTotal, setSessionsTotalPages, setSidePanel, setExplorerCollapsed, setDetail,
     setLive, setSubs, setApproval, setAskPrompt, setAskChoice, setAskOtherText,
     setEditingId, setEditDraft, setEditRestorePrompt, editDraft, editRestorePrompt,
-    setCopiedId, openSettings, openHistoryPanel, refreshSessions, applySessionDetail,
+    setCopiedId, openSettings, openMemory, openChat, openHistoryPanel, refreshSessions, applySessionDetail,
     resetContextUsage, commit, appendMsg, transcriptRef, busyRef, streamIdRef,
     streamTextRef, streamReasoningRef, nativeReasoningRef, enqueueMessage, clearQueued,
     sendChat, stopChat,
@@ -390,23 +392,13 @@ async function runSlashCommand(raw: string): Promise<boolean> {
     }
     case "memory": {
       const sub = args.toLowerCase();
-      if (sub === "edit" || sub === "open") {
-        openSettings("memory");
-        return true;
-      }
       if (sub === "refresh") {
         const text = await fetchMemory();
         setMemory(text);
         setToast("记忆已刷新。");
         return true;
       }
-      const text = (await fetchMemory()).trim();
-      setMemory(text);
-      postSystem(
-        text
-          ? `当前记忆（MEMORY.md）：\n\n\`\`\`md\n${text.slice(0, 6000)}${text.length > 6000 ? "\n…" : ""}\n\`\`\`\n\n输入 \`/memory edit\` 打开编辑。`
-          : "记忆为空。输入 `/memory edit` 打开编辑。",
-      );
+      openMemory();
       return true;
     }
     case "model":
@@ -440,7 +432,7 @@ async function runSlashCommand(raw: string): Promise<boolean> {
       setToast(t("navBrowser"));
       return true;
     case "settings":
-      openSettings(args === "model" ? "model" : args === "memory" ? "memory" : "workspace");
+      openSettings(args === "model" ? "model" : "workspace");
       return true;
     default:
       postSystem(`命令 \`/${def.name}\` 尚未实现。`);

@@ -116,7 +116,7 @@ export function BrowserPanel({ onPickElement, openRequest }: Props) {
     void refreshStatus();
   }, [refreshStatus]);
 
-  // Live BrowserView lifecycle + bounds sync (Cursor-style overlay).
+  // Live BrowserView lifecycle + bounds sync.
   useEffect(() => {
     if (!live || !desktop) return;
     void showLive();

@@ -2,37 +2,31 @@
   "version": 3,
   "providers": [
     {
-      "id": "prov_deepseek_example",
-      "name": "DeepSeek",
-      "vendor": "deepseek",
-      "market_id": "deepseek",
+      "id": "prov_openai_compat",
+      "name": "OpenAI-API-Compatible",
+      "vendor": "openai",
+      "market_id": "custom",
       "models": [
         {
-          "id": "mdl_chat",
-          "name": "deepseek-chat",
-          "base_url": "https://api.deepseek.com",
-          "api_key": ""
-        },
-        {
-          "id": "mdl_reasoner",
-          "name": "deepseek-reasoner",
-          "base_url": "https://api.deepseek.com",
+          "id": "mdl_main",
+          "name": "gpt-4o",
+          "base_url": "https://api.openai.com/v1",
           "api_key": ""
         }
       ]
     }
   ],
   "main": {
-    "provider_id": "prov_deepseek_example",
-    "model_id": "mdl_chat"
+    "provider_id": "prov_openai_compat",
+    "model_id": "mdl_main"
   },
   "subagent": {
-    "provider_id": "prov_deepseek_example",
-    "model_id": "mdl_chat"
+    "provider_id": "prov_openai_compat",
+    "model_id": "mdl_main"
   },
   "compress": {
-    "provider_id": "prov_deepseek_example",
-    "model_id": "mdl_chat"
+    "provider_id": "prov_openai_compat",
+    "model_id": "mdl_main"
   },
   "reasoning_effort": "medium",
   "thinking_enabled": true,

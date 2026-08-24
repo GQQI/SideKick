@@ -165,8 +165,8 @@ export function McpSettings({ onToast }: Props) {
       <header className="settings-pane-intro">
         <h3>MCP</h3>
         <p className="hint">
-          对齐 Cursor / Claude Code：本地用 <code>command + args</code>，远程用{" "}
-          <code>url</code>（HTTP 或 SSE）。工具名形如 <code>mcp_名称_工具</code>，调用需审批。
+          本地用 <code>command + args</code>，远程用 <code>url</code>（HTTP 或 SSE）。
+          工具名形如 <code>mcp_名称_工具</code>，调用需审批。
         </p>
       </header>
 

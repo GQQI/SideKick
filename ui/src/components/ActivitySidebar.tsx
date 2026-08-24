@@ -5,7 +5,7 @@ import { HistoryPanel } from "./HistoryPanel";
 import { BrowserPanel, type BrowserOpenRequest } from "./BrowserPanel";
 import { GitPanel } from "./GitPanel";
 import { UndoTimeline } from "./UndoTimeline";
-import { IconClock, IconFiles, IconGit, IconGlobe, IconSearch, IconSettings, IconUndo } from "./icons";
+import { IconBook, IconClock, IconFiles, IconGit, IconGlobe, IconSearch, IconSettings, IconUndo } from "./icons";
 import { IconRobotCube } from "./IconRobotCube";
 import type { SessionItem } from "../api";
 import { fileToDetail } from "../utils/chatHelpers";
@@ -38,6 +38,9 @@ export type ActivitySidebarProps = {
   onPickDomElement: (el: DomElementPayload) => void;
   browserOpenRequest?: BrowserOpenRequest | null;
   onWorkspaceMutated?: () => void;
+  mainView?: "chat" | "memory";
+  onOpenMemory?: () => void;
+  onOpenChat?: () => void;
 };
 
 export function ActivitySidebar({
@@ -66,7 +69,11 @@ export function ActivitySidebar({
   onPickDomElement,
   browserOpenRequest,
   onWorkspaceMutated,
+  mainView = "chat",
+  onOpenMemory,
+  onOpenChat,
 }: ActivitySidebarProps) {
+  const showChat = () => onOpenChat?.();
   return (
     <>
       <nav className="activity-rail" aria-label="Sidekick">
@@ -148,6 +155,7 @@ export function ActivitySidebar({
             className={`activity-btn${sidePanel === "undo" && !explorerCollapsed ? " active" : ""}`}
             title={t("navUndo")}
             onClick={() => {
+              showChat();
               if (sidePanel === "undo" && !explorerCollapsed) {
                 setExplorerCollapsed(true);
               } else {
@@ -161,9 +169,22 @@ export function ActivitySidebar({
           </button>
           <button
             type="button"
-            className={`activity-btn${sidePanel === "history" && !explorerCollapsed ? " active" : ""}`}
+            className={`activity-btn${mainView === "memory" ? " active" : ""}`}
+            title={t("navMemory")}
+            onClick={() => {
+              if (mainView === "memory") showChat();
+              else onOpenMemory?.();
+            }}
+          >
+            <IconBook size={18} />
+            <span>{t("navMemory")}</span>
+          </button>
+          <button
+            type="button"
+            className={`activity-btn${sidePanel === "history" && !explorerCollapsed && mainView !== "memory" ? " active" : ""}`}
             title={t("history")}
             onClick={() => {
+              showChat();
               if (sidePanel === "history" && !explorerCollapsed) {
                 setExplorerCollapsed(true);
               } else {

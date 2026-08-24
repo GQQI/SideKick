@@ -42,25 +42,7 @@ export type ModelSetup = {
 
 export type ModelRole = "main" | "subagent";
 
-const DEFAULT_VENDOR_TEMPLATES: Record<string, VendorTemplate> = {
-  deepseek: {
-    name: "DeepSeek",
-    vendor: "deepseek",
-    base_url: "https://api.deepseek.com",
-    models: ["deepseek-chat", "deepseek-reasoner", "deepseek-v4-pro"],
-  },
-  openai: {
-    name: "OpenAI",
-    vendor: "openai",
-    base_url: "https://api.openai.com/v1",
-    models: ["gpt-4o", "gpt-4o-mini"],
-  },
-  ollama: {
-    name: "Ollama",
-    vendor: "ollama",
-    base_url: "http://127.0.0.1:11434/v1",
-    models: ["llama3.2"],
-  },
+export const DEFAULT_VENDOR_TEMPLATES: Record<string, VendorTemplate> = {
   custom: {
     name: "OpenAI-API-Compatible",
     vendor: "openai",
@@ -79,7 +61,11 @@ function providersOf(setup: ModelSetup | null | undefined): ModelProvider[] {
 
 /** Adapt legacy flat `/api/model` payload (provider/model/api_key) to multi-provider setup. */
 function fromLegacyFlat(raw: Record<string, unknown>): ModelSetup {
-  const providerName = String(raw.provider || "default");
+  const rawProvider = String(raw.provider || "").trim().toLowerCase();
+  const providerName =
+    !rawProvider || ["deepseek", "openai", "minimax", "ollama"].includes(rawProvider)
+      ? "OpenAI-API-Compatible"
+      : String(raw.provider);
   const providerId = `prov_${providerName}`;
   const baseUrl = String(raw.base_url || "");
   const hasKey = Boolean(raw.api_key_set || raw.api_key);
@@ -115,8 +101,8 @@ function fromLegacyFlat(raw: Record<string, unknown>): ModelSetup {
       {
         id: providerId,
         name: providerName,
-        vendor: providerName === "deepseek" ? "deepseek" : "openai",
-        market_id: providerName === "deepseek" ? "deepseek" : "custom",
+        vendor: "openai",
+        market_id: "custom",
         models,
       },
     ],

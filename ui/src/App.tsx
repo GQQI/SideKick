@@ -8,11 +8,8 @@ import {
   fetchHealth,
   fetchMemory,
   fetchSessions,
-  fetchSkills,
   getStoredToken,
   listFiles,
-  readFileContent,
-  saveMemory,
   searchFiles,
   type Health,
   type SessionItem,
@@ -85,6 +82,7 @@ import type { BrowserOpenRequest } from "./components/BrowserPanel";
 import { ChatThread } from "./components/ChatThread";
 import { ComposerBar } from "./components/ComposerBar";
 import { ReviewPanel } from "./components/ChangesBar";
+import { MemoryLibraryPanel } from "./components/MemoryLibrary";
 import { LinkifiedText } from "./components/LinkifiedText";
 import { SandboxUrlPrompt, type SandboxUrlPromptState } from "./components/SandboxUrlPrompt";
 import { SettingsModal } from "./components/SettingsModal";
@@ -137,6 +135,7 @@ export function App() {
   const [sessionsTotalPages, setSessionsTotalPages] = useState(1);
   const [settingsOpen, setSettingsOpen] = useState(false);
   const [settingsTab, setSettingsTab] = useState<SettingsTab>("workspace");
+  const [mainView, setMainView] = useState<"chat" | "memory">("chat");
   const [stats, setStats] = useState({ tokens: 0, iters: 0 });
   const [ctx, setCtx] = useState({ tokens: 0, limit: 48000 });
   const [compressState, setCompressState] = useState<{
@@ -355,6 +354,12 @@ export function App() {
     editRestorePrompt,
     setCopiedId,
     openSettings: (tab) => openSettingsRef.current(tab),
+    openMemory: () => {
+      setMainView("memory");
+      setExplorerCollapsed(true);
+      setSettingsOpen(false);
+    },
+    openChat: () => setMainView("chat"),
     openHistoryPanel: session.openHistoryPanel,
     refreshSessions: session.refreshSessions,
     applySessionDetail: session.applySessionDetail,
@@ -970,7 +975,22 @@ export function App() {
               }}
               browserOpenRequest={browserOpenRequest}
               onWorkspaceMutated={() => setFsRefresh((n) => n + 1)}
+              mainView={mainView}
+              onOpenMemory={() => {
+                setMainView("memory");
+                setExplorerCollapsed(true);
+                setSettingsOpen(false);
+              }}
+              onOpenChat={() => setMainView("chat")}
             />
+        {mainView === "memory" ? (
+          <MemoryLibraryPanel
+            t={t}
+            onToast={setToast}
+            onBack={() => setMainView("chat")}
+          />
+        ) : (
+          <>
         <section className="chat pane">
           <ChatThread
             t={t}
@@ -1365,6 +1385,8 @@ export function App() {
         )}
           </>
         )}
+          </>
+        )}
       </main>
 
       {editRestorePrompt && (
@@ -1436,9 +1458,6 @@ export function App() {
           modelSaving={modelSaving}
           onModelChange={setModel}
           onModelSave={dialogs.applyModel}
-          memory={memory}
-          onMemoryChange={setMemory}
-          onSaveMemory={() => void saveMemory(memory).then(() => setToast(t("memorySaved")))}
           subs={subs}
           live={live}
           accountUser={accountUser}

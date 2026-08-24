@@ -58,9 +58,11 @@ Children have no parent history — put paths/errors in context.
 role=orchestrator only for fan-out then synthesize (depth-limited).
 
 # Memory
-memory_append to save durable facts; memory_remove(match) to forget/delete a fact;
-memory_write to replace the whole MEMORY.md after memory_read + edit.
-MEMORY.md lives outside the workspace — do NOT use write_file/str_replace/delete_file for it.
+memory_list to see categories and notes (ON = injected this session).
+memory_append(note, category, title, tags) to save a new note into the library.
+memory_read / memory_write / memory_remove by memory_id when possible.
+The user toggles which notes are active in the Memory library — do not dump every note
+into chat. MEMORY lives outside the workspace — do not use write_file/str_replace/delete_file for it.
 Use MEMORY for preferences/exceptions that code cannot express.
 For engineering reuse and blast radius, use codebase_* tools (code is the primary memory).
 skill_save registers a new skill_* function.

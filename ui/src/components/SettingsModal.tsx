@@ -29,9 +29,6 @@ export type SettingsModalProps = {
   modelSaving: boolean;
   onModelChange: (next: ModelSetup) => void;
   onModelSave: (next?: ModelSetup, opts?: { restartChat?: boolean }) => void;
-  memory: string;
-  onMemoryChange: (text: string) => void;
-  onSaveMemory: () => void;
   subs: SubNode[];
   live: LiveLine[];
   accountUser?: { id: string; username: string; email?: string } | null;
@@ -59,9 +56,6 @@ export function SettingsModal({
   modelSaving,
   onModelChange,
   onModelSave,
-  memory,
-  onMemoryChange,
-  onSaveMemory,
   subs,
   live,
   accountUser,
@@ -106,7 +100,6 @@ export function SettingsModal({
               ["model", t("tabModel")],
               ["mcp", "MCP"],
               ["appearance", t("tabAppearance")],
-              ["memory", t("tabMemory")],
               ["runtime", t("tabRuntime")],
               ["account", "账号"],
             ] as const
@@ -268,26 +261,6 @@ export function SettingsModal({
                 <h4>{t("aboutTitle")}</h4>
                 <p className="settings-about-ver">{t("aboutVersion", APP_VERSION)}</p>
                 <p className="hint">{t("aboutBlurb")}</p>
-              </div>
-            </div>
-          )}
-
-          {settingsTab === "memory" && (
-            <div className="settings-pane settings-pane-fill memory-pane">
-              <header className="settings-pane-intro">
-                <h3>{t("memoryTitle")}</h3>
-                <p className="hint">{t("memoryHint")}</p>
-              </header>
-              <textarea
-                value={memory}
-                placeholder={t("memoryEmptyHint")}
-                onChange={(e) => onMemoryChange(e.target.value)}
-              />
-              <div className="memory-footer">
-                <span className="hint">{t("memoryChars", String(memory.length))}</span>
-                <button type="button" className="primary" onClick={() => void onSaveMemory()}>
-                  {t("saveMemory")}
-                </button>
               </div>
             </div>
           )}

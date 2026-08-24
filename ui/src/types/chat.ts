@@ -83,7 +83,7 @@ export type ChatMsg = {
 };
 
 export type LiveLine = { id: string; text: string; kind: string };
-export type SettingsTab = "workspace" | "model" | "mcp" | "memory" | "runtime" | "appearance" | "account";
+export type SettingsTab = "workspace" | "model" | "mcp" | "runtime" | "appearance" | "account";
 
 export type QueuedMsg = {
   id: string;

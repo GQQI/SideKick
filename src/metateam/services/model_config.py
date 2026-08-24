@@ -58,24 +58,6 @@ def _config_path() -> Path:
 CONFIG_PATH = ROOT / "data" / "model.json"
 
 VENDOR_TEMPLATES: dict[str, dict[str, Any]] = {
-    "deepseek": {
-        "name": "DeepSeek",
-        "vendor": "deepseek",
-        "base_url": "https://api.deepseek.com",
-        "models": ["deepseek-chat", "deepseek-reasoner", "deepseek-v4-pro"],
-    },
-    "openai": {
-        "name": "OpenAI",
-        "vendor": "openai",
-        "base_url": "https://api.openai.com/v1",
-        "models": ["gpt-4o", "gpt-4o-mini"],
-    },
-    "ollama": {
-        "name": "Ollama",
-        "vendor": "ollama",
-        "base_url": "http://127.0.0.1:11434/v1",
-        "models": ["llama3.2"],
-    },
     "custom": {
         "name": "OpenAI-API-Compatible",
         "vendor": "openai",

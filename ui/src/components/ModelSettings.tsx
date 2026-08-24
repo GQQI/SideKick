@@ -1,4 +1,5 @@
-import { useMemo, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
+import { createPortal } from "react-dom";
 import type {
   ModelSetup,
   ModelProvider,
@@ -6,8 +7,20 @@ import type {
   VendorTemplate,
   ModelRef,
 } from "../types/modelSetup";
-import { modelLabel, newModelEntry, refKey } from "../types/modelSetup";
+import { newModelEntry, refKey, DEFAULT_VENDOR_TEMPLATES } from "../types/modelSetup";
 import type { MsgKey } from "../i18n";
+import {
+  IconCheck,
+  IconChevronDown,
+  IconEye,
+  IconEyeOff,
+  IconPencil,
+  IconPlus,
+  IconSearch,
+  IconSettings,
+  IconTrash,
+  IconX,
+} from "./icons";
 
 type Props = {
   setup: ModelSetup;
@@ -18,7 +31,7 @@ type Props = {
   t: (key: MsgKey, ...args: string[]) => string;
 };
 
-type MarketKind = "deepseek" | "openai" | "ollama" | "custom";
+type MarketKind = "custom";
 
 const MARKET: Array<{
   id: MarketKind;
@@ -28,15 +41,12 @@ const MARKET: Array<{
   descEn: string;
   tags: string[];
 }> = [
-  { id: "deepseek", nameZh: "DeepSeek", nameEn: "DeepSeek", descZh: "官方 API", descEn: "Official API", tags: ["LLM"] },
-  { id: "openai", nameZh: "OpenAI", nameEn: "OpenAI", descZh: "官方 API", descEn: "Official API", tags: ["LLM"] },
-  { id: "ollama", nameZh: "Ollama", nameEn: "Ollama", descZh: "本机本地模型", descEn: "Local models", tags: ["LLM"] },
   {
     id: "custom",
     nameZh: "OpenAI-API-Compatible",
     nameEn: "OpenAI-API-Compatible",
-    descZh: "任意兼容接口 / 网关",
-    descEn: "Any compatible gateway",
+    descZh: "任意兼容接口 / 网关，模型名称可自由填写",
+    descEn: "Any compatible gateway — type any model name",
     tags: ["LLM"],
   },
 ];
@@ -57,13 +67,12 @@ function newProvider(
   const market = MARKET.find((m) => m.id === kind);
   const baseName = market ? market.nameZh : tpl?.name || kind;
   const baseUrl = tpl?.base_url || "";
-  const models = (tpl?.models || []).map((n) => newModelEntry(n, { base_url: baseUrl }));
   return {
     id: `prov_${Math.random().toString(36).slice(2, 10)}`,
     name: uniqueName(baseName, existingNames),
     vendor: tpl?.vendor || "openai",
     market_id: kind,
-    models,
+    models: [newModelEntry("", { base_url: baseUrl })],
   };
 }
 
@@ -76,18 +85,157 @@ function setRole(setup: ModelSetup, role: "main" | "subagent", ref: ModelRef): M
 function badge(kind: string): string {
   if (kind === "deepseek") return "DS";
   if (kind === "openai") return "OA";
+  if (kind === "minimax") return "MM";
   if (kind === "ollama") return "OL";
   return "API";
+}
+
+type RfOption = { value: string; label: string };
+type RfGroup = { label: string; options: RfOption[] };
+
+function RfSelect({
+  value,
+  disabled,
+  placeholder,
+  options,
+  groups,
+  className,
+  onChange,
+}: {
+  value: string;
+  disabled?: boolean;
+  placeholder?: string;
+  options?: RfOption[];
+  groups?: RfGroup[];
+  className?: string;
+  onChange: (value: string) => void;
+}) {
+  const [open, setOpen] = useState(false);
+  const [menuPos, setMenuPos] = useState<{ top: number; left: number; width: number; maxH: number } | null>(
+    null,
+  );
+  const rootRef = useRef<HTMLDivElement>(null);
+  const menuRef = useRef<HTMLDivElement>(null);
+  const visibleGroups = (groups || []).filter((g) => g.options.length > 0);
+  const all = visibleGroups.length ? visibleGroups.flatMap((g) => g.options) : options ?? [];
+  const current = all.find((o) => o.value === value);
+
+  useEffect(() => {
+    if (!open) return;
+    const place = () => {
+      const el = rootRef.current;
+      if (!el) return;
+      const r = el.getBoundingClientRect();
+      const spaceBelow = window.innerHeight - r.bottom - 12;
+      const spaceAbove = r.top - 12;
+      const dropUp = spaceBelow < 180 && spaceAbove > spaceBelow;
+      const maxH = Math.max(120, Math.min(240, dropUp ? spaceAbove : spaceBelow));
+      setMenuPos({
+        top: dropUp ? Math.max(8, r.top - maxH - 6) : r.bottom + 6,
+        left: r.left,
+        width: Math.max(r.width, 180),
+        maxH,
+      });
+    };
+    place();
+    const onDoc = (e: MouseEvent) => {
+      const t = e.target as Node;
+      if (rootRef.current?.contains(t) || menuRef.current?.contains(t)) return;
+      setOpen(false);
+    };
+    document.addEventListener("mousedown", onDoc);
+    window.addEventListener("resize", place);
+    window.addEventListener("scroll", place, true);
+    return () => {
+      document.removeEventListener("mousedown", onDoc);
+      window.removeEventListener("resize", place);
+      window.removeEventListener("scroll", place, true);
+    };
+  }, [open]);
+
+  const menu =
+    open && !disabled && menuPos
+      ? createPortal(
+          <div
+            ref={menuRef}
+            className="rf-select-menu"
+            role="listbox"
+            style={{
+              top: menuPos.top,
+              left: menuPos.left,
+              width: menuPos.width,
+              maxHeight: menuPos.maxH,
+            }}
+            onMouseDown={(e) => e.stopPropagation()}
+          >
+            {visibleGroups.length
+              ? visibleGroups.map((g) => (
+                  <div key={g.label} className="rf-select-group">
+                    <div className="rf-select-group-label">{g.label}</div>
+                    {g.options.map((o) => (
+                      <button
+                        key={o.value}
+                        type="button"
+                        className={o.value === value ? "active" : ""}
+                        onClick={() => {
+                          onChange(o.value);
+                          setOpen(false);
+                        }}
+                      >
+                        {o.label}
+                      </button>
+                    ))}
+                  </div>
+                ))
+              : all.map((o) => (
+                  <button
+                    key={o.value}
+                    type="button"
+                    className={o.value === value ? "active" : ""}
+                    onClick={() => {
+                      onChange(o.value);
+                      setOpen(false);
+                    }}
+                  >
+                    {o.label}
+                  </button>
+                ))}
+          </div>,
+          document.body,
+        )
+      : null;
+
+  return (
+    <div
+      className={`rf-select${open ? " open" : ""}${disabled ? " disabled" : ""}${className ? ` ${className}` : ""}`}
+      ref={rootRef}
+    >
+      <button
+        type="button"
+        className="rf-select-btn"
+        disabled={disabled}
+        onClick={() => setOpen((v) => !v)}
+      >
+        <span className={current ? "" : "placeholder"}>{current?.label || placeholder || "—"}</span>
+        <IconChevronDown size={14} />
+      </button>
+      {menu}
+    </div>
+  );
 }
 
 type EditTarget = { providerId: string; modelId: string };
 
 export function ModelSettings({ setup, locale, onChange, onSave, saving, t }: Props) {
-  const templates = setup.vendor_templates || {};
+  const templates = { ...DEFAULT_VENDOR_TEMPLATES, ...(setup.vendor_templates || {}) };
   const [edit, setEdit] = useState<EditTarget | null>(null);
   const [expanded, setExpanded] = useState<Record<string, boolean>>({});
   const [showKey, setShowKey] = useState(false);
   const [marketQuery, setMarketQuery] = useState("");
+  const [mineQuery, setMineQuery] = useState("");
+  const [renamingProv, setRenamingProv] = useState("");
+  const [renameValue, setRenameValue] = useState("");
+  const [confirmProvId, setConfirmProvId] = useState("");
 
   const editingModel = useMemo(() => {
     if (!edit) return null;
@@ -103,12 +251,35 @@ export function ModelSettings({ setup, locale, onChange, onSave, saving, t }: Pr
         !q ||
         m.nameZh.toLowerCase().includes(q) ||
         m.nameEn.toLowerCase().includes(q) ||
-        m.descZh.includes(q),
+        m.descZh.includes(q) ||
+        m.descEn.toLowerCase().includes(q),
     );
   }, [marketQuery]);
 
-  function patchModel(providerId: string, modelId: string, patch: Partial<ModelEntry>) {
-    onChange({
+  const filteredProviders = useMemo(() => {
+    const q = mineQuery.trim().toLowerCase();
+    if (!q) return setup.providers;
+    return setup.providers
+      .map((p) => {
+        const nameHit = p.name.toLowerCase().includes(q);
+        const models = nameHit ? p.models : p.models.filter((m) => m.name.toLowerCase().includes(q));
+        return nameHit || models.length ? { ...p, models } : null;
+      })
+      .filter((p): p is ModelProvider => Boolean(p));
+  }, [setup.providers, mineQuery]);
+
+  function persist(next: ModelSetup) {
+    onChange(next);
+    onSave(next, { restartChat: false });
+  }
+
+  function patchModel(
+    providerId: string,
+    modelId: string,
+    patch: Partial<ModelEntry>,
+    save = false,
+  ) {
+    const next = {
       ...setup,
       providers: setup.providers.map((p) =>
         p.id !== providerId
@@ -118,7 +289,22 @@ export function ModelSettings({ setup, locale, onChange, onSave, saving, t }: Pr
               models: p.models.map((m) => (m.id === modelId ? { ...m, ...patch } : m)),
             },
       ),
+    };
+    if (save) persist(next);
+    else onChange(next);
+  }
+
+  function renameProvider(id: string, name: string) {
+    const next = name.trim();
+    if (!next) {
+      setRenamingProv("");
+      return;
+    }
+    persist({
+      ...setup,
+      providers: setup.providers.map((p) => (p.id === id ? { ...p, name: next } : p)),
     });
+    setRenamingProv("");
   }
 
   function addFromMarket(kind: MarketKind) {
@@ -127,7 +313,7 @@ export function ModelSettings({ setup, locale, onChange, onSave, saving, t }: Pr
       templates,
       setup.providers.map((x) => x.name),
     );
-    onChange({ ...setup, providers: [...setup.providers, p] });
+    persist({ ...setup, providers: [...setup.providers, p] });
     setExpanded((d) => ({ ...d, [p.id]: true }));
     if (p.models[0]) {
       setEdit({ providerId: p.id, modelId: p.models[0].id });
@@ -144,7 +330,7 @@ export function ModelSettings({ setup, locale, onChange, onSave, saving, t }: Pr
         ? { provider_id: next[0].id, model_id: fallback.id }
         : { provider_id: "", model_id: "" };
     };
-    onChange({
+    persist({
       ...setup,
       providers: next,
       main: remap(setup.main),
@@ -152,12 +338,17 @@ export function ModelSettings({ setup, locale, onChange, onSave, saving, t }: Pr
       compress: remap(setup.compress),
     });
     if (edit?.providerId === id) setEdit(null);
+    setConfirmProvId("");
   }
 
   function addBlankModel(provider: ModelProvider) {
     const tpl = templates[provider.market_id || ""] || templates.custom;
-    const entry = newModelEntry("", { base_url: tpl?.base_url || "" });
-    onChange({
+    const seed = provider.models[0];
+    const entry = newModelEntry("", {
+      base_url: seed?.base_url || tpl?.base_url || "",
+      api_key: seed?.api_key || "",
+    });
+    persist({
       ...setup,
       providers: setup.providers.map((p) =>
         p.id === provider.id ? { ...p, models: [...p.models, entry] } : p,
@@ -191,14 +382,14 @@ export function ModelSettings({ setup, locale, onChange, onSave, saving, t }: Pr
         };
       }
     }
-    onChange(next);
+    persist(next);
     if (edit?.modelId === modelId) setEdit(null);
   }
 
   function pickRole(role: "main" | "subagent", key: string) {
     const i = key.indexOf("::");
     if (i <= 0) return;
-    onChange(
+    persist(
       setRole(setup, role, {
         provider_id: key.slice(0, i),
         model_id: key.slice(i + 2),
@@ -209,23 +400,21 @@ export function ModelSettings({ setup, locale, onChange, onSave, saving, t }: Pr
   function openEdit(providerId: string, modelId: string) {
     setEdit({ providerId, modelId });
     setShowKey(false);
+    setExpanded((d) => ({ ...d, [providerId]: true }));
+  }
+
+  function applyNow() {
+    persist(setup);
   }
 
   function closeEdit() {
+    persist(setup);
     setEdit(null);
     setShowKey(false);
   }
 
   function handleDone() {
-    setEdit(null);
-    setShowKey(false);
-    onSave(setup, { restartChat: false });
-  }
-
-  function handleSaveAndNewChat() {
-    setEdit(null);
-    setShowKey(false);
-    onSave(setup, { restartChat: true });
+    closeEdit();
   }
 
   const hasModels = setup.providers.some((p) => p.models.length > 0);
@@ -234,9 +423,23 @@ export function ModelSettings({ setup, locale, onChange, onSave, saving, t }: Pr
     <div className="rf">
       {setup.demo_mode ? <p className="rf-banner">{t("modelDemoHint")}</p> : null}
 
+      <div className="rf-toolbar">
+        <p className="hint rf-toolbar-hint">{t("modelHint")}</p>
+        <div className="rf-toolbar-actions">
+          <button
+            type="button"
+            className="primary rf-save"
+            disabled={saving}
+            onClick={applyNow}
+          >
+            {saving ? t("modelSavingBtn") : t("saveModel")}
+          </button>
+        </div>
+      </div>
+
       <div className="rf-layout">
         <div className="rf-main">
-          <section className="rf-block">
+          <section className="rf-block rf-block-defaults">
             <h3 className="rf-block-title">{t("modelStepAgents")}</h3>
             <div className="rf-defaults">
               {(["main", "subagent"] as const).map((role) => {
@@ -244,102 +447,134 @@ export function ModelSettings({ setup, locale, onChange, onSave, saving, t }: Pr
                 return (
                   <label key={role}>
                     <span>{role === "main" ? t("mainModel") : t("subModel")}</span>
-                    <select
+                    <RfSelect
                       value={refKey(ref)}
                       disabled={!hasModels}
-                      onChange={(e) => pickRole(role, e.target.value)}
-                    >
-                      {!hasModels ? (
-                        <option value="">{t("modelPickProviderFirst")}</option>
-                      ) : (
-                        setup.providers.map((p) =>
-                          p.models.length === 0 ? null : (
-                            <optgroup key={p.id} label={p.name}>
-                              {p.models.map((m) => (
-                                <option
-                                  key={m.id}
-                                  value={refKey({ provider_id: p.id, model_id: m.id })}
-                                >
-                                  {m.name || (locale === "en" ? "(unnamed)" : "（未命名）")}
-                                </option>
-                              ))}
-                            </optgroup>
-                          ),
-                        )
-                      )}
-                    </select>
-                    <em>{modelLabel(setup, ref) || "—"}</em>
+                      placeholder={t("modelPickProviderFirst")}
+                      groups={setup.providers
+                        .filter((p) => p.models.length > 0)
+                        .map((p) => ({
+                          label: p.name,
+                          options: p.models.map((m) => ({
+                            value: refKey({ provider_id: p.id, model_id: m.id }),
+                            label: m.name || t("modelUnnamed"),
+                          })),
+                        }))}
+                      onChange={(v) => pickRole(role, v)}
+                    />
                   </label>
                 );
               })}
             </div>
           </section>
 
-          <section className="rf-block">
+          <section className="rf-block rf-block-mine">
             <div className="rf-block-head">
               <h3 className="rf-block-title">{t("modelAddedTitle")}</h3>
-              <button
-                type="button"
-                className="primary rf-save"
-                disabled={saving}
-                onClick={handleSaveAndNewChat}
-              >
-                {t("saveModel")}
-              </button>
             </div>
+            {setup.providers.length > 0 && (
+              <label className="rf-search">
+                <IconSearch size={14} />
+                <input
+                  value={mineQuery}
+                  onChange={(e) => setMineQuery(e.target.value)}
+                  placeholder={t("modelSearchMine")}
+                />
+              </label>
+            )}
 
             {setup.providers.length === 0 ? (
               <p className="rf-empty">{t("modelMarketEmpty")}</p>
+            ) : filteredProviders.length === 0 ? (
+              <p className="rf-empty">{t("modelSearchMine")}</p>
             ) : (
               <ul className="rf-added">
-                {setup.providers.map((p) => {
+                {filteredProviders.map((p) => {
+                  const full = setup.providers.find((x) => x.id === p.id) || p;
                   const kind = p.market_id || p.vendor || "custom";
-                  const show = expanded[p.id] ?? true;
-                  const readyCount = p.models.filter((m) => m.api_key_set || m.api_key).length;
+                  const show = mineQuery ? true : (expanded[p.id] ?? true);
+                  const readyCount = full.models.filter((m) => m.api_key_set || m.api_key).length;
                   return (
-                    <li key={p.id} className="rf-added-card">
-                      <div className="rf-added-top">
-                        <span className={`rf-logo v-${kind}`}>{badge(kind)}</span>
-                        <div className="rf-added-info">
-                          <strong>{p.name}</strong>
-                          <span>
-                            {locale === "en"
-                              ? `${p.models.length} models · ${readyCount} ready`
-                              : `${p.models.length} 个模型 · ${readyCount} 已配 Key`}
-                          </span>
+                    <li key={p.id} id={`rf-prov-${p.id}`} className="rf-added-card">
+                      {confirmProvId === p.id ? (
+                        <div className="rf-inline-confirm">
+                          <span>{t("providerDeleteConfirm", p.name)}</span>
+                          <div>
+                            <button type="button" className="ghost danger" onClick={() => removeProvider(p.id)}>
+                              {t("providerRemove")}
+                            </button>
+                            <button type="button" className="ghost" onClick={() => setConfirmProvId("")}>
+                              {t("cancel")}
+                            </button>
+                          </div>
                         </div>
-                        <div className="rf-added-actions">
-                          <button
-                            type="button"
-                            className="rf-icon-btn"
-                            title={locale === "en" ? "Add model" : "添加模型"}
-                            onClick={() => addBlankModel(p)}
-                          >
-                            +
-                          </button>
-                          <button
-                            type="button"
-                            className="rf-icon-btn danger"
-                            title={t("providerRemove")}
-                            onClick={() => removeProvider(p.id)}
-                          >
-                            🗑
-                          </button>
+                      ) : (
+                        <div className="rf-added-top">
+                          <span className={`rf-logo v-${kind}`}>{badge(kind)}</span>
+                          {renamingProv === p.id ? (
+                            <form
+                              className="rf-rename"
+                              onSubmit={(e) => {
+                                e.preventDefault();
+                                renameProvider(p.id, renameValue);
+                              }}
+                            >
+                              <input
+                                autoFocus
+                                value={renameValue}
+                                onChange={(e) => setRenameValue(e.target.value)}
+                                onKeyDown={(e) => {
+                                  if (e.key === "Escape") setRenamingProv("");
+                                }}
+                              />
+                              <button type="submit" className="rf-icon-btn" title={t("modelDone")}>
+                                <IconCheck size={14} />
+                              </button>
+                            </form>
+                          ) : (
+                            <div className="rf-added-info">
+                              <strong>{p.name}</strong>
+                              <span>{t("modelCount", String(full.models.length), String(readyCount))}</span>
+                            </div>
+                          )}
+                          <div className="rf-added-actions">
+                            <button
+                              type="button"
+                              className="rf-icon-btn"
+                              title={t("providerName")}
+                              onClick={() => {
+                                setRenamingProv(p.id);
+                                setRenameValue(p.name);
+                              }}
+                            >
+                              <IconPencil size={14} />
+                            </button>
+                            <button
+                              type="button"
+                              className="rf-icon-btn"
+                              title={t("modelAddModel")}
+                              onClick={() => addBlankModel(full)}
+                            >
+                              <IconPlus size={14} />
+                            </button>
+                            <button
+                              type="button"
+                              className="rf-icon-btn danger"
+                              title={t("providerRemove")}
+                              onClick={() => setConfirmProvId(p.id)}
+                            >
+                              <IconTrash size={14} />
+                            </button>
+                          </div>
                         </div>
-                      </div>
+                      )}
 
                       <button
                         type="button"
                         className="rf-models-toggle"
                         onClick={() => setExpanded((d) => ({ ...d, [p.id]: !show }))}
                       >
-                        {show
-                          ? locale === "en"
-                            ? "Hide models"
-                            : "收起模型"
-                          : locale === "en"
-                            ? `Show models (${p.models.length})`
-                            : `展示更多模型 (${p.models.length})`}
+                        {show ? t("modelHideList") : t("modelShowList", String(p.models.length))}
                         <span aria-hidden>{show ? "▴" : "▾"}</span>
                       </button>
 
@@ -356,15 +591,16 @@ export function ModelSettings({ setup, locale, onChange, onSave, saving, t }: Pr
                                   setup.subagent.provider_id === p.id &&
                                   setup.subagent.model_id === m.id;
                                 const ready = Boolean(m.api_key_set || m.api_key);
+                                const active = edit?.providerId === p.id && edit?.modelId === m.id;
                                 return (
-                                  <li key={m.id}>
+                                  <li key={m.id} className={active ? "active" : ""}>
                                     <button
                                       type="button"
                                       className="rf-model-open"
                                       onClick={() => openEdit(p.id, m.id)}
-                                      title={locale === "en" ? "Configure this model" : "配置此模型"}
+                                      title={t("modelConfigure")}
                                     >
-                                      <code>{m.name || "—"}</code>
+                                      <code>{m.name || t("modelUnnamed")}</code>
                                       <span className={`rf-dot${ready ? " ok" : ""}`} />
                                     </button>
                                     <div className="rf-model-row-actions">
@@ -378,7 +614,7 @@ export function ModelSettings({ setup, locale, onChange, onSave, saving, t }: Pr
                                           )
                                         }
                                       >
-                                        {locale === "en" ? "Main" : "主"}
+                                        {t("mainModel").slice(0, 1)}
                                       </button>
                                       <button
                                         type="button"
@@ -390,14 +626,15 @@ export function ModelSettings({ setup, locale, onChange, onSave, saving, t }: Pr
                                           )
                                         }
                                       >
-                                        {locale === "en" ? "Sub" : "子"}
+                                        {t("subModel").slice(0, 1)}
                                       </button>
                                       <button
                                         type="button"
                                         className="rf-icon-btn"
+                                        title={t("modelConfigure")}
                                         onClick={() => openEdit(p.id, m.id)}
                                       >
-                                        ⚙
+                                        <IconSettings size={14} />
                                       </button>
                                     </div>
                                   </li>
@@ -408,9 +645,9 @@ export function ModelSettings({ setup, locale, onChange, onSave, saving, t }: Pr
                           <button
                             type="button"
                             className="rf-add-model-link"
-                            onClick={() => addBlankModel(p)}
+                            onClick={() => addBlankModel(full)}
                           >
-                            + {locale === "en" ? "Add model" : "添加模型"}
+                            <IconPlus size={12} /> {t("modelAddModel")}
                           </button>
                         </div>
                       ) : null}
@@ -422,139 +659,124 @@ export function ModelSettings({ setup, locale, onChange, onSave, saving, t }: Pr
           </section>
         </div>
 
-        <aside className="rf-market">
-          <h3 className="rf-block-title">{t("modelAvailableTitle")}</h3>
-          <input
-            className="rf-market-search"
-            value={marketQuery}
-            onChange={(e) => setMarketQuery(e.target.value)}
-            placeholder={locale === "en" ? "Search providers…" : "搜索厂商…"}
-          />
-          <ul className="rf-market-list">
-            {marketList.map((item) => (
-              <li key={item.id}>
-                <button type="button" className="rf-market-card" onClick={() => addFromMarket(item.id)}>
-                  <span className={`rf-logo v-${item.id}`}>{badge(item.id)}</span>
-                  <span className="rf-market-text">
-                    <strong>{locale === "en" ? item.nameEn : item.nameZh}</strong>
-                    <em>{locale === "en" ? item.descEn : item.descZh}</em>
-                    <span className="rf-market-tags">
-                      {item.tags.map((tag) => (
-                        <i key={tag}>{tag}</i>
-                      ))}
-                    </span>
-                  </span>
-                  <span className="rf-market-add">+</span>
+        <aside className="rf-side">
+          {editingModel ? (
+            <div className="rf-editor">
+              <div className="rf-side-head">
+                <div>
+                  <h3>{t("modelConfigure")}</h3>
+                  <p>{editingModel.prov.name}</p>
+                </div>
+                <button type="button" className="rf-icon-btn" onClick={closeEdit} title={t("close")}>
+                  <IconX size={14} />
                 </button>
-              </li>
-            ))}
-          </ul>
-        </aside>
-      </div>
-
-      {editingModel ? (
-        <div
-          className="rf-drawer-backdrop"
-          onClick={(e) => {
-            if (e.target === e.currentTarget) closeEdit();
-          }}
-        >
-          <div className="rf-drawer" role="dialog" aria-label={editingModel.model.name || "model"}>
-            <div className="rf-drawer-head">
-              <h3>{locale === "en" ? "Configure model" : "配置模型"}</h3>
-              <button type="button" className="icon-btn" onClick={closeEdit}>
-                ✕
-              </button>
-            </div>
-            <div className="rf-drawer-body">
-              <p className="rf-drawer-sub">
-                {editingModel.prov.name}
-              </p>
-              <label>
-                <span>{locale === "en" ? "Model name (API id)" : "模型名称 (model_name)"}</span>
-                <input
-                  value={editingModel.model.name}
-                  onChange={(e) =>
-                    patchModel(editingModel.prov.id, editingModel.model.id, {
-                      name: e.target.value,
-                    })
-                  }
-                  placeholder={t("modelNamePlaceholder")}
-                />
-              </label>
-              <label>
-                <span>Base URL</span>
-                <input
-                  value={editingModel.model.base_url}
-                  onChange={(e) =>
-                    patchModel(editingModel.prov.id, editingModel.model.id, {
-                      base_url: e.target.value,
-                    })
-                  }
-                  placeholder="https://api.example.com/v1"
-                />
-              </label>
-              <label>
-                <span>API Key</span>
-                <div className="rf-key-row">
+              </div>
+              <div className="rf-editor-body">
+                <label>
+                  <span>{t("modelNameLocked")}</span>
                   <input
-                    type={showKey ? "text" : "password"}
-                    autoComplete="off"
-                    spellCheck={false}
-                    placeholder="sk-..."
-                    value={editingModel.model.api_key || ""}
+                    value={editingModel.model.name}
                     onChange={(e) =>
                       patchModel(editingModel.prov.id, editingModel.model.id, {
-                        api_key: e.target.value,
-                        api_key_set: Boolean(e.target.value.trim()),
+                        name: e.target.value,
                       })
                     }
+                    placeholder={t("modelNamePlaceholder")}
                   />
-                  <button
-                    type="button"
-                    className="rf-key-eye"
-                    title={
-                      showKey
-                        ? locale === "en"
-                          ? "Hide"
-                          : "隐藏"
-                        : locale === "en"
-                          ? "Show"
-                          : "显示"
+                </label>
+                <label>
+                  <span>Base URL</span>
+                  <input
+                    value={editingModel.model.base_url}
+                    onChange={(e) =>
+                      patchModel(editingModel.prov.id, editingModel.model.id, {
+                        base_url: e.target.value,
+                      })
                     }
-                    aria-label={showKey ? "Hide API key" : "Show API key"}
-                    onClick={() => setShowKey((v) => !v)}
-                  >
-                    {showKey ? "🙈" : "👁"}
-                  </button>
-                </div>
-              </label>
+                    placeholder="https://api.example.com/v1"
+                  />
+                </label>
+                <label>
+                  <span>API Key</span>
+                  <div className="rf-key-row">
+                    <input
+                      type={showKey ? "text" : "password"}
+                      autoComplete="off"
+                      spellCheck={false}
+                      placeholder="sk-..."
+                      value={editingModel.model.api_key || ""}
+                      onChange={(e) =>
+                        patchModel(editingModel.prov.id, editingModel.model.id, {
+                          api_key: e.target.value,
+                          api_key_set: Boolean(e.target.value.trim()),
+                        })
+                      }
+                    />
+                    <button
+                      type="button"
+                      className="rf-key-eye"
+                      title={showKey ? t("modelKeyHide") : t("modelKeyShow")}
+                      onClick={() => setShowKey((v) => !v)}
+                    >
+                      {showKey ? <IconEyeOff size={16} /> : <IconEye size={16} />}
+                    </button>
+                  </div>
+                </label>
+              </div>
+              <div className="rf-editor-foot">
+                <button
+                  type="button"
+                  className="ghost danger"
+                  onClick={() => removeModel(editingModel.prov.id, editingModel.model.id)}
+                >
+                  <IconTrash size={14} /> {t("modelDelete")}
+                </button>
+                <button type="button" className="primary" disabled={saving} onClick={handleDone}>
+                  {saving ? t("modelSavingBtn") : t("modelDone")}
+                </button>
+              </div>
             </div>
-            <div className="rf-drawer-foot">
-              <button
-                type="button"
-                className="mini danger"
-                onClick={() => {
-                  removeModel(editingModel.prov.id, editingModel.model.id);
-                  setEdit(null);
-                  setShowKey(false);
-                }}
-              >
-                {locale === "en" ? "Delete model" : "删除模型"}
-              </button>
-              <button type="button" className="primary" disabled={saving} onClick={handleDone}>
-                {saving
-                  ? locale === "en"
-                    ? "Saving…"
-                    : "保存中…"
-                  : locale === "en"
-                    ? "Done"
-                    : "完成"}
-              </button>
+          ) : (
+            <div className="rf-market">
+              <h3 className="rf-block-title">{t("modelAvailableTitle")}</h3>
+              <p className="hint rf-side-hint">{t("modelMarketHint")}</p>
+              {MARKET.length > 1 && (
+                <label className="rf-search">
+                  <IconSearch size={14} />
+                  <input
+                    value={marketQuery}
+                    onChange={(e) => setMarketQuery(e.target.value)}
+                    placeholder={t("modelSearchMarket")}
+                  />
+                </label>
+              )}
+              <ul className="rf-market-list">
+                {marketList.map((item) => (
+                  <li key={item.id}>
+                    <button
+                      type="button"
+                      className="rf-market-card"
+                      onClick={() => addFromMarket(item.id)}
+                    >
+                      <span className={`rf-logo v-${item.id}`}>{badge(item.id)}</span>
+                      <span className="rf-market-text">
+                        <strong>{locale === "en" ? item.nameEn : item.nameZh}</strong>
+                        <em>{locale === "en" ? item.descEn : item.descZh}</em>
+                        <span className="rf-market-tags">
+                          {item.tags.map((tag) => (
+                            <i key={tag}>{tag}</i>
+                          ))}
+                        </span>
+                      </span>
+                      <span className="rf-market-add">+</span>
+                    </button>
+                  </li>
+                ))}
+              </ul>
             </div>
-          </div>
-        </div>
-      ) : null}
+          )}
+        </aside>
+      </div>
     </div>
   );
 }
