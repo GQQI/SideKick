@@ -638,5 +638,6 @@ def file_change_pair(
         "new": new_text,
         "kind": kind,
         "is_new": is_new,
+        "is_deleted": kind == "deleted",
         "binary": False,
     }

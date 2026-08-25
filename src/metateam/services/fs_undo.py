@@ -307,13 +307,74 @@ def _count_lines_text(text: str) -> int:
     return text.count("\n") + (0 if text.endswith("\n") else 1)
 
 
-def _blob_text(blob_id: Any, workspace: Optional[Path] = None) -> Optional[str]:
+def _blob_root(blob_id: Any, workspace: Optional[Path] = None) -> Optional[Path]:
     if not blob_id:
         return None
     path = _undo_root(workspace) / "blobs" / str(blob_id)
-    if not path.is_file():
+    return path if path.exists() else None
+
+
+def _blob_text(blob_id: Any, workspace: Optional[Path] = None) -> Optional[str]:
+    root = _blob_root(blob_id, workspace)
+    if root is None or not root.is_file():
         return None
-    return _read_text_capped(path)
+    return _read_text_capped(root)
+
+
+def _read_blob_file(path: Path) -> tuple[str, bool]:
+    """Return (text, is_binary). Missing files yield empty non-binary text."""
+    if not path.is_file():
+        return "", False
+    text = _read_text_capped(path)
+    if text is None:
+        return "", True
+    return text, False
+
+
+def _deleted_blob_members(
+    st: dict[str, Any], workspace: Optional[Path] = None
+) -> list[tuple[str, str, bool]]:
+    """Inner relative path ('' = the tracked path itself), text, binary flag."""
+    blob = st.get("delete_blob") or st.get("blob")
+    root = _blob_root(blob, workspace)
+    if root is None:
+        return [("", "", False)]
+    if root.is_file():
+        text, binary = _read_blob_file(root)
+        return [("", text, binary)]
+    if root.is_dir():
+        members: list[tuple[str, str, bool]] = []
+        for p in sorted(root.rglob("*")):
+            if not p.is_file():
+                continue
+            inner = p.relative_to(root).as_posix()
+            text, binary = _read_blob_file(p)
+            members.append((inner, text, binary))
+        return members or [("", "", False)]
+    return [("", "", False)]
+
+
+def _find_tracked(
+    path: str, tracked: dict[str, dict[str, Any]]
+) -> tuple[str, Optional[dict[str, Any]], str]:
+    """Match an exact path, or a file inside a deleted directory blob."""
+    st = tracked.get(path)
+    if st is not None:
+        return path, st, ""
+    best: Optional[tuple[str, dict[str, Any], str]] = None
+    for prefix, item in tracked.items():
+        if not prefix or path == prefix:
+            continue
+        if not path.startswith(prefix + "/"):
+            continue
+        if not (item.get("op") == "delete" and item.get("kind") == "dir"):
+            continue
+        inner = path[len(prefix) + 1 :]
+        if best is None or len(prefix) > len(best[0]):
+            best = (prefix, item, inner)
+    if best:
+        return best
+    return path, None, ""
 
 
 def _line_delta(old: str, new: str) -> tuple[int, int]:
@@ -499,23 +560,39 @@ def review_snapshot(
     for path in sorted(tracked):
         st = tracked[path]
         last = st.get("op")
-        if st.get("kind") == "dir":
-            if last == "delete":
-                files.append(
-                    _review_entry(path, kind="deleted", added=0, deleted=0, xy=" D")
-                )
-            continue
-        if last == "delete":
-            if not st.get("had"):
-                continue
-            old = _blob_text(st.get("delete_blob") or st.get("blob"), workspace) or ""
-            n = _count_lines_text(old)
-            files.append(_review_entry(path, kind="deleted", added=0, deleted=n, xy=" D"))
-            deleted_total += n
-            continue
         abs_path = ws / path
+        missing = not abs_path.exists()
+        is_dir = st.get("kind") == "dir"
+
+        if is_dir and last != "delete" and not missing:
+            continue
+
+        gone = last == "delete" or missing
+        if gone:
+            for inner, text, binary in _deleted_blob_members(st, workspace):
+                full = f"{path}/{inner}" if inner else path
+                n = 0 if binary else _count_lines_text(text)
+                files.append(
+                    _review_entry(path=full, kind="deleted", added=0, deleted=n, xy=" D")
+                )
+                deleted_total += n
+            continue
+
         current = _read_text_capped(abs_path)
-        if current is None and not abs_path.is_file():
+        if current is None and abs_path.is_file():
+            # Binary file still present: list it so add/modify is not dropped.
+            n = 0
+            kind = "added" if not st.get("had") else ("renamed" if last == "rename" else "modified")
+            files.append(
+                _review_entry(
+                    path,
+                    kind=kind,
+                    added=n,
+                    deleted=0,
+                    xy="??" if kind == "added" else " M",
+                    untracked=kind == "added",
+                )
+            )
             continue
         text = current or ""
         if not st.get("had"):
@@ -565,20 +642,39 @@ def file_review_pair(
     if not path or path.startswith("-"):
         raise ValueError("invalid path")
     ws = (workspace or get_settings().workspace).resolve()
-    st = _collect_tracked(workspace, session_id=session_id).get(path)
+    tracked = _collect_tracked(workspace, session_id=session_id)
+    _prefix, st, inner = _find_tracked(path, tracked)
     if not st:
         raise ValueError(f"not a changed file: {path}")
     abs_path = ws / path
     last = st.get("op")
-    if last == "delete":
-        old = _blob_text(st.get("delete_blob") or st.get("blob"), workspace) or ""
+    gone = last == "delete" or not abs_path.exists()
+    if gone:
+        blob = st.get("delete_blob") or st.get("blob")
+        root = _blob_root(blob, workspace)
+        target = (root / inner) if (root is not None and inner) else root
+        if target is not None and target.is_dir():
+            return {
+                "path": path,
+                "old": "",
+                "new": "",
+                "kind": "deleted",
+                "is_new": False,
+                "is_deleted": True,
+                "binary": False,
+            }
+        old = ""
+        binary = False
+        if target is not None and target.is_file():
+            old, binary = _read_blob_file(target)
         return {
             "path": path,
             "old": old,
             "new": "",
             "kind": "deleted",
             "is_new": False,
-            "binary": False,
+            "is_deleted": True,
+            "binary": binary,
         }
     current = _read_text_capped(abs_path)
     if current is None and abs_path.exists() and abs_path.is_file():
@@ -588,6 +684,7 @@ def file_review_pair(
             "new": "",
             "kind": st.get("kind") or "modified",
             "is_new": not st.get("had"),
+            "is_deleted": False,
             "binary": True,
         }
     text = current or ""
@@ -598,6 +695,7 @@ def file_review_pair(
             "new": text,
             "kind": "added",
             "is_new": True,
+            "is_deleted": False,
             "binary": False,
         }
     old = _blob_text(st.get("blob"), workspace) or ""
@@ -608,6 +706,7 @@ def file_review_pair(
         "new": text,
         "kind": kind,
         "is_new": False,
+        "is_deleted": False,
         "binary": False,
     }
 

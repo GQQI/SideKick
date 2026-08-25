@@ -40,15 +40,57 @@ def test_review_snapshot_deleted(tmp_path: Path) -> None:
     assert snap["files"][0]["path"] == "gone.txt"
     assert snap["files"][0]["kind"] == "deleted"
     assert snap["files"][0]["deleted"] == 2
+    pair = fs_undo.file_review_pair(tmp_path, "gone.txt")
+    assert pair["kind"] == "deleted"
+    assert pair["is_deleted"] is True
+    assert pair["new"] == ""
+    assert pair["old"].replace("\r\n", "\n") == "x\ny\n"
 
 
-def test_review_skips_create_then_delete(tmp_path: Path) -> None:
+def test_review_shows_create_then_delete(tmp_path: Path) -> None:
     fs_undo.push_before_create("tmp.txt", "file", tmp_path)
     (tmp_path / "tmp.txt").write_text("n\n", encoding="utf-8")
     fs_undo.push_before_delete("tmp.txt", tmp_path / "tmp.txt", tmp_path)
     (tmp_path / "tmp.txt").unlink()
     snap = fs_undo.review_snapshot(tmp_path)
-    assert snap["files"] == []
+    assert len(snap["files"]) == 1
+    assert snap["files"][0]["path"] == "tmp.txt"
+    assert snap["files"][0]["kind"] == "deleted"
+    pair = fs_undo.file_review_pair(tmp_path, "tmp.txt")
+    assert pair["kind"] == "deleted"
+    assert "n" in pair["old"]
+
+
+def test_review_missing_after_modify_is_deleted(tmp_path: Path) -> None:
+    (tmp_path / "a.txt").write_text("hello\n", encoding="utf-8")
+    fs_undo.push_before_write("a.txt", tmp_path / "a.txt", tmp_path)
+    (tmp_path / "a.txt").write_text("hello\nworld\n", encoding="utf-8")
+    (tmp_path / "a.txt").unlink()
+    snap = fs_undo.review_snapshot(tmp_path)
+    assert len(snap["files"]) == 1
+    assert snap["files"][0]["kind"] == "deleted"
+    pair = fs_undo.file_review_pair(tmp_path, "a.txt")
+    assert pair["kind"] == "deleted"
+    assert pair["old"].replace("\r\n", "\n") == "hello\n"
+
+
+def test_review_dir_delete_lists_inner_files(tmp_path: Path) -> None:
+    pack = tmp_path / "pack"
+    pack.mkdir()
+    (pack / "a.txt").write_text("one\n", encoding="utf-8")
+    (pack / "b.txt").write_text("two\nthree\n", encoding="utf-8")
+    fs_undo.push_before_delete("pack", pack, tmp_path)
+    import shutil
+
+    shutil.rmtree(pack)
+    snap = fs_undo.review_snapshot(tmp_path)
+    paths = {f["path"]: f for f in snap["files"]}
+    assert paths["pack/a.txt"]["kind"] == "deleted"
+    assert paths["pack/b.txt"]["kind"] == "deleted"
+    pair = fs_undo.file_review_pair(tmp_path, "pack/a.txt")
+    assert pair["kind"] == "deleted"
+    assert "one" in pair["old"]
+    assert pair["new"] == ""
 
 
 def test_checkpoint_clips_long_user_text(tmp_path: Path) -> None:

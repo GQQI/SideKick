@@ -920,6 +920,7 @@ export type GitFileDiff = {
   new: string;
   kind: string;
   is_new?: boolean;
+  is_deleted?: boolean;
   binary?: boolean;
 };
 export const fetchGitFileDiff = (path: string, sessionId?: string | null) => {

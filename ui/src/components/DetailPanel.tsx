@@ -184,6 +184,7 @@ function ToolDetail({
               loading={detailDiffLoading}
               title={t("diffPreview")}
               newFileLabel={t("diffNewFile")}
+              deletedFileLabel={t("diffDeletedFile")}
               truncatedLabel={t("diffTruncated")}
               emptyLabel={t("diffEmpty")}
               alreadyAppliedLabel={t("diffAlreadyApplied")}

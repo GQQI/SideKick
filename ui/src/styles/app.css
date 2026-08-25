@@ -1725,7 +1725,9 @@ html[data-theme="dark"] .diff-review-body {
 }
 
 .review-files {
-  max-height: 38%;
+  flex: 0 1 46%;
+  min-height: 7rem;
+  max-height: 46%;
   overflow: auto;
   padding: 6px 8px 8px;
   border-bottom: 1px solid var(--line);

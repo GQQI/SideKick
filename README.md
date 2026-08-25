@@ -1,10 +1,30 @@
 # Sidekick
 
-[English](README.en.md) · 中文
+**Sidekick** 不是一个聊天机器人，而是一个 **真正属于你本地文件系统的智能协作团队**。  
+它由主智能体与子智能体协同工作，帮你搜索、阅读、编辑文件。
 
-**Sidekick** 是开源的**本机多智能体平台**。打开本地文件夹即可对话：主智能体与子智能体协作搜索、编辑文件，写入前会征求确认。Skills 可直接丢进目录，Memory 可按分类长期保存。
+---
 
-定位很简单：**方便二开**。Python 后端 + Vite 前端分层清楚，加一个 Skill 或注册一条工具就能做成自己的私有版，不必改核心黑盒。
+## ✨ 核心亮点
+
+### 🤝 多智能体协作，而非单点对话
+- 主智能体负责任务拆解与调度
+- 子智能体专注执行具体动作（搜索、读取、编辑）
+- 你始终在决策链中，**变更需确认**，可控且透明
+
+### 📁 本地优先，开箱即用
+- 打开任意本机文件夹，浏览器内即可对话
+- 无需上传云端，数据不出设备
+- 适合处理代码库、文档、日志等敏感或大规模内容
+
+### 🧩 Skill 即插即用，目录即能力
+- 新增 Skill 只需丢进目录，无需修改核心代码
+- 支持自定义工具注册，快速适配私有工作流
+- 真正为**二次开发**设计，不硬啃黑盒
+
+### 🧠 长期记忆，越用越懂你
+- Memory 机制可长期存储偏好、上下文与决策习惯
+- 跨会话保持一致性，减少重复说明
 
 **Windows · macOS · Linux** · 默认 **http://127.0.0.1:8787**
 
@@ -13,56 +33,6 @@
 ## 界面预览
 
 ![主工作台](docs/screenshots/workbench.jpg)
-
----
-
-## 介绍
-
-**方便二开**  
-`src/metateam/` 是运行时（API、智能体、工具），`ui/` 是控制界面。Skills、Memory、模型配置彼此独立——拷走仓库、换皮肤、加工具即可私有化。
-
-二开入口很短：
-
-- **加 Skill**：把目录丢进 `src/skills/`，对话里用 `/skill 名称` 调用
-- **加工具**：在 `src/metateam/runtime/tools.py` 注册函数即可被智能体调用
-- **改界面**：`ui/src/`，样式在 `ui/src/styles/app.css`（不必改后端）
-- **接模型**：任意 OpenAI 兼容网关（Base URL + API Key + 模型名）
-
-**Token 更省**  
-上下文将满时自动压缩。Skills 按需调用，而不是每轮把长流程塞进 prompt。主模型 / 子模型 / 压缩模型可分开配置。
-
-**贴着工作区干活**  
-文件名与内容搜索、流式对话、详情面板一体。写入、删除、Shell、记忆变更会先征求批准。
-
-**数据在你这边**  
-本机运行，自备 API Key。历史、Memory、工作区文件都在你控制的磁盘上。
-
----
-
-## 能力一览
-
-| | |
-|---|---|
-| **对话 + 工具** | SSE 流式、附件、干净停止、编辑重发（可选恢复文件到该步） |
-| **文件** | 新建 / 重命名 / 删除确认 / 拖拽移动；按文件名**与**内容搜索并跳行 |
-| **浏览器沙盒** | 预览本地站、点选 DOM 发给智能体；智能体可用 browser_* 工具验收 |
-| **Memory** | 分类记忆库：开关控制哪些条目注入下一轮对话 |
-| **Skills** | 放到 `src/skills/`，`/skill <名称>` 调用 |
-| **模型** | 任意 OpenAI 兼容接口；主模型 / 子模型 / 压缩模型可分开配置 |
-| **界面** | 中 / 英 · 浅 / 暗色 · 历史分页 |
-
-### 斜杠命令
-
-`/help` · `/new` · `/clear` · `/skills` · `/skill <名称>` · `/memory` · `/history` · `/browser` · `/stop`
-
-浏览器沙盒依赖 Playwright Chromium（一次性）：
-
-```bash
-pip install playwright
-playwright install chromium
-```
-
-详见 [docs/browser-sandbox.md](docs/browser-sandbox.md)。
 
 ---
 
@@ -102,7 +72,12 @@ python3 main.py
 .\start-desktop.bat
 ```
 
-详见 [desktop/README.md](desktop/README.md) · [docs/browser-sandbox.md](docs/browser-sandbox.md)。
+浏览器沙盒依赖 Playwright Chromium（一次性）：
+
+```bash
+pip install playwright
+playwright install chromium
+```
 
 ### Windows 离线安装包（.exe）
 
@@ -111,8 +86,6 @@ python3 main.py
 ```powershell
 .\scripts\build-windows.bat
 ```
-
-详见 [packaging/windows/README.md](packaging/windows/README.md)。
 
 > 切勿提交真实 Key、`.env`、会话或 `model.json`（见 `.gitignore`）。
 
@@ -131,6 +104,17 @@ npm i
 npm run dev          # 热更新
 # npm run build      # 构建后只跑后端即可托管静态页
 ```
+
+### 斜杠命令
+
+`/help` · `/new` · `/clear` · `/skills` · `/skill <名称>` · `/memory` · `/history` · `/browser` · `/stop`
+
+### 二开入口
+
+- **加 Skill**：把目录丢进 `src/skills/`，对话里用 `/skill 名称` 调用
+- **加工具**：在 `src/metateam/runtime/tools/` 注册函数即可被智能体调用
+- **改界面**：`ui/src/`，样式在 `ui/src/styles/app.css`（不必改后端）
+- **接模型**：任意 OpenAI 兼容网关（Base URL + API Key + 模型名）
 
 ---
 
@@ -180,8 +164,7 @@ Sidekick/
 ├── start.bat
 ├── start-desktop.bat
 ├── requirements.txt
-├── README.md
-└── README.en.md
+└── README.md
 ```
 
 欢迎 Fork、改界面、加 Skills，做成自己的多智能体工作台。

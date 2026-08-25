@@ -258,6 +258,7 @@ export function ComposerBar({
                 acceptHunkLabel={t("diffAcceptHunk")}
                 title={t("diffPreview")}
                 newFileLabel={t("diffNewFile")}
+                deletedFileLabel={t("diffDeletedFile")}
                 truncatedLabel={t("diffTruncated")}
                 emptyLabel={t("diffEmpty")}
                 alreadyAppliedLabel={t("diffAlreadyApplied")}

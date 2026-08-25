@@ -14,6 +14,7 @@ export type FileDiffPreview = {
   oldText: string;
   newText: string;
   isNew: boolean;
+  isDeleted?: boolean;
   /** True when preview is only the old/new snippet (file not used). */
   snippetOnly?: boolean;
   /** True when file already matches the intended result. */
@@ -149,7 +150,7 @@ export async function buildFileDiff(
   const obj = args as Record<string, unknown>;
   const path = argString(obj, "path");
   if (!path) return null;
-  if (tool !== "write_file" && tool !== "str_replace") return null;
+  if (tool !== "write_file" && tool !== "str_replace" && tool !== "delete_file") return null;
 
   let fileText = "";
   let fileMissing = false;
@@ -164,6 +165,7 @@ export async function buildFileDiff(
   let oldText = fileText;
   let newText = fileText;
   let isNew = fileMissing;
+  let isDeleted = false;
   let snippetOnly = false;
   let alreadyApplied = false;
   let statDel: number | undefined;
@@ -182,6 +184,17 @@ export async function buildFileDiff(
       statDel = 0;
       statAdd = nlines(newText);
     }
+  } else if (tool === "delete_file") {
+    isDeleted = true;
+    isNew = false;
+    newText = "";
+    if (fileMissing) {
+      oldText = "";
+    } else {
+      oldText = fileText;
+    }
+    statAdd = 0;
+    statDel = nlines(oldText);
   } else if (tool === "str_replace") {
     const oldStr = argString(obj, "old_string", "oldString");
     const newStr = argString(obj, "new_string", "newString");
@@ -260,6 +273,7 @@ export async function buildFileDiff(
     oldText,
     newText,
     isNew,
+    isDeleted,
     snippetOnly,
     alreadyApplied,
     statDel,
@@ -273,7 +287,7 @@ export async function buildFileDiff(
 }
 
 export function isFileMutatingTool(name: string): boolean {
-  return name === "write_file" || name === "str_replace";
+  return name === "write_file" || name === "str_replace" || name === "delete_file";
 }
 
 export type DiffHunk = {
@@ -348,7 +362,7 @@ export function previewFromTexts(
   path: string,
   oldText: string,
   newText: string,
-  opts?: { isNew?: boolean },
+  opts?: { isNew?: boolean; isDeleted?: boolean },
 ): FileDiffPreview {
   const oldT = truncateText(oldText || "");
   const newT = truncateText(newText || "");
@@ -365,6 +379,7 @@ export function previewFromTexts(
     oldText: oldT.text,
     newText: newT.text,
     isNew: Boolean(opts?.isNew),
+    isDeleted: Boolean(opts?.isDeleted),
     statAdd: lines.filter((l) => l.kind === "add").length,
     statDel: lines.filter((l) => l.kind === "del").length,
     lines,

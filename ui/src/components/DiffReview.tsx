@@ -8,6 +8,7 @@ type Props = {
   loading?: boolean;
   title?: string;
   newFileLabel?: string;
+  deletedFileLabel?: string;
   truncatedLabel?: string;
   emptyLabel?: string;
   alreadyAppliedLabel?: string;
@@ -80,6 +81,7 @@ export function DiffReview({
   loading,
   title = "变更预览",
   newFileLabel = "新建文件",
+  deletedFileLabel = "已删除文件",
   truncatedLabel = "已截断显示",
   emptyLabel = "无文本变更",
   alreadyAppliedLabel = "已应用到文件",
@@ -150,6 +152,7 @@ export function DiffReview({
         </span>
         <span className="diff-review-meta">
           {diff.isNew ? <span className="diff-badge">{newFileLabel}</span> : null}
+          {diff.isDeleted ? <span className="diff-badge">{deletedFileLabel}</span> : null}
           {diff.snippetOnly ? <span className="diff-badge">{snippetLabel}</span> : null}
           {diff.alreadyApplied ? (
             <span className="diff-badge">{alreadyAppliedLabel}</span>
@@ -160,7 +163,7 @@ export function DiffReview({
               <span className="diff-stat add">+{adds}</span>
             </span>
           ) : (
-            <span className="diff-stat muted">{emptyLabel}</span>
+            <span className="diff-stat muted">{diff.isDeleted ? deletedFileLabel : emptyLabel}</span>
           )}
           {canSelect ? (
             <span className="diff-stat muted">
@@ -183,7 +186,7 @@ export function DiffReview({
       </div>
       <div className="diff-review-body" role="table" aria-label={title}>
         {!hasChanges ? (
-          <div className="diff-review-empty">{emptyLabel}</div>
+          <div className="diff-review-empty">{diff.isDeleted ? deletedFileLabel : emptyLabel}</div>
         ) : canSelect ? (
           hunks.map((hunk) => {
             const on = accepted.has(hunk.id);

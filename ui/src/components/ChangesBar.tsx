@@ -119,7 +119,8 @@ export function ReviewPanel({
         }
         setDiff(
           previewFromTexts(pair.path, pair.old || "", pair.new || "", {
-            isNew: Boolean(pair.is_new),
+            isNew: Boolean(pair.is_new) || pair.kind === "added",
+            isDeleted: Boolean(pair.is_deleted) || pair.kind === "deleted",
           }),
         );
       })
@@ -138,7 +139,10 @@ export function ReviewPanel({
 
   const files = snap?.files || [];
   const totals = snap?.totals || { files: 0, added: 0, deleted: 0 };
-  const modified = files.filter((f) => f.kind !== "deleted");
+  const added = files.filter((f) => f.kind === "added" || f.kind === "untracked");
+  const modified = files.filter(
+    (f) => f.kind !== "deleted" && f.kind !== "added" && f.kind !== "untracked",
+  );
   const deleted = files.filter((f) => f.kind === "deleted");
 
   function renderList(items: GitFileEntry[]) {
@@ -184,7 +188,18 @@ export function ReviewPanel({
       </div>
       <div className="review-files">
         {files.length === 0 ? <div className="muted">{t("gitClean")}</div> : null}
-        {modified.length > 0 ? renderList(modified) : null}
+        {added.length > 0 ? (
+          <>
+            <div className="review-files-head">{t("gitReviewAdded")}</div>
+            {renderList(added)}
+          </>
+        ) : null}
+        {modified.length > 0 ? (
+          <>
+            <div className="review-files-head">{t("gitReviewModified")}</div>
+            {renderList(modified)}
+          </>
+        ) : null}
         {deleted.length > 0 ? (
           <>
             <div className="review-files-head">{t("gitReviewDeleted")}</div>
@@ -204,6 +219,7 @@ export function ReviewPanel({
             fill
             title={t("reviewFileDiff")}
             newFileLabel={t("diffNewFile")}
+            deletedFileLabel={t("diffDeletedFile")}
             truncatedLabel={t("diffTruncated")}
             emptyLabel={t("diffEmpty")}
             alreadyAppliedLabel={t("diffAlreadyApplied")}
