@@ -1,0 +1,240 @@
+import { useEffect } from "react";
+import {
+  saveExplorerCollapsed,
+  saveExplorerWidth,
+  saveSidePanel,
+  type SidePanel,
+} from "../layoutPersist";
+import type { ApprovalPrompt, AskPrompt, DetailView } from "../types/chat";
+import type { PlanConfirmState } from "../types/plan";
+import type { ChatMsg } from "../types/chat";
+
+type CompressState = {
+  active: boolean;
+  message: string;
+  attempt: number;
+  maxAttempts: number;
+  before: number;
+  after?: number;
+} | null;
+
+type Deps = {
+  sidePanel: SidePanel;
+  explorerCollapsed: boolean;
+  explorerWidth: number;
+  setExplorerCollapsed: (v: boolean | ((p: boolean) => boolean)) => void;
+  setExplorerWidth: (v: number | ((p: number) => number)) => void;
+  setDetailWidth: (v: number | ((p: number) => number)) => void;
+  resizingRef: React.MutableRefObject<boolean>;
+  resizingDetailRef: React.MutableRefObject<boolean>;
+  stickBottomRef: React.MutableRefObject<boolean>;
+  threadRef: React.RefObject<HTMLDivElement | null>;
+  bottomRef: React.RefObject<HTMLDivElement | null>;
+  composerRef: React.RefObject<HTMLTextAreaElement | null>;
+  messages: ChatMsg[];
+  busy: boolean;
+  compressState: CompressState;
+  bootReady: boolean;
+  contextLimit?: number;
+  setCtx: React.Dispatch<React.SetStateAction<{ tokens: number; limit: number }>>;
+  toast: string;
+  setToast: (msg: string) => void;
+  approval: ApprovalPrompt | null;
+  askPrompt: AskPrompt | null;
+  planConfirm: PlanConfirmState | null;
+  settingsOpen: boolean;
+  setSettingsOpen: (v: boolean) => void;
+  detail: DetailView;
+  setDetail: React.Dispatch<React.SetStateAction<DetailView>>;
+  input: string;
+  setInput: React.Dispatch<React.SetStateAction<string>>;
+  sessionsPage: number;
+  onNewChat: () => void;
+  onOpenHistory: () => void;
+  onOpenSettings: () => void;
+};
+
+export function useAppChrome(d: Deps) {
+  useEffect(() => {
+    saveSidePanel(d.sidePanel);
+  }, [d.sidePanel]);
+
+  useEffect(() => {
+    if (d.sidePanel === "browser" && !d.explorerCollapsed) {
+      d.setExplorerWidth((w) => (w < 520 ? 640 : w));
+    }
+  }, [d.sidePanel, d.explorerCollapsed]);
+
+  useEffect(() => {
+    saveExplorerCollapsed(d.explorerCollapsed);
+  }, [d.explorerCollapsed]);
+
+  useEffect(() => {
+    saveExplorerWidth(d.explorerWidth);
+  }, [d.explorerWidth]);
+
+  useEffect(() => {
+    const mq = window.matchMedia("(max-width: 768px)");
+    const apply = () => {
+      if (mq.matches) d.setExplorerCollapsed(true);
+    };
+    apply();
+    mq.addEventListener("change", apply);
+    return () => mq.removeEventListener("change", apply);
+  }, []);
+
+  useEffect(() => {
+    if (d.contextLimit) {
+      d.setCtx((c) => ({ ...c, limit: d.contextLimit || c.limit }));
+    }
+  }, [d.contextLimit]);
+
+  useEffect(() => {
+    if (!d.stickBottomRef.current) return;
+    const el = d.threadRef.current;
+    if (el) {
+      const dist = el.scrollHeight - el.scrollTop - el.clientHeight;
+      if (dist >= 80) {
+        d.stickBottomRef.current = false;
+        return;
+      }
+      el.scrollTop = el.scrollHeight;
+    } else {
+      d.bottomRef.current?.scrollIntoView({ behavior: "auto", block: "end" });
+    }
+  }, [d.messages, d.busy, d.compressState?.active]);
+
+  useEffect(() => {
+    const el = d.threadRef.current;
+    if (!el) return;
+    const unpinIfUp = (deltaY: number) => {
+      if (deltaY < 0) d.stickBottomRef.current = false;
+    };
+    const onWheel = (e: WheelEvent) => unpinIfUp(e.deltaY);
+    let touchY: number | null = null;
+    const onTouchStart = (e: TouchEvent) => {
+      touchY = e.touches[0]?.clientY ?? null;
+    };
+    const onTouchMove = (e: TouchEvent) => {
+      const y = e.touches[0]?.clientY;
+      if (touchY != null && y != null) unpinIfUp(touchY - y);
+      touchY = y ?? touchY;
+    };
+    el.addEventListener("wheel", onWheel, { passive: true });
+    el.addEventListener("touchstart", onTouchStart, { passive: true });
+    el.addEventListener("touchmove", onTouchMove, { passive: true });
+    return () => {
+      el.removeEventListener("wheel", onWheel);
+      el.removeEventListener("touchstart", onTouchStart);
+      el.removeEventListener("touchmove", onTouchMove);
+    };
+  }, [d.bootReady]);
+
+  useEffect(() => {
+    const onMove = (e: MouseEvent) => {
+      if (d.resizingRef.current) {
+        const maxW = Math.min(1200, Math.max(520, Math.floor(window.innerWidth * 0.72)));
+        const next = Math.min(maxW, Math.max(200, e.clientX - 64));
+        d.setExplorerWidth(next);
+        d.setExplorerCollapsed(false);
+      }
+      if (d.resizingDetailRef.current) {
+        const fromRight = window.innerWidth - e.clientX - 12;
+        const next = Math.min(720, Math.max(280, fromRight));
+        d.setDetailWidth(next);
+      }
+    };
+    const onUp = () => {
+      d.resizingRef.current = false;
+      d.resizingDetailRef.current = false;
+      document.body.classList.remove("resizing-sidebar");
+    };
+    window.addEventListener("mousemove", onMove);
+    window.addEventListener("mouseup", onUp);
+    return () => {
+      window.removeEventListener("mousemove", onMove);
+      window.removeEventListener("mouseup", onUp);
+    };
+  }, []);
+
+  useEffect(() => {
+    const onKey = (e: KeyboardEvent) => {
+      const mod = e.metaKey || e.ctrlKey;
+      const target = e.target as HTMLElement | null;
+      const typing =
+        target &&
+        (target.tagName === "TEXTAREA" ||
+          target.tagName === "INPUT" ||
+          target.isContentEditable);
+
+      if (e.key === "Escape") {
+        if (d.approval || d.askPrompt || d.planConfirm) return;
+        if (d.settingsOpen) {
+          d.setSettingsOpen(false);
+          return;
+        }
+        if (d.sidePanel === "history" && !d.explorerCollapsed) {
+          d.setExplorerCollapsed(true);
+          return;
+        }
+        if (d.detail) {
+          if (d.detail.type === "changes" && d.detail.selectedPath) {
+            d.setDetail({ type: "changes", selectedPath: null });
+            return;
+          }
+          d.setDetail(null);
+          return;
+        }
+        if (d.input.startsWith("/")) {
+          d.setInput("");
+          return;
+        }
+      }
+
+      if (mod && e.key.toLowerCase() === "n") {
+        e.preventDefault();
+        d.onNewChat();
+        return;
+      }
+      if (mod && e.key.toLowerCase() === "k") {
+        e.preventDefault();
+        d.onOpenHistory();
+        return;
+      }
+      if (mod && e.key === ",") {
+        e.preventDefault();
+        d.onOpenSettings();
+        return;
+      }
+      if (mod && e.key === "/") {
+        e.preventDefault();
+        d.composerRef.current?.focus();
+        d.setInput((v) => (v.startsWith("/") ? v : "/"));
+        return;
+      }
+      if (!typing && e.key === "/" && !mod && !e.altKey) {
+        e.preventDefault();
+        d.composerRef.current?.focus();
+        d.setInput("/");
+      }
+    };
+    window.addEventListener("keydown", onKey);
+    return () => window.removeEventListener("keydown", onKey);
+  }, [
+    d.approval,
+    d.askPrompt,
+    d.settingsOpen,
+    d.sidePanel,
+    d.explorerCollapsed,
+    d.detail,
+    d.input,
+    d.sessionsPage,
+    d.planConfirm,
+  ]);
+
+  useEffect(() => {
+    if (!d.toast) return;
+    const t = window.setTimeout(() => d.setToast(""), 5000);
+    return () => window.clearTimeout(t);
+  }, [d.toast]);
+}
