@@ -26,7 +26,12 @@ All capabilities are OpenAI function tools. Call them with JSON arguments.
   Do not run bare `npm create vue@latest` and wait for prompts.
 - skill_* tools: each installed skill is a callable function. Call the matching
   skill_* tool when its description fits; follow the returned procedure.
-- delegate_task: fan out isolated subagents for heavy/parallel work.
+- delegate_task: DEFAULT for spawning workers. Isolated parallel *work*
+  (search, research, edit, gather sources). Parent synthesizes the summaries.
+  Children cannot hear each other. "Start two agents to search then summarize"
+  is ALWAYS this tool — never delegate_dialogue.
+- delegate_dialogue: ONLY when named parties must speak TO EACH OTHER in
+  character (debate, negotiation, military sim, tabletop). Not for research.
 - ask_user: when information is missing or a decision is needed, ask the user
   BEFORE acting — at ANY stage (start, mid-task, after tool results). Provide
   question + options (array of 2–12 short labels). allow_custom lets the user
@@ -53,9 +58,28 @@ Once a tool has returned contents this turn, reuse that result. Do not call the 
 Batch independent reads/searches/skill lookups in ONE turn. Serialize only when
 a later call needs an earlier result. Never parallelize ask_user with mutating tools.
 
-# Delegation
+# Delegation (CRITICAL)
 Children have no parent history — put paths/errors in context.
 role=orchestrator only for fan-out then synthesize (depth-limited).
+Choose the tool by what the children must do:
+- Separate work then merge (search, research, code, files, "分别搜集再汇总")
+  → delegate_task with tasks=[{goal, context}, …]. You summarize after.
+- Live back-and-forth in roles (debate, 红蓝对抗, negotiation, tabletop)
+  → delegate_dialogue. Do NOT enter Plan mode.
+"启动 N 个智能体" by itself is NOT dialogue. If they work independently, use
+delegate_task. Never use delegate_dialogue for parallel research.
+
+# Live multi-agent session
+Use delegate_dialogue ONLY when parties must interact with each other in
+character — military/red-blue simulation, negotiation, debate, tabletop:
+- Call it with topic + speakers[{name, brief}] + optional mode + rounds (2–8 parties).
+- Each party is a full agent with your tools, kept across rounds, and may spawn helpers.
+- Do NOT write Python/JS/HTML simulators unless they asked you to implement software.
+- Do NOT invent the specific question, victory conditions, or party list.
+  If the user named a domain but not the exact scenario, format, or who participates:
+  search and/or ask_user first. Then call delegate_dialogue (still not Plan).
+- Do NOT play every party yourself in one assistant message.
+- Do NOT use this tool to split research or other work across agents.
 
 # Memory
 memory_list to see categories and notes (ON = injected this session).
@@ -104,11 +128,23 @@ and sprawling if/loops. Completion means good shape, not only "it runs".
 SUBAGENT_CORE = """You are a focused Sidekick subagent.
 Complete YOUR TASK using function tools. Finish with a tight bullet summary:
 outcomes, files touched, remaining issues. Skills are skill_* function tools.
+If DEPTH allows, you MAY call delegate_task to spawn helpers, then synthesize.
+"""
+
+SESSION_PARTY_EXTRA = """
+# Session party (CRITICAL)
+You are a FULL agent with the same tools as the lead operator, acting as the
+named party in YOUR TASK. You MAY search, read/write files, browse, run_shell,
+ask_user, and call delegate_task / delegate_dialogue to create other agents
+(depth-limited). Use tools first when facts would change your move.
+Stay in character for public output. Your final assistant message is this
+party's action this turn (not a meta summary of tools unless asked).
 """
 
 ORCHESTRATOR_EXTRA = """
 # Orchestrator
 You MAY call delegate_task to fan out, then synthesize. Prefer 2–3 focused leaves.
+You MAY call delegate_dialogue only if helpers must talk to each other in character.
 """
 
 
@@ -156,15 +192,26 @@ def build_system_prompt(
     context: str = "",
     depth: int = 0,
     max_depth: int = 2,
+    talk_only: bool = False,
+    full_agent: bool = False,
 ) -> str:
     parts: list[str] = []
-    if is_subagent:
+    if full_agent:
+        parts.append(CORE)
+        parts.append(SESSION_PARTY_EXTRA)
+        parts.append(f"YOUR TASK:\n{goal}")
+        if context.strip():
+            parts.append(f"CONTEXT:\n{context.strip()}")
+        parts.append(f"DEPTH: {depth}/{max_depth} role={role}")
+        if depth < max_depth:
+            parts.append(ORCHESTRATOR_EXTRA)
+    elif is_subagent:
         parts.append(SUBAGENT_CORE)
         parts.append(f"YOUR TASK:\n{goal}")
         if context.strip():
             parts.append(f"CONTEXT:\n{context.strip()}")
         parts.append(f"DEPTH: {depth}/{max_depth} role={role}")
-        if role == "orchestrator":
+        if depth < max_depth:
             parts.append(ORCHESTRATOR_EXTRA)
     else:
         parts.append(CORE)
@@ -173,7 +220,7 @@ def build_system_prompt(
     parts.append(f"WORKSPACE: {workspace.resolve()}")
 
     # Compact list of skill function names (schemas carry full descriptions)
-    if skills:
+    if skills and not talk_only:
         names = ", ".join(f"skill_{_safe(s.name)}" for s in skills)
         parts.append(
             "## Skill functions\n"
@@ -181,7 +228,7 @@ def build_system_prompt(
             "Pick by tool description; calling returns the procedure to follow."
         )
 
-    if not is_subagent:
+    if (not is_subagent) or full_agent:
         from ..core.logutil import get_logger, log_exception
 
         try:

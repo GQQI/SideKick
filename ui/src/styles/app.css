@@ -12,6 +12,7 @@
   --accent-soft: rgba(47, 111, 237, 0.1);
   --accent-border: rgba(47, 111, 237, 0.28);
   --accent-hover: #245bd4;
+  --accent-ink: #ffffff;
   --warn: #b67a1e;
   --danger: #c44b4b;
   --shadow: 0 10px 36px rgba(18, 28, 43, 0.07);
@@ -29,26 +30,27 @@
 }
 
 html[data-theme="dark"] {
-  --bg: #0d1218;
-  --bg-2: #141b24;
-  --surface: #171e28;
-  --surface-2: #1e2733;
-  --ink: #e9eef5;
-  --ink-soft: #c5d0dc;
-  --muted: #8a98a8;
-  --line: rgba(233, 238, 245, 0.09);
-  --line-strong: rgba(233, 238, 245, 0.15);
-  --accent: #6ba0ff;
-  --accent-soft: rgba(107, 160, 255, 0.14);
-  --accent-border: rgba(107, 160, 255, 0.34);
-  --accent-hover: #84b0ff;
-  --warn: #e0a045;
-  --danger: #f07178;
+  --bg: #0b1016;
+  --bg-2: #121922;
+  --surface: #1a222d;
+  --surface-2: #243040;
+  --ink: #f7f9fc;
+  --ink-soft: #e8eef6;
+  --muted: #c5d0dc;
+  --line: rgba(243, 246, 251, 0.16);
+  --line-strong: rgba(243, 246, 251, 0.28);
+  --accent: #7eafff;
+  --accent-soft: rgba(126, 175, 255, 0.2);
+  --accent-border: rgba(126, 175, 255, 0.48);
+  --accent-hover: #9bc0ff;
+  --accent-ink: #0b1016;
+  --warn: #e8b04d;
+  --danger: #ff8a90;
   --shadow: 0 12px 40px rgba(0, 0, 0, 0.42);
   --shadow-soft: 0 2px 12px rgba(0, 0, 0, 0.25);
-  --wash-a: rgba(107, 160, 255, 0.09);
-  --wash-b: rgba(40, 80, 140, 0.1);
-  --wash-c: #10161e;
+  --wash-a: rgba(126, 175, 255, 0.12);
+  --wash-b: rgba(40, 80, 140, 0.12);
+  --wash-c: #0e141c;
   --panel: var(--surface);
 }
 
@@ -298,7 +300,7 @@ body {
   width: 52px;
   border: none;
   background: transparent;
-  color: var(--muted);
+  color: var(--ink-soft);
   border-radius: 12px;
   padding: 8px 4px 6px;
   cursor: pointer;
@@ -320,6 +322,42 @@ body {
   background: var(--accent-soft);
   color: var(--accent);
   box-shadow: inset 0 0 0 1px var(--accent-border);
+}
+
+html[data-theme="dark"] .activity-rail,
+html[data-theme="dark"] .explorer,
+html[data-theme="dark"] .side-panel,
+html[data-theme="dark"] .detail-panel {
+  background: var(--surface-2);
+  color: var(--ink);
+}
+
+html[data-theme="dark"] .activity-btn {
+  color: var(--ink);
+}
+
+html[data-theme="dark"] .activity-btn svg {
+  stroke-width: 2.1;
+}
+
+html[data-theme="dark"] .fe-row,
+html[data-theme="dark"] .fe-title,
+html[data-theme="dark"] .fe-actions button,
+html[data-theme="dark"] .ft-icon.file {
+  color: var(--ink);
+}
+
+html[data-theme="dark"] .mini,
+html[data-theme="dark"] .detail-actions .mini {
+  background: var(--accent);
+  color: var(--accent-ink, #0b1016);
+  border-color: var(--accent);
+}
+
+html[data-theme="dark"] .detail-actions .mini:disabled {
+  background: var(--surface);
+  color: var(--ink-soft);
+  border-color: var(--line-strong);
 }
 
 .side-panel-wrap {
@@ -357,7 +395,32 @@ body {
   margin-left: auto;
   display: flex;
   align-items: center;
-  gap: 2px;
+  gap: 4px;
+}
+
+.side-panel-head-actions .icon-btn {
+  width: 32px;
+  height: 32px;
+  padding: 0;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  color: var(--ink);
+  background: var(--surface-2);
+  border: 1px solid var(--line-strong);
+  cursor: pointer;
+  flex-shrink: 0;
+}
+
+.side-panel-head-actions .icon-btn:hover:not(:disabled) {
+  color: var(--accent);
+  border-color: var(--accent-border);
+  background: var(--accent-soft);
+}
+
+.side-panel-head-actions .icon-btn:disabled {
+  opacity: 0.55;
+  cursor: default;
 }
 
 .search-box {
@@ -585,6 +648,7 @@ body {
   flex: 0 0 auto;
   width: 260px;
   background: var(--surface);
+  color: var(--ink);
   border: 1px solid var(--line);
   border-radius: var(--radius-lg);
   box-shadow: var(--shadow-soft);
@@ -792,7 +856,7 @@ body.resizing-sidebar {
   text-align: left;
   padding: 4px 8px;
   cursor: pointer;
-  color: var(--ink-soft);
+  color: var(--ink);
   font-family: var(--sans);
   font-size: 0.82rem;
   min-width: 0;
@@ -1023,7 +1087,7 @@ body.resizing-sidebar {
 }
 
 .ft-icon.file {
-  color: var(--muted);
+  color: var(--ink-soft);
 }
 
 .ft-badge {
@@ -3046,26 +3110,46 @@ html[data-theme="dark"] .plan-doc {
   align-self: stretch;
   border: 1px solid var(--line);
   border-radius: 14px;
-  background: #f7fafc;
+  background: var(--surface-2);
   padding: 10px 12px;
   display: grid;
   gap: 6px;
   cursor: pointer;
   text-align: left;
   font: inherit;
-  color: inherit;
+  color: var(--ink);
   width: 100%;
+}
+
+.subagent-card-wrap {
+  align-self: stretch;
+  width: 100%;
+  display: grid;
+  gap: 6px;
+}
+
+.subagent-children {
+  display: grid;
+  gap: 6px;
+  margin-left: 14px;
+  padding-left: 10px;
+  border-left: 2px solid var(--accent-border);
+}
+
+.subagent-children .subagent-card {
+  border-radius: 12px;
+  padding: 8px 10px;
 }
 
 .subagent-card:hover,
 .subagent-card.active {
   border-color: var(--accent-border);
-  background: linear-gradient(180deg, #eef6ff, #fff);
+  background: var(--accent-soft);
 }
 
 .subagent-card.running {
   border-color: var(--accent-border);
-  background: linear-gradient(180deg, #f0f7ff, #fff);
+  background: var(--accent-soft);
 }
 
 .subagent-card.done {
@@ -3118,7 +3202,8 @@ html[data-theme="dark"] .plan-doc {
   overflow: auto;
   padding: 8px 10px;
   border-radius: 8px;
-  background: #fff;
+  background: var(--surface);
+  color: var(--ink);
   border: 1px solid var(--line);
   font-size: 0.78rem;
   white-space: pre-wrap;
@@ -3156,7 +3241,8 @@ html[data-theme="dark"] .plan-doc {
   display: flex;
   align-items: center;
   gap: 8px;
-  background: #fff;
+  background: var(--surface);
+  color: var(--ink);
   border-radius: 8px;
   padding: 6px 8px;
   border: 1px solid var(--line);
@@ -3196,6 +3282,7 @@ html[data-theme="dark"] .plan-doc {
   flex-direction: column;
   gap: 8px;
   min-height: 120px;
+  color: var(--ink);
 }
 
 .subagent-detail-thread .tool-chip {
@@ -3301,6 +3388,33 @@ html[data-theme="dark"] .plan-doc {
   color: var(--ink);
   background: var(--accent-soft);
   border-color: var(--accent-border);
+}
+
+.detail-actions .mini {
+  background: var(--accent-soft);
+  color: var(--accent);
+  border: 1px solid var(--accent-border);
+  font-weight: 600;
+}
+
+html[data-theme="dark"] .detail-actions .mini {
+  background: var(--accent);
+  color: var(--accent-ink, #0b1016);
+  border-color: var(--accent);
+}
+
+.detail-actions .mini:disabled {
+  opacity: 0.7;
+  color: var(--ink-soft);
+  background: var(--surface-2);
+  border-color: var(--line-strong);
+}
+
+.detail-actions .icon-btn,
+.detail-actions .detail-close {
+  color: var(--ink);
+  background: var(--surface-2);
+  border: 1px solid var(--line-strong);
 }
 
 .detail-body {
@@ -3945,7 +4059,7 @@ html[data-theme="dark"] .slash-item.skill .slash-item-label {
 .primary {
   border: 1px solid transparent;
   background: var(--accent);
-  color: #ffffff;
+  color: var(--accent-ink, #ffffff);
   border-radius: 999px;
   padding: 8px 16px;
   font-weight: 600;
@@ -4352,6 +4466,30 @@ html[data-theme="dark"] .slash-item.skill .slash-item-label {
   flex-shrink: 0;
 }
 
+.history-open-icon.loading {
+  background: var(--accent-soft);
+}
+
+.history-spinner {
+  width: 12px;
+  height: 12px;
+  border-radius: 50%;
+  border: 2px solid var(--line-strong);
+  border-top-color: var(--accent);
+  animation: boot-spin 0.7s linear infinite;
+}
+
+.history-open.running,
+.history-open.running:hover,
+.history-open.running.active {
+  border-color: var(--accent-border);
+  background: var(--accent-soft);
+}
+
+.history-item.is-running .history-open-text strong {
+  animation: pulse 1.4s ease-in-out infinite;
+}
+
 .history-open-text {
   flex: 1;
   min-width: 0;
@@ -4371,6 +4509,11 @@ html[data-theme="dark"] .slash-item.skill .slash-item-label {
   font-size: 0.72rem;
   font-family: var(--mono);
   flex-shrink: 0;
+}
+
+.history-open-time.running {
+  color: var(--accent);
+  font-weight: 600;
 }
 
 .history-delete {
@@ -4927,11 +5070,12 @@ html[data-density="compact"] .modal-tabs button {
 
 .mini {
   border: 1px solid var(--accent-border);
-  background: #fff;
+  background: var(--accent-soft);
   color: var(--accent);
   border-radius: 999px;
   padding: 6px 10px;
   white-space: nowrap;
+  font-weight: 600;
 }
 
 .mini:disabled {
@@ -4981,6 +5125,39 @@ html[data-density="compact"] .modal-tabs button {
   margin-bottom: 10px;
   font-size: 0.82rem;
   color: var(--muted);
+}
+
+.model-pane label.rf-search,
+.rf-search {
+  display: flex;
+  flex-direction: row;
+  align-items: center;
+  gap: 8px;
+  height: 32px;
+  min-height: 32px;
+  max-height: 32px;
+  margin-bottom: 8px;
+  padding: 0 10px;
+  box-sizing: border-box;
+  border: 1px solid var(--line);
+  border-radius: 10px;
+  background: var(--surface-2);
+  color: var(--muted);
+}
+
+.model-pane label.rf-search input,
+.rf-search input,
+.rf-rename input {
+  border: 0 !important;
+  background: transparent !important;
+  box-shadow: none !important;
+  width: 100%;
+  height: 30px;
+  padding: 0 !important;
+  outline: none;
+  color: var(--ink);
+  font: inherit;
+  line-height: 30px;
 }
 
 .model-pane label.check {
@@ -5138,7 +5315,8 @@ html[data-density="compact"] .modal-tabs button {
   padding: 12px;
   border-radius: 12px;
   border: 1px solid var(--line);
-  background: #fff;
+  background: var(--surface);
+  color: var(--ink);
   overflow: auto;
   text-align: center;
 }
@@ -5902,6 +6080,10 @@ html[data-theme="dark"] .ctx-meter {
   color: var(--ink);
 }
 
+html[data-theme="dark"] .history-open.running {
+  background: var(--accent-soft);
+}
+
 /* Code blocks: github.css is a light theme — force readable dark tokens */
 html[data-theme="dark"] .code-fence {
   background: #0d1117;
@@ -5913,6 +6095,30 @@ html[data-theme="dark"] .code-fence code,
 html[data-theme="dark"] .code-fence .hljs {
   color: #e6edf3 !important;
   background: transparent !important;
+}
+
+html[data-theme="dark"] .hljs {
+  background: transparent !important;
+}
+
+html[data-theme="dark"] .subagent-card,
+html[data-theme="dark"] .subagent-detail,
+html[data-theme="dark"] .subagent-detail .bubble,
+html[data-theme="dark"] .subagent-detail .markdown {
+  color: var(--ink);
+  background: var(--surface-2);
+}
+
+html[data-theme="dark"] .subagent-card.running,
+html[data-theme="dark"] .subagent-card.active,
+html[data-theme="dark"] .subagent-card:hover {
+  background: var(--accent-soft);
+}
+
+html[data-theme="dark"] .subagent-card-summary,
+html[data-theme="dark"] .subagent-tool-result {
+  background: var(--surface);
+  color: var(--ink);
 }
 
 html[data-theme="dark"] .inline-code {
@@ -6086,11 +6292,17 @@ html[data-theme="dark"] .hljs-attribute {
 
 .rf-search {
   display: flex;
+  flex-direction: row;
   align-items: center;
   gap: 8px;
+  height: 32px;
+  min-height: 32px;
+  max-height: 32px;
+  margin-bottom: 8px;
+  padding: 0 10px;
+  box-sizing: border-box;
   border: 1px solid var(--line);
   border-radius: 10px;
-  padding: 0 10px;
   background: var(--surface-2);
   color: var(--muted);
 }
@@ -6101,10 +6313,12 @@ html[data-theme="dark"] .hljs-attribute {
   background: transparent !important;
   box-shadow: none !important;
   width: 100%;
-  padding: 8px 0 !important;
+  height: 30px;
+  padding: 0 !important;
   outline: none;
   color: var(--ink);
   font: inherit;
+  line-height: 30px;
 }
 
 .rf-rename {

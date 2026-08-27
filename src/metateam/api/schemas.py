@@ -85,6 +85,7 @@ class FileReveal(BaseModel):
 
 class UndoBody(BaseModel):
     id: str | None = None
+    session_id: str | None = None
 
 
 class GitPathsBody(BaseModel):

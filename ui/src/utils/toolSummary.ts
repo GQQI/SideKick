@@ -57,7 +57,18 @@ export function formatToolSummary(name: string, args: unknown, fallback = ""): s
   if (name === "memory_remove") return `删除记忆: ${short(str("match"), 80)}`;
   if (name === "memory_write") return `覆写记忆（${str("content").length} 字符）`;
   if (name === "memory_read") return "读取记忆";
-  if (name === "delegate_task") return `委派: ${short(str("goal") || str("task"), 80)}`;
+  if (name === "delegate_task") {
+    const tasks = Array.isArray(a.tasks) ? a.tasks : [];
+    if (tasks.length > 1) return `委派 ${tasks.length} 个智能体`;
+    return `委派: ${short(str("goal") || str("task"), 80)}`;
+  }
+  if (name === "delegate_dialogue") {
+    const speakers = Array.isArray(a.speakers) ? a.speakers : [];
+    const topic = str("topic");
+    if (topic) return `对话: ${short(topic, 80)}`;
+    if (speakers.length) return `对话 · ${speakers.length} 方`;
+    return "多方对话";
+  }
   if (name === "ask_user") return `询问用户: ${short(str("question"), 80)}`;
   if (name === "browser_navigate") return `浏览器打开 ${short(str("url"), 80)}`;
   if (name === "browser_screenshot") return "浏览器截图";

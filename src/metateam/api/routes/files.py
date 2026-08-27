@@ -94,13 +94,14 @@ def api_files_reveal(request: Request, body: FileReveal) -> dict[str, Any]:
 
 
 @router.get("/undo")
-def api_files_undo_status() -> dict[str, Any]:
-    return fs_undo.status()
+def api_files_undo_status(session_id: str = "") -> dict[str, Any]:
+    return fs_undo.status(session_id=session_id or None)
 
 
 @router.post("/undo")
 def api_files_undo(body: UndoBody = UndoBody()) -> dict[str, Any]:
     entry_id = str(body.id or "").strip()
+    sid = str(body.session_id or "").strip() or None
     if entry_id:
-        return call_fs(fs_undo.undo_to_id, entry_id)
-    return call_fs(fs_undo.undo_latest_turn)
+        return call_fs(fs_undo.undo_to_id, entry_id, session_id=sid)
+    return call_fs(fs_undo.undo_latest_turn, session_id=sid)

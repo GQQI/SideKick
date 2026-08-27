@@ -22,7 +22,7 @@ class AgentExecuteMixin:
         call_id = str(tc.get("id") or new_id("call"))
         needs_ok = approval_required(name, tool)
         summary = summarize_tool_call(name, args)
-        mutating = bool(needs_ok) or name == "delegate_task"
+        mutating = bool(needs_ok) or name in ("delegate_task", "delegate_dialogue")
         if mutating and not getattr(self, "_allow_mutating_tools", True):
             content = (
                 "ERROR: still gathering information for the plan; "
@@ -83,29 +83,51 @@ class AgentExecuteMixin:
                     },
                 )
             else:
-                approval_id = new_id("appr")
-                self._emit(
-                    "approval_request",
-                    {
-                        "approval_id": approval_id,
-                        "call_id": call_id,
-                        "name": name,
-                        "args": args,
-                        "summary": summary,
-                        "message": f"等待确认：{summary}",
-                    },
-                )
-                approved = self.approval.request(approval_id, name, args, summary)
-                self._emit(
-                    "approval_resolved",
-                    {
-                        "approval_id": approval_id,
-                        "call_id": call_id,
-                        "name": name,
-                        "approved": approved,
-                        "message": "已批准" if approved else "已拒绝或超时",
-                    },
-                )
+                with self.approval.serialize_ui():
+                    if self.cancelled():
+                        content = f"ERROR: cancelled — {summary}"
+                        self.guard.after(name, args, content)
+                        self._emit(
+                            "tool_end",
+                            {
+                                "name": name,
+                                "args": args,
+                                "call_id": call_id,
+                                "ok": False,
+                                "preview": content[:400],
+                                "result": content,
+                                "message": f"← {name} cancelled",
+                            },
+                        )
+                        return {
+                            "role": "tool",
+                            "tool_call_id": call_id,
+                            "name": name,
+                            "content": content,
+                        }
+                    approval_id = new_id("appr")
+                    self._emit(
+                        "approval_request",
+                        {
+                            "approval_id": approval_id,
+                            "call_id": call_id,
+                            "name": name,
+                            "args": args,
+                            "summary": summary,
+                            "message": f"等待确认：{summary}",
+                        },
+                    )
+                    approved = self.approval.request(approval_id, name, args, summary)
+                    self._emit(
+                        "approval_resolved",
+                        {
+                            "approval_id": approval_id,
+                            "call_id": call_id,
+                            "name": name,
+                            "approved": approved,
+                            "message": "已批准" if approved else "已拒绝或超时",
+                        },
+                    )
                 if not approved:
                     content = f"ERROR: user rejected or approval timed out — {summary}"
                     self.guard.after(name, args, content)

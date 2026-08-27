@@ -1,4 +1,4 @@
-import { useRef } from "react";
+import { useRef, useState } from "react";
 import {
   answerAsk,
   attachSessionEvents,
@@ -11,6 +11,7 @@ import {
   streamChat,
   type RuntimeEvent,
   type SessionDetail,
+  type SessionItem,
   type SkillItem,
 } from "../api";
 import type { ActivePlan } from "../components/TaskPlanPanel";
@@ -30,7 +31,7 @@ import {
 } from "../types/chat";
 import type { PlanConfirmState } from "../types/plan";
 import { ThinkTagSplitter, splitThinkTags } from "../utils/thinkTags";
-import { mapSessionMessages, uid } from "../utils/chatHelpers";
+import { mapSessionMessages, uid, findSubNode, mapSubNode } from "../utils/chatHelpers";
 import type { MsgKey } from "../i18n";
 import { handleRuntimeEvent } from "./chat/handleRuntimeEvent";
 import {
@@ -142,10 +143,41 @@ export function useChatStream(deps: ChatStreamDeps) {
   const nativeReasoningRef = useRef(false);
   const thinkSplitRef = useRef(new ThinkTagSplitter());
   const abortRef = useRef<AbortController | null>(null);
+  const listenerGenRef = useRef(0);
   const stoppingRef = useRef(false);
   const turnDoneRef = useRef(false);
   const queuedRef = useRef<QueuedMsg[]>([]);
   const busyRef = useRef(false);
+  const runningSinceRef = useRef<Record<string, number>>({});
+  const [runningSessionIds, setRunningSessionIds] = useState<string[]>([]);
+
+  function markSessionRunning(id: string | null | undefined) {
+    const sid = String(id || "").trim();
+    if (!sid) return;
+    runningSinceRef.current[sid] = Date.now();
+    setRunningSessionIds((prev) => (prev.includes(sid) ? prev : [...prev, sid]));
+  }
+
+  function markSessionIdle(id: string | null | undefined) {
+    const sid = String(id || "").trim();
+    if (!sid) return;
+    delete runningSinceRef.current[sid];
+    setRunningSessionIds((prev) => (prev.includes(sid) ? prev.filter((x) => x !== sid) : prev));
+  }
+
+  function reconcileRunningSessions(items: SessionItem[]) {
+    const now = Date.now();
+    setRunningSessionIds((prev) => {
+      const next = prev.filter((id) => {
+        const started = runningSinceRef.current[id] || 0;
+        const hit = items.find((s) => s.id === id);
+        if (hit?.busy) return true;
+        return now - started < 8000;
+      });
+      if (next.length === prev.length && next.every((id, i) => id === prev[i])) return prev;
+      return next;
+    });
+  }
 
   function commit(next: ChatMsg[]) {
   transcriptRef.current = next;
@@ -241,37 +273,62 @@ function clearQueued() {
 }
 
 function updateSubagentMsg(childId: string, patch: Partial<SubNode>) {
-  const hit = transcriptRef.current.find(
-    (m) => m.role === "subagent" && m.subagent?.id === childId,
-  );
-  if (!hit?.subagent) return;
-  const subagent = { ...hit.subagent, ...patch };
-  updateMsg(hit.id, {
-    subagent,
-    content: subagent.summary || subagent.goal,
-  });
-  setSubs((prev) => prev.map((s) => (s.id === childId ? { ...s, ...patch } : s)));
-  setDetail((d) =>
-    d?.type === "subagent" && d.subagent.id === childId ? { type: "subagent", subagent } : d,
-  );
+  patchSubagent(childId, (s) => ({ ...s, ...patch }));
 }
 
 function patchSubagent(
   childId: string,
   fn: (s: SubNode) => SubNode,
 ) {
-  const hit = transcriptRef.current.find(
-    (m) => m.role === "subagent" && m.subagent?.id === childId,
+  if (!childId) return;
+  const hitMsg = transcriptRef.current.find(
+    (m) => m.role === "subagent" && m.subagent && findSubNode(m.subagent, childId),
   );
-  if (!hit?.subagent) return;
-  const subagent = fn(hit.subagent);
-  updateMsg(hit.id, {
-    subagent,
-    content: subagent.summary || subagent.goal,
+  if (!hitMsg?.subagent) {
+    const stub: SubNode = {
+      id: childId,
+      goal: "",
+      status: "running",
+      transcript: [],
+      activity: "运行中…",
+    };
+    appendMsg({ id: uid(), role: "subagent", content: "", subagent: stub });
+    setSubs((prev) => (prev.some((s) => s.id === childId) ? prev : [...prev, stub]));
+    const created = transcriptRef.current.find(
+      (m) => m.role === "subagent" && m.subagent?.id === childId,
+    );
+    if (!created?.subagent) return;
+    const subagent = fn(created.subagent);
+    updateMsg(created.id, {
+      subagent,
+      content: subagent.summary || subagent.goal,
+    });
+    setSubs((prev) => prev.map((s) => (s.id === childId ? { ...s, ...subagent } : s)));
+    setDetail((d) =>
+      d?.type === "subagent" && d.subagent.id === childId ? { type: "subagent", subagent } : d,
+    );
+    return;
+  }
+  const mappedRoot =
+    hitMsg.subagent.id === childId
+      ? fn(hitMsg.subagent)
+      : mapSubNode(hitMsg.subagent, childId, fn);
+  if (!mappedRoot) return;
+  const patched = findSubNode(mappedRoot, childId) || mappedRoot;
+  updateMsg(hitMsg.id, {
+    subagent: mappedRoot,
+    content: mappedRoot.summary || mappedRoot.goal,
   });
-  setSubs((prev) => prev.map((s) => (s.id === childId ? { ...s, ...subagent } : s)));
+  setSubs((prev) => {
+    const without = prev.filter((s) => s.id !== childId && s.id !== hitMsg.subagent?.id);
+    return [...without, mappedRoot];
+  });
   setDetail((d) =>
-    d?.type === "subagent" && d.subagent.id === childId ? { type: "subagent", subagent } : d,
+    d?.type === "subagent" && d.subagent.id === childId
+      ? { type: "subagent", subagent: patched }
+      : d?.type === "subagent" && d.subagent.id === mappedRoot.id
+        ? { type: "subagent", subagent: mappedRoot }
+        : d,
   );
 }
 
@@ -498,6 +555,26 @@ function finalizeAssistant(text: string, opts?: { stopped?: boolean }) {
   nativeReasoningRef.current = false;
 }
 
+function isLiveListener(gen: number) {
+  return listenerGenRef.current === gen;
+}
+
+function detachListener() {
+  listenerGenRef.current += 1;
+  abortRef.current?.abort();
+  abortRef.current = null;
+  stoppingRef.current = false;
+  setBusyState(false);
+}
+
+function beginUiListener() {
+  listenerGenRef.current += 1;
+  abortRef.current?.abort();
+  const ac = new AbortController();
+  abortRef.current = ac;
+  return { gen: listenerGenRef.current, ac };
+}
+
 async function stopChat() {
   const pending = approval;
   const pendingAsk = askPrompt;
@@ -558,6 +635,7 @@ async function stopChat() {
       /* ignore */
     }
   }
+  if (sid) markSessionIdle(sid);
   abortRef.current?.abort();
 }
 
@@ -603,6 +681,7 @@ async function sendChat(
   const showUser = opts?.showUser !== false;
   setInput("");
   setBusyState(true);
+  markSessionRunning(sessionId);
   stoppingRef.current = false;
   turnDoneRef.current = false;
   stickBottomRef.current = true;
@@ -627,11 +706,41 @@ async function sendChat(
     });
   }
 
-  abortRef.current?.abort();
-  const ac = new AbortController();
-  abortRef.current = ac;
+  const { gen, ac } = beginUiListener();
 
   const runMode = opts?.mode ?? chatMode;
+  const eventCtx = {
+    ...toolUpsertCtx,
+    t,
+    locale,
+    sessionId,
+    sessionIdRef,
+    setPlanConfirm,
+    setActivePlan,
+    planPendingRef,
+    executingPlanIdRef,
+    patchSubagent,
+    sealSubassistant,
+    setLive,
+    setSessionId,
+    setCtx,
+    setCompressState,
+    appendStreamChunk,
+    appendReasoningChunk,
+    setApproval,
+    findToolMsg,
+    updateMsg,
+    syncToolPanel,
+    setDetail,
+    stripDuplicateAskBubble,
+    askPendingRef,
+    setAskChoice,
+    setAskOtherText,
+    setAskPrompt,
+    setFsRefresh,
+    setSubs,
+    appendMsg,
+  };
 
   try {
     const displayForApi =
@@ -642,40 +751,19 @@ async function sendChat(
       msg,
       sessionId,
       {
-        onEvent: (ev) =>
-          handleRuntimeEvent(ev, {
-            ...toolUpsertCtx,
-            t,
-            locale,
-            sessionId,
-            sessionIdRef,
-            setPlanConfirm,
-            setActivePlan,
-            planPendingRef,
-            executingPlanIdRef,
-            patchSubagent,
-            sealSubassistant,
-            setLive,
-            setSessionId,
-            setCtx,
-            setCompressState,
-            appendStreamChunk,
-            appendReasoningChunk,
-            setApproval,
-            findToolMsg,
-            updateMsg,
-            syncToolPanel,
-            setDetail,
-            stripDuplicateAskBubble,
-            askPendingRef,
-            setAskChoice,
-            setAskOtherText,
-            setAskPrompt,
-            setFsRefresh,
-            setSubs,
-            appendMsg,
-          }),
+        onEvent: (ev) => {
+          if (ev.type === "session") {
+            const nid = String(ev.data.session_id || "");
+            markSessionRunning(nid);
+            void refreshSessionsRef.current();
+          }
+          if (!isLiveListener(gen)) return;
+          handleRuntimeEvent(ev, eventCtx);
+        },
         onFinal: (textOut, meta) => {
+          markSessionIdle(String(meta.session_id || sessionId || ""));
+          void refreshSessionsRef.current();
+          if (!isLiveListener(gen)) return;
           const stopped = Boolean(meta.cancelled);
           finalizeAssistant(textOut, { stopped });
           if (stopped && String(textOut || "").trim()) {
@@ -688,15 +776,17 @@ async function sendChat(
           if (meta.session_id) setSessionId(String(meta.session_id));
           void fetchSkills().then(setSkills);
           void fetchMemory().then(setMemory);
-          void refreshSessionsRef.current();
           setFsRefresh((n) => n + 1);
         },
         onError: (err) => {
+          markSessionIdle(sessionIdRef.current || sessionId);
+          if (!isLiveListener(gen)) return;
           sealStreamBubble();
           appendMsg({ id: uid(), role: "assistant", content: `错误：${err}` });
           turnDoneRef.current = true;
         },
         onAbort: () => {
+          if (!isLiveListener(gen)) return;
           const had = streamTextRef.current.trim();
           finalizeAssistant(had, { stopped: true });
           setToast(had ? t("stoppedKeep") : t("stopped"));
@@ -706,9 +796,13 @@ async function sendChat(
       runMode,
       displayForApi,
     );
-    if (sid) setSessionId(sid);
+    if (isLiveListener(gen) && sid) {
+      setSessionId(sid);
+      markSessionRunning(sid);
+    }
   } catch (e) {
     if (!(e instanceof DOMException && e.name === "AbortError")) {
+      markSessionIdle(sessionIdRef.current || sessionId);
       appendMsg({
         id: uid(),
         role: "assistant",
@@ -716,6 +810,7 @@ async function sendChat(
       });
     }
   } finally {
+    if (!isLiveListener(gen)) return;
     abortRef.current = null;
     stoppingRef.current = false;
     setBusyState(false);
@@ -734,17 +829,17 @@ async function sendChat(
 
 async function attachLive(sid: string) {
   if (!sid) return;
-  abortRef.current?.abort();
-  const ac = new AbortController();
-  abortRef.current = ac;
+  const { gen, ac } = beginUiListener();
   stoppingRef.current = false;
   turnDoneRef.current = false;
   setBusyState(true);
+  markSessionRunning(sid);
   try {
     await attachSessionEvents(
       sid,
       {
-        onEvent: (ev) =>
+        onEvent: (ev) => {
+          if (!isLiveListener(gen)) return;
           handleRuntimeEvent(ev, {
             ...toolUpsertCtx,
             t,
@@ -776,14 +871,19 @@ async function attachLive(sid: string) {
             setFsRefresh,
             setSubs,
             appendMsg,
-          }),
+          });
+        },
         onFinal: (textOut, meta) => {
           if (meta.replay) {
+            if (!isLiveListener(gen)) return;
             void fetchSession(sid)
               .then((d) => commit(mapSessionMessages(d.messages)))
               .catch(() => {});
             return;
           }
+          markSessionIdle(sid);
+          void refreshSessionsRef.current();
+          if (!isLiveListener(gen)) return;
           const stopped = Boolean(meta.cancelled);
           finalizeAssistant(textOut, { stopped });
           setStats({
@@ -792,15 +892,15 @@ async function attachLive(sid: string) {
           });
           void fetchSkills().then(setSkills);
           void fetchMemory().then(setMemory);
-          void refreshSessionsRef.current();
           setFsRefresh((n) => n + 1);
         },
         onError: (err) => {
+          if (!isLiveListener(gen)) return;
           sealStreamBubble();
           appendMsg({ id: uid(), role: "assistant", content: `错误：${err}` });
         },
         onAbort: () => {
-          /* stopChat / new send replaces this attach */
+          /* detached to another chat; server turn keeps running */
         },
       },
       ac.signal,
@@ -810,11 +910,10 @@ async function attachLive(sid: string) {
       setToast(e instanceof Error ? e.message : String(e));
     }
   } finally {
-    if (abortRef.current === ac) {
-      abortRef.current = null;
-      stoppingRef.current = false;
-      setBusyState(false);
-    }
+    if (!isLiveListener(gen)) return;
+    if (abortRef.current === ac) abortRef.current = null;
+    stoppingRef.current = false;
+    setBusyState(false);
   }
 }
 
@@ -903,11 +1002,14 @@ function resumeFromSnapshot(detail: SessionDetail) {
     appendReasoningChunk,
     finalizeAssistant,
     stopChat,
+    detachListener,
     upsertToolStart: (ev: RuntimeEvent) => upsertToolStart(ev, toolUpsertCtx),
     upsertToolDelta: (ev: RuntimeEvent) => upsertToolDelta(ev, toolUpsertCtx),
     upsertToolEnd: (ev: RuntimeEvent) => upsertToolEnd(ev, toolUpsertCtx),
     drainQueueSoon,
     sendChat,
     resumeFromSnapshot,
+    runningSessionIds,
+    reconcileRunningSessions,
   };
 }

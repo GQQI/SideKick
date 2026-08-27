@@ -268,6 +268,7 @@ export function App() {
     composerRef,
     busy,
     sessionId,
+    sessionIdRef,
     sessionsPage,
     skills,
     setSkills,
@@ -328,9 +329,37 @@ export function App() {
     clearQueued: chat.clearQueued,
     sendChat: chat.sendChat,
     stopChat: chat.stopChat,
+    detachListener: chat.detachListener,
+    setBusy,
   });
 
   newChatRef.current = actions.newChat;
+
+  const historySessions = sessions.map((s) => ({
+    ...s,
+    busy:
+      Boolean(s.busy) ||
+      chat.runningSessionIds.includes(s.id) ||
+      Boolean(busy && s.id === sessionId),
+  }));
+  const historyNeedsPoll =
+    sidePanel === "history" &&
+    (busy || chat.runningSessionIds.length > 0 || sessions.some((item) => item.busy));
+
+  const reconcileRunningRef = useRef(chat.reconcileRunningSessions);
+  reconcileRunningRef.current = chat.reconcileRunningSessions;
+
+  useEffect(() => {
+    reconcileRunningRef.current(sessions);
+  }, [sessions, chat.runningSessionIds]);
+
+  useEffect(() => {
+    if (!historyNeedsPoll) return;
+    const timer = window.setInterval(() => {
+      void session.refreshSessions();
+    }, 2500);
+    return () => window.clearInterval(timer);
+  }, [historyNeedsPoll, session.refreshSessions]);
 
   const { finishAuth } = useAuthBoot({
     boot: session.boot,
@@ -500,7 +529,7 @@ export function App() {
               explorerWidth={explorerWidth}
               fsRefresh={fsRefresh}
               activeWs={activeWs}
-              sessions={sessions}
+              sessions={historySessions}
               sessionId={sessionId}
               sessionsPage={sessionsPage}
               sessionsTotalPages={sessionsTotalPages}

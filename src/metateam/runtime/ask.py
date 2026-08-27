@@ -53,9 +53,14 @@ class AskGate:
     def __init__(self, timeout_sec: float = 600.0) -> None:
         self.timeout_sec = timeout_sec
         self._lock = threading.Lock()
+        self._ui_lock = threading.Lock()
         self._events: dict[str, threading.Event] = {}
         self._answers: dict[str, str] = {}
         self._pending: dict[str, AskRequest] = {}
+
+    def serialize_ui(self) -> threading.Lock:
+        """One in-flight ask dialog at a time (parallel subagents share this gate)."""
+        return self._ui_lock
 
     def request(
         self,

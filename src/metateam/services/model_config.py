@@ -137,13 +137,25 @@ class ModelSetup:
     demo_mode: bool = True
 
     def find_entry(self, ref: ModelRef) -> tuple[ModelProvider | None, ModelEntry | None]:
-        if not ref or not ref.model_id:
+        if not ref or not (ref.model_id or ref.provider_id):
             return None, None
         for p in self.providers:
-            if p.id != ref.provider_id:
+            if ref.provider_id and p.id != ref.provider_id:
                 continue
             for m in p.models:
-                if m.id == ref.model_id:
+                if m.id == ref.model_id or (ref.model_id and m.name == ref.model_id):
+                    return p, m
+        if ref.model_id:
+            for p in self.providers:
+                for m in p.models:
+                    if m.id == ref.model_id or m.name == ref.model_id:
+                        return p, m
+        return None, None
+
+    def first_keyed_entry(self) -> tuple[ModelProvider | None, ModelEntry | None]:
+        for p in self.providers:
+            for m in p.models:
+                if (m.api_key or "").strip():
                     return p, m
         return None, None
 
@@ -405,16 +417,33 @@ def _read_setup(path: Path) -> ModelSetup | None:
         return None
 
 
+def _setup_main_key(setup: ModelSetup | None) -> str:
+    if not setup:
+        return ""
+    return (setup.resolve(setup.main)[3] or "").strip()
+
+
+def _pick_model_setup(
+    workspace: ModelSetup | None, account: ModelSetup | None
+) -> ModelSetup:
+    """Workspace override wins only when its main model actually has a key.
+
+    A stale workspace file (Demo / empty keys) must not hide the account
+    default — otherwise new chats fall back to Demo while an older in-memory
+    session still has the key from a previous save.
+    """
+    if workspace and _setup_main_key(workspace):
+        return workspace
+    if account and (_setup_main_key(account) or account.any_key_set()):
+        return account
+    return workspace or account or _default_setup()
+
+
 def load_model_config() -> ModelSetup:
     ws_path = _workspace_config_path()
-    if ws_path:
-        loaded = _read_setup(ws_path)
-        if loaded:
-            return loaded
-    loaded = _read_setup(_global_config_path())
-    if loaded:
-        return loaded
-    return _default_setup()
+    workspace = _read_setup(ws_path) if ws_path else None
+    account = _read_setup(_global_config_path())
+    return _pick_model_setup(workspace, account)
 
 
 def save_model_config(cfg: ModelSetup, *, persist_workspace: bool = True) -> None:
@@ -438,6 +467,13 @@ def save_model_config(cfg: ModelSetup, *, persist_workspace: bool = True) -> Non
 def apply_to_settings(settings: Any, cfg: ModelSetup | None = None) -> Any:
     cfg = cfg or load_model_config()
     main_name, main_model, main_url, main_key = cfg.resolve(cfg.main)
+    if not str(main_key or "").strip():
+        keyed_prov, keyed = cfg.first_keyed_entry()
+        if keyed:
+            main_name = keyed_prov.name if keyed_prov else main_name
+            main_model = keyed.name or main_model
+            main_url = (keyed.base_url or main_url or "").rstrip("/")
+            main_key = keyed.api_key
     _, sub_model, sub_url, sub_key = cfg.resolve(cfg.subagent)
     _, compress_model, compress_url, compress_key = cfg.resolve(cfg.compress)
 

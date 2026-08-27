@@ -104,6 +104,20 @@ def load_session(path: Path) -> tuple[SessionMeta, list[dict[str, Any]]]:
     return meta, messages
 
 
+def workspace_matches(session_ws: str, current_ws: str | Path) -> bool:
+    """True when a session belongs to the active project folder."""
+    a = str(session_ws or "").strip()
+    b = str(current_ws or "").strip()
+    if not a or not b:
+        return False
+    try:
+        from .tenant_context import workspace_settings_key
+
+        return workspace_settings_key(a) == workspace_settings_key(b)
+    except Exception:
+        return a.replace("\\", "/").rstrip("/").lower() == b.replace("\\", "/").rstrip("/").lower()
+
+
 def latest_session(root: Path) -> Optional[Path]:
     files = sorted(sessions_dir(root).glob("*.json"), key=lambda p: p.stat().st_mtime)
     return files[-1] if files else None

@@ -73,6 +73,7 @@ export function HistoryPanel({
   const { t, locale } = usePrefs();
   const [pendingDeleteId, setPendingDeleteId] = useState<string | null>(null);
   const [earlierOpen, setEarlierOpen] = useState(false);
+  const [refreshing, setRefreshing] = useState(false);
 
   useEffect(() => {
     setPendingDeleteId(null);
@@ -91,7 +92,11 @@ export function HistoryPanel({
             type="button"
             className="icon-btn"
             title={t("feRefresh")}
-            onClick={() => onRefresh()}
+            disabled={refreshing}
+            onClick={() => {
+              setRefreshing(true);
+              void Promise.resolve(onRefresh()).finally(() => setRefreshing(false));
+            }}
           >
             <IconRefresh size={15} />
           </button>
@@ -125,21 +130,24 @@ export function HistoryPanel({
               </button>
               {!collapsed && (
                 <ul className="history-list">
-                  {items.map((s) => (
+                  {items.map((s) => {
+                    const running = Boolean(s.busy);
+                    return (
                     <li
                       key={s.id}
-                      className={`history-item ${pendingDeleteId === s.id ? "confirming" : ""}`}
+                      className={`history-item${pendingDeleteId === s.id ? " confirming" : ""}${running ? " is-running" : ""}`}
                     >
                       <button
                         type="button"
-                        className={`history-open ${s.id === activeSessionId ? "active" : ""}`}
+                        className={`history-open${s.id === activeSessionId ? " active" : ""}${running ? " running" : ""}`}
+                        aria-busy={running || undefined}
                         onClick={() => {
                           setPendingDeleteId(null);
                           onOpen(s.id);
                         }}
                       >
-                        <span className="history-open-icon">
-                          <IconChat size={14} />
+                        <span className={`history-open-icon${running ? " loading" : ""}`}>
+                          {running ? <span className="history-spinner" aria-hidden /> : <IconChat size={14} />}
                         </span>
                         <span className="history-open-text">
                           <strong title={displaySessionTitle(s.title, t("sessionUntitled"), s.id)}>
@@ -147,8 +155,8 @@ export function HistoryPanel({
                           </strong>
                         </span>
                         {pendingDeleteId !== s.id && (
-                          <span className="history-open-time">
-                            {formatHistoryClock(s.updated_at, locale)}
+                          <span className={`history-open-time${running ? " running" : ""}`}>
+                            {running ? t("historyRunning") : formatHistoryClock(s.updated_at, locale)}
                           </span>
                         )}
                       </button>
@@ -198,7 +206,8 @@ export function HistoryPanel({
                         </button>
                       )}
                     </li>
-                  ))}
+                    );
+                  })}
                 </ul>
               )}
             </div>

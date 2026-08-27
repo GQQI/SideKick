@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import contextvars
 import json
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import Any, Optional
@@ -110,7 +111,10 @@ def register_ask_and_delegate(reg: ToolRegistry, ctx: ToolContext) -> None:
                 return idx, summary
 
             with ThreadPoolExecutor(max_workers=settings.max_concurrent_children) as pool:
-                futs = [pool.submit(_one, i, it) for i, it in enumerate(items)]
+                futs = [
+                    pool.submit(contextvars.copy_context().run, _one, i, it)
+                    for i, it in enumerate(items)
+                ]
                 for fut in as_completed(futs):
                     i, summary = fut.result()
                     results[i] = summary
@@ -125,13 +129,48 @@ def register_ask_and_delegate(reg: ToolRegistry, ctx: ToolContext) -> None:
             ]
             return json.dumps(payload, ensure_ascii=False, indent=2)
 
+        def delegate_dialogue(
+            topic: str = "",
+            speakers: Optional[list[Any]] = None,
+            rounds: int = 3,
+            extra: str = "",
+            mode: str = "",
+        ) -> str:
+            from ..dialogue import normalize_speakers, run_sequential_dialogue
+
+            try:
+                parsed = normalize_speakers(speakers)
+                n_rounds = max(1, min(int(rounds or 3), 8))
+                mode_s = (mode or "").strip()
+                topic_s = (topic or "").strip()
+                try:
+                    result = run_sequential_dialogue(
+                        run_child=run_child,
+                        topic=topic_s,
+                        speakers=parsed,
+                        rounds=n_rounds,
+                        extra=extra,
+                        mode=mode_s,
+                    )
+                finally:
+                    end = ctx.end_party_session
+                    if end is not None:
+                        end()
+            except ValueError as exc:
+                return f"ERROR: {exc}"
+            except Exception as exc:  # noqa: BLE001
+                return f"ERROR: dialogue failed: {exc}"
+            return json.dumps(result, ensure_ascii=False, indent=2)
+
         reg.register(
             Tool(
                 "delegate_task",
-                "Spawn isolated subagent(s). Single: goal(+context,+role). "
-                "Parallel: tasks=[{goal,context,role?}]. Only summaries return. "
-                "Children have no parent history. role=orchestrator may re-delegate "
-                "if depth allows.",
+                "DEFAULT: spawn isolated subagent(s) for work (search, research, "
+                "edit, gather sources). Parallel: tasks=[{goal,context,role?}]. "
+                "Parent gets summaries and synthesizes. Children cannot hear each "
+                "other. Use this when the user wants several agents to work "
+                "separately then merge — NOT delegate_dialogue. "
+                "Children may re-delegate if spawn depth remains.",
                 {
                     "type": "object",
                     "properties": {
@@ -158,6 +197,70 @@ def register_ask_and_delegate(reg: ToolRegistry, ctx: ToolContext) -> None:
                     "required": [],
                 },
                 delegate_task,
+                parallel_safe=False,
+            )
+        )
+        reg.register(
+            Tool(
+                "delegate_dialogue",
+                "ONLY for live in-character turns where parties hear each other "
+                "(debate, negotiation, military sim, tabletop) — 2 to 8 named "
+                "parties. Each party is a FULL agent with the same tools as you, "
+                "kept across rounds, and may spawn further agents. "
+                "NOT for parallel research, search, or 'start N agents then "
+                "summarize' — that is delegate_task. Do NOT write a code simulator. "
+                "Do NOT enter Plan mode. If the user did not specify the exact "
+                "scenario, party list, or format, ask_user and/or search first. "
+                "speakers: [{name, brief}]. mode is a free label. rounds: 1–8.",
+                {
+                    "type": "object",
+                    "properties": {
+                        "topic": {
+                            "type": "string",
+                            "description": "Scenario in the user's own words. Do not invent a motion they did not state.",
+                        },
+                        "mode": {
+                            "type": "string",
+                            "description": "Free-form session type, e.g. simulation, negotiation, debate, tabletop.",
+                        },
+                        "speakers": {
+                            "type": "array",
+                            "minItems": 2,
+                            "maxItems": 8,
+                            "items": {
+                                "type": "object",
+                                "properties": {
+                                    "name": {
+                                        "type": "string",
+                                        "description": "Party name (any label: 红方, NATO, 调解人, …).",
+                                    },
+                                    "brief": {
+                                        "type": "string",
+                                        "description": "That party's role, objective, or constraints.",
+                                    },
+                                    "stance": {
+                                        "type": "string",
+                                        "description": "Alias of brief.",
+                                    },
+                                },
+                                "required": ["name"],
+                            },
+                        },
+                        "rounds": {
+                            "type": "integer",
+                            "minimum": 1,
+                            "maximum": 8,
+                            "default": 3,
+                            "description": "How many full cycles through all parties.",
+                        },
+                        "extra": {
+                            "type": "string",
+                            "description": "Optional extra rules (fog of war, time, scoring).",
+                        },
+                    },
+                    "required": ["topic", "speakers"],
+                },
+                delegate_dialogue,
                 parallel_safe=False,
             )
         )

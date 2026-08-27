@@ -246,7 +246,11 @@ export function ActivitySidebar({
             </div>
           ) : sidePanel === "undo" ? (
             <div className="side-panel-wrap" style={{ width: explorerWidth }}>
-              <UndoTimeline refreshKey={fsRefresh} onRestored={onWorkspaceMutated} />
+              <UndoTimeline
+                refreshKey={fsRefresh}
+                sessionId={sessionId}
+                onRestored={onWorkspaceMutated}
+              />
             </div>
           ) : (
             <FileExplorer

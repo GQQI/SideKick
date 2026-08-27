@@ -35,12 +35,12 @@ def default_is_public(method: str, path: str) -> bool:
 
 
 def bind_tenant_workspace(user_id: str) -> None:
-    """Bind this user's overlay (workspace / skills / memory) onto live sessions."""
+    """Apply this user's settings overlay; do not rewrite live chats' folders."""
     get_settings()
     try:
         STORE.refresh_settings(
             rebind_llm=False,
-            rebind_workspace=True,
+            rebind_workspace=False,
             user_id=user_id,
         )
     except Exception as exc:

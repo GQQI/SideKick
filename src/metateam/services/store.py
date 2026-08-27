@@ -12,7 +12,7 @@ from ..runtime.agent import Agent
 from ..core.config import Settings, get_settings, reload_settings
 from ..core.events import EventBus, new_id
 from ..core.logutil import get_logger, log_exception
-from .session import load_session, save_session, sessions_dir
+from .session import load_session, save_session, sessions_dir, workspace_matches
 
 _log = get_logger("metateam.store")
 
@@ -46,6 +46,14 @@ def _is_internal_message(m: dict[str, Any]) -> bool:
         return True
     content = str(m.get("content") or "").lstrip()
     return content.startswith("[Plan step ") or content.startswith("[sidekick:")
+
+
+def _user_turn_count(messages: list[dict[str, Any]]) -> int:
+    return sum(
+        1
+        for m in messages
+        if m.get("role") == "user" and not _is_internal_message(m)
+    )
 
 
 def _message_display_text(m: dict[str, Any]) -> str:
@@ -232,7 +240,10 @@ class SessionStore:
                         sess.agent._refresh_workspace_grounding()
                     except Exception as exc:
                         log_exception(_log, f"workspace grounding failed for {sess.id}", exc)
-                if not rebind_llm:
+                keyed = bool(str(getattr(sess.agent.settings, "api_key", "") or "").strip())
+                llm = getattr(sess.agent, "llm", None)
+                llm_demo = bool(llm is not None and getattr(llm, "demo", False))
+                if not rebind_llm and not (keyed and llm_demo):
                     continue
                 sess.agent.llm = LLM(sess.agent.settings)
                 sess.agent.compress_llm = LLM(
@@ -250,8 +261,10 @@ class SessionStore:
     def create(self) -> ChatSession:
         # Always use latest settings for new chats (model switch)
         from .tenant_context import get_user_id
+        from .model_config import apply_to_settings, load_model_config
 
         self.settings = get_settings()
+        apply_to_settings(self.settings, load_model_config())
         bus = EventBus()
         from ..runtime.approval import ApprovalGate
 
@@ -320,6 +333,7 @@ class SessionStore:
             "pending_approvals": agent.approval.pending(),
             "pending_asks": agent.ask.pending(),
             "pending_plans": agent.plan_gate.pending(),
+            "live_subagents": agent.live_subagent_snapshot(),
         }
 
     def _get_live(self, session_id: str) -> Optional[ChatSession]:
@@ -429,8 +443,21 @@ class SessionStore:
         if meta.user_id and meta.user_id != uid:
             return None
         self.settings = get_settings()
+        from .model_config import apply_to_settings, load_model_config
+
+        apply_to_settings(self.settings, load_model_config())
         bus = EventBus()
         agent = Agent(self.settings, bus=bus, messages=messages)
+        ws = (meta.workspace or "").strip()
+        if ws:
+            try:
+                from pathlib import Path as _Path
+
+                folder = _Path(ws).expanduser().resolve()
+                if folder.is_dir():
+                    agent.settings.workspace = folder
+            except Exception:
+                pass
         mtime = path.stat().st_mtime
         title = _prefer_title(meta.title, _title_from_messages(messages, ""), fallback=meta.id)
         sess = ChatSession(
@@ -450,6 +477,7 @@ class SessionStore:
         from .tenant_context import get_user_id
 
         uid = get_user_id()
+        current_ws = getattr(get_settings(), "workspace", "")
         items: dict[str, dict[str, Any]] = {}
 
         # Disk history first
@@ -458,12 +486,12 @@ class SessionStore:
                 meta, messages = load_session(path)
                 if meta.user_id and meta.user_id != uid:
                     continue
+                if not workspace_matches(meta.workspace, current_ws):
+                    continue
                 sid = meta.id or path.stem
-                user_count = sum(
-                    1
-                    for m in messages
-                    if m.get("role") == "user" and not _is_internal_message(m)
-                )
+                user_count = _user_turn_count(messages)
+                if user_count <= 0:
+                    continue
                 mtime = path.stat().st_mtime
                 updated = mtime
                 if meta.updated_at:
@@ -498,6 +526,7 @@ class SessionStore:
                     "messages": len(messages),
                     "user_turns": user_count,
                     "demo": False,
+                    "busy": False,
                     "source": "disk",
                 }
             except Exception:
@@ -507,6 +536,12 @@ class SessionStore:
             live = list(self._sessions.values())
         for s in live:
             if s.user_id and s.user_id != uid:
+                continue
+            sess_ws = getattr(s.agent.settings, "workspace", "")
+            if not workspace_matches(str(sess_ws or ""), current_ws):
+                continue
+            user_turns = _user_turn_count(s.agent.messages)
+            if user_turns <= 0:
                 continue
             prev = items.get(s.id)
             # Prefer the freshest interaction time (memory vs disk)
@@ -523,12 +558,9 @@ class SessionStore:
                 "created_at": s.created_at,
                 "updated_at": updated,
                 "messages": len(s.agent.messages),
-                "user_turns": sum(
-                    1
-                    for m in s.agent.messages
-                    if m.get("role") == "user" and not _is_internal_message(m)
-                ),
+                "user_turns": user_turns,
                 "demo": s.agent.settings.demo_mode,
+                "busy": bool(s.busy),
                 "source": "memory",
             }
 
@@ -610,11 +642,13 @@ class SessionStore:
         if not sess:
             _log.error("persist skipped: session %s not found", session_id)
             return None
+        if _user_turn_count(sess.agent.messages) <= 0:
+            return None
         path = save_session(
             self.settings.root,
             sess.agent.messages,
             model=self.settings.model,
-            workspace=self.settings.workspace,
+            workspace=getattr(sess.agent.settings, "workspace", None) or self.settings.workspace,
             session_id=session_id,
             user_id=sess.user_id or None,
             title=sess.title or "",
@@ -685,7 +719,7 @@ class SessionStore:
                     elif result_msg is not None:
                         status = "done"
                     else:
-                        status = "done"
+                        status = "running"
                     tool_item = {
                         "role": "tool",
                         "name": name,

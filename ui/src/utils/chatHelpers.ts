@@ -1,7 +1,7 @@
 /** Pure helpers extracted from App to keep the shell leaner. */
 
 import { fileRawUrl, withAuthToken, type FilePayload, type SessionDetailMessage } from "../api";
-import type { ChatMsg, DetailView, MsgAttachment, ToolCard } from "../types/chat";
+import type { ChatMsg, DetailView, MsgAttachment, SubNode, SubTranscriptItem, ToolCard } from "../types/chat";
 import { formatToolSummary } from "./toolSummary";
 
 export type GreetingKey =
@@ -230,6 +230,184 @@ export function normalizeRestoredUserContent(content: string): string {
   return text;
 }
 
+export const DELEGATE_TOOL_NAMES = new Set(["delegate_task", "delegate_dialogue"]);
+
+function parseJsonValue(raw: string): unknown {
+  const text = (raw || "").trim();
+  if (!text) return null;
+  try {
+    return JSON.parse(text);
+  } catch {
+    return null;
+  }
+}
+
+function toolArgsRecord(args: unknown): Record<string, unknown> {
+  if (args && typeof args === "object" && !Array.isArray(args)) {
+    return args as Record<string, unknown>;
+  }
+  return {};
+}
+
+function asSubagentMsg(node: SubNode): ChatMsg {
+  return {
+    id: uid(),
+    role: "subagent",
+    content: node.summary || node.goal,
+    subagent: node,
+  };
+}
+
+function taskItemsFromDelegateArgs(args: Record<string, unknown>): { goal: string; role: string }[] {
+  const items: { goal: string; role: string }[] = [];
+  const tasks = args.tasks;
+  if (Array.isArray(tasks) && tasks.length) {
+    for (const raw of tasks) {
+      if (raw && typeof raw === "object" && !Array.isArray(raw)) {
+        const rec = raw as Record<string, unknown>;
+        const goal = String(rec.goal || "").trim();
+        if (goal) items.push({ goal, role: String(rec.role || "leaf") });
+      }
+    }
+    return items;
+  }
+  const goal = String(args.goal || args.task || "").trim();
+  if (goal) items.push({ goal, role: String(args.role || "leaf") });
+  return items;
+}
+
+function speakersFromDelegateArgs(args: Record<string, unknown>): { name: string; brief: string }[] {
+  const out: { name: string; brief: string }[] = [];
+  const raw = args.speakers;
+  if (!Array.isArray(raw)) return out;
+  for (const item of raw) {
+    if (typeof item === "string") {
+      const name = item.trim();
+      if (name) out.push({ name, brief: "" });
+      continue;
+    }
+    if (item && typeof item === "object" && !Array.isArray(item)) {
+      const rec = item as Record<string, unknown>;
+      const name = String(rec.name || rec.role || rec.side || "").trim();
+      if (!name) continue;
+      out.push({
+        name,
+        brief: String(rec.brief || rec.stance || rec.goal || "").trim(),
+      });
+    }
+  }
+  return out;
+}
+
+function isRunningToolStatus(status?: string, hasResult?: boolean): boolean {
+  const raw = (status || "").toLowerCase();
+  if (raw === "running" || raw === "pending" || raw === "streaming") return true;
+  if (raw === "done" || raw === "error") return false;
+  return !hasResult;
+}
+
+/** Turn persisted delegate_task / delegate_dialogue tool rows into subagent cards. */
+export function subagentMessagesFromDelegateTool(m: {
+  name?: string;
+  call_id?: string;
+  args?: unknown;
+  result?: string;
+  status?: string;
+}): ChatMsg[] {
+  const name = m.name || "";
+  if (!DELEGATE_TOOL_NAMES.has(name)) return [];
+  const args = toolArgsRecord(m.args);
+  const callId = m.call_id || uid();
+  const parsed = parseJsonValue(m.result || "");
+  const hasResult = Boolean((m.result || "").trim());
+  const running = isRunningToolStatus(m.status, hasResult);
+
+  if (name === "delegate_task") {
+    let items = taskItemsFromDelegateArgs(args);
+    const rows = Array.isArray(parsed) ? parsed : [];
+    if (!items.length) {
+      for (const row of rows) {
+        if (row && typeof row === "object" && !Array.isArray(row)) {
+          const rec = row as Record<string, unknown>;
+          const goal = String(rec.goal || "").trim();
+          if (goal) items.push({ goal, role: "leaf" });
+        }
+      }
+    }
+    return items.map((item, i) => {
+      const row =
+        rows.find(
+          (r) =>
+            r &&
+            typeof r === "object" &&
+            !Array.isArray(r) &&
+            Number((r as Record<string, unknown>).index) === i,
+        ) || rows[i];
+      const rec =
+        row && typeof row === "object" && !Array.isArray(row)
+          ? (row as Record<string, unknown>)
+          : {};
+      const summary = String(rec.summary || "").trim();
+      const err = summary.startsWith("ERROR");
+      const done = Boolean(summary) && !running;
+      const node: SubNode = {
+        id: `restored:${callId}:${i}`,
+        goal: item.goal,
+        role: item.role || "leaf",
+        status: err ? "error" : done ? "done" : "running",
+        summary: summary || undefined,
+        activity: done || err ? undefined : "运行中…",
+        transcript: summary
+          ? [{ id: uid(), kind: "assistant", text: summary }]
+          : [],
+      };
+      return asSubagentMsg(node);
+    });
+  }
+
+  let speakers = speakersFromDelegateArgs(args);
+  const resultObj =
+    parsed && typeof parsed === "object" && !Array.isArray(parsed)
+      ? (parsed as Record<string, unknown>)
+      : null;
+  if (!speakers.length && Array.isArray(resultObj?.speakers)) {
+    for (const sp of resultObj.speakers) {
+      const name = String(sp || "").trim();
+      if (name) speakers.push({ name, brief: "" });
+    }
+  }
+  const turns = Array.isArray(resultObj?.turns) ? resultObj.turns : [];
+  return speakers.map((sp, i) => {
+    const speakerTurns = turns.filter(
+      (t) =>
+        t &&
+        typeof t === "object" &&
+        !Array.isArray(t) &&
+        String((t as Record<string, unknown>).name || "") === sp.name,
+    );
+    const texts = speakerTurns
+      .map((t) => String((t as Record<string, unknown>).text || "").trim())
+      .filter(Boolean);
+    const summary = texts.join("\n\n");
+    const done = hasResult && !running;
+    const transcript: SubTranscriptItem[] = texts.map((text) => ({
+      id: uid(),
+      kind: "assistant" as const,
+      text,
+    }));
+    const node: SubNode = {
+      id: `restored:${callId}:${i}`,
+      goal: sp.brief ? `${sp.name} — ${sp.brief}` : sp.name,
+      role: sp.name,
+      status: done ? "done" : "running",
+      summary: summary || undefined,
+      activity: done ? undefined : "运行中…",
+      transcript,
+    };
+    return asSubagentMsg(node);
+  });
+}
+
 export function mapSessionMessages(messages: SessionDetailMessage[]): ChatMsg[] {
   const out: ChatMsg[] = [];
   for (const m of messages || []) {
@@ -259,6 +437,17 @@ export function mapSessionMessages(messages: SessionDetailMessage[]): ChatMsg[] 
     }
     if (m.role === "tool") {
       const name = m.name || "tool";
+      const expanded = subagentMessagesFromDelegateTool({
+        name,
+        call_id: m.call_id,
+        args: m.args,
+        result: m.result,
+        status: m.status,
+      });
+      if (expanded.length) {
+        out.push(...expanded);
+        continue;
+      }
       const callId = m.call_id || uid();
       const statusRaw = (m.status || "done").toLowerCase();
       const status: ToolCard["status"] =
@@ -267,7 +456,7 @@ export function mapSessionMessages(messages: SessionDetailMessage[]): ChatMsg[] 
           : statusRaw === "pending"
             ? "pending"
             : statusRaw === "running" || statusRaw === "streaming"
-              ? "done"
+              ? "running"
               : "done";
       const tool: ToolCard = {
         id: uid(),
@@ -287,4 +476,32 @@ export function mapSessionMessages(messages: SessionDetailMessage[]): ChatMsg[] 
     }
   }
   return out;
+}
+
+export function findSubNode(node: SubNode, id: string): SubNode | null {
+  if (node.id === id) return node;
+  for (const child of node.children || []) {
+    const hit = findSubNode(child, id);
+    if (hit) return hit;
+  }
+  return null;
+}
+
+export function mapSubNode(
+  node: SubNode,
+  id: string,
+  fn: (s: SubNode) => SubNode,
+): SubNode | null {
+  if (node.id === id) return fn(node);
+  if (!node.children?.length) return null;
+  let found = false;
+  const children = node.children.map((child) => {
+    const next = mapSubNode(child, id, fn);
+    if (next) {
+      found = true;
+      return next;
+    }
+    return child;
+  });
+  return found ? { ...node, children } : null;
 }

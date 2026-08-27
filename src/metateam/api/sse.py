@@ -138,4 +138,23 @@ def gate_replay_events(sess: ChatSession) -> list[dict[str, Any]]:
                 agent_id=agent_id,
             )
         )
+    for item in snap.get("live_subagents") or []:
+        if not isinstance(item, dict):
+            continue
+        child_id = str(item.get("child_id") or "").strip()
+        if not child_id:
+            continue
+        data = dict(item)
+        data["replay"] = True
+        data.setdefault("message", f"resume {data.get('role') or 'leaf'}")
+        spawner = str(item.get("parent_id") or "") or agent_id
+        nested = spawner != agent_id
+        events.append(
+            event_payload(
+                "subagent_start",
+                data,
+                agent_id=spawner,
+                parent_id=agent_id if nested else "",
+            )
+        )
     return events

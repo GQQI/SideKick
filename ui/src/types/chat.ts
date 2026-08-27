@@ -61,6 +61,7 @@ export type SubNode = {
   role?: string;
   activity?: string;
   transcript: SubTranscriptItem[];
+  children?: SubNode[];
 };
 
 export type MsgAttachment = {

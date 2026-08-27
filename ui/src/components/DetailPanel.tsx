@@ -123,7 +123,7 @@ export function DetailPanel({
             onPickUrl={pickUrl}
           />
         ) : detail.type === "subagent" ? (
-          <SubagentDetail t={t} detail={detail} onPickUrl={pickUrl} />
+          <SubagentDetail t={t} detail={detail} onPickUrl={pickUrl} onChange={onChange} />
         ) : detail.type === "changes" ? (
           <ReviewPanel
             t={t}
@@ -227,10 +227,12 @@ function SubagentDetail({
   t,
   detail,
   onPickUrl,
+  onChange,
 }: {
   t: Props["t"];
   detail: Extract<NonNullable<DetailView>, { type: "subagent" }>;
   onPickUrl: (url: string, x: number, y: number) => void;
+  onChange: (next: NonNullable<DetailView>) => void;
 }) {
   return (
     <div className="detail-body subagent-detail">
@@ -243,6 +245,33 @@ function SubagentDetail({
         {detail.subagent.activity ? ` · ${detail.subagent.activity}` : ""}
       </div>
       <p className="subagent-detail-goal">{detail.subagent.goal}</p>
+      {(detail.subagent.children || []).length > 0 ? (
+        <div className="subagent-children detail-subagent-children">
+          {detail.subagent.children!.map((child) => (
+            <button
+              key={child.id}
+              type="button"
+              className={`subagent-card nested ${child.status}`}
+              onClick={() => onChange({ type: "subagent", subagent: child })}
+            >
+              <div className="subagent-card-head">
+                <span className="subagent-card-badge">
+                  {t("subtaskLabel")}
+                  {child.role ? ` · ${child.role}` : ""}
+                </span>
+                <span className="subagent-card-status">
+                  {child.status === "running"
+                    ? t("subtaskRunning")
+                    : child.status === "error"
+                      ? t("toolStatusError")
+                      : t("toolStatusDone")}
+                </span>
+              </div>
+              <div className="subagent-card-goal">{child.goal}</div>
+            </button>
+          ))}
+        </div>
+      ) : null}
       <div className="subagent-detail-thread">
         {(detail.subagent.transcript || []).length === 0 && (
           <p className="hint">{t("subagentWaiting")}</p>

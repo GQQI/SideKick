@@ -778,7 +778,18 @@ export function FileExplorer({
           <IconFolder size={13} />
           <span>{t("feNewDir")}</span>
         </button>
-        <button type="button" title={t("feRefresh")} onClick={() => void loadDir(".")}>
+        <button
+          type="button"
+          title={t("feRefresh")}
+          onClick={() => {
+            const paths = Object.keys(dirs);
+            if (paths.length === 0) {
+              void loadDir(".");
+              return;
+            }
+            for (const p of paths) void loadDir(p);
+          }}
+        >
           <IconRefresh size={13} />
           <span>{t("feRefresh")}</span>
         </button>

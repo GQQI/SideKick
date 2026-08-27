@@ -1,7 +1,7 @@
 import type { RuntimeEvent } from "../../api";
 import type { ChatMsg, DetailView, ToolCard } from "../../types/chat";
 import { formatToolSummary } from "../../utils/toolSummary";
-import { softParseToolArgs, uid, writeFilePreview } from "../../utils/chatHelpers";
+import { DELEGATE_TOOL_NAMES, softParseToolArgs, subagentMessagesFromDelegateTool, uid, writeFilePreview } from "../../utils/chatHelpers";
 
 export type ToolUpsertCtx = {
   sealStreamBubble: () => void;
@@ -37,6 +37,27 @@ export function upsertToolStart(ev: RuntimeEvent, ctx: ToolUpsertCtx) {
   const callId = String(ev.data.call_id || uid());
   const name = String(ev.data.name || "tool");
   const pending = Boolean(ev.data.needs_approval);
+  if (DELEGATE_TOOL_NAMES.has(name)) {
+    const cards = subagentMessagesFromDelegateTool({
+      name,
+      call_id: callId,
+      args: ev.data.args,
+      status: pending ? "pending" : "running",
+    });
+    for (const msg of cards) {
+      const goal = msg.subagent?.goal || "";
+      const role = msg.subagent?.role || "";
+      const exists = ctx.transcriptRef.current.some(
+        (m) =>
+          m.role === "subagent" &&
+          m.subagent &&
+          ((role && (m.subagent.role === role || m.subagent.goal === role)) ||
+            (goal && m.subagent.goal === goal)),
+      );
+      if (!exists) ctx.appendMsg(msg);
+    }
+    return;
+  }
   const existing =
     ctx.findToolMsg({ callId }) ||
     ctx.findToolMsg({
@@ -86,6 +107,7 @@ export function upsertToolDelta(ev: RuntimeEvent, ctx: ToolUpsertCtx) {
   const argsRaw = String(ev.data.arguments || "");
   const args = softParseToolArgs(argsRaw);
   const callId = realId || streamKey;
+  if (DELEGATE_TOOL_NAMES.has(name)) return;
 
   const existing =
     ctx.findToolMsg({ callId }) ||
@@ -147,6 +169,40 @@ export function upsertToolEnd(ev: RuntimeEvent, ctx: ToolUpsertCtx) {
   const name = String(ev.data.name || "tool");
   const result = String(ev.data.result ?? ev.data.preview ?? "");
   const ok = ev.data.ok !== false && !result.startsWith("ERROR");
+  if (DELEGATE_TOOL_NAMES.has(name)) {
+    const cards = subagentMessagesFromDelegateTool({
+      name,
+      call_id: callId,
+      args: ev.data.args,
+      result,
+      status: ok ? "done" : "error",
+    });
+    for (const msg of cards) {
+      const node = msg.subagent;
+      if (!node) continue;
+      const hit = ctx.transcriptRef.current.find(
+        (m) =>
+          m.role === "subagent" &&
+          m.subagent &&
+          (m.subagent.goal === node.goal ||
+            (node.role && (m.subagent.role === node.role || m.subagent.goal === node.role))),
+      );
+      if (hit?.subagent && hit.subagent.status === "running") {
+        ctx.updateMsg(hit.id, {
+          subagent: {
+            ...hit.subagent,
+            status: node.status,
+            summary: node.summary || hit.subagent.summary,
+            activity: undefined,
+            transcript:
+              hit.subagent.transcript?.length ? hit.subagent.transcript : node.transcript,
+          },
+          content: node.summary || node.goal,
+        });
+      }
+    }
+    return;
+  }
   const hit =
     ctx.findToolMsg({ callId }) ||
     ctx.findToolMsg({

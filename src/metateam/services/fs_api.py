@@ -6,6 +6,7 @@ import mimetypes
 import re
 import shutil
 import zipfile
+from contextvars import ContextVar
 from pathlib import Path
 from typing import Any, Optional
 from urllib.parse import quote
@@ -13,6 +14,10 @@ from xml.etree import ElementTree as ET
 
 from ..core.config import get_settings
 from ..core.pathutil import is_relative_to, relative_to_posix, resolve_path
+
+_ACTIVE_WORKSPACE: ContextVar[Optional[Path]] = ContextVar(
+    "metateam_active_workspace", default=None
+)
 
 SKIP_NAMES = {".git", ".venv", "node_modules", "__pycache__", ".DS_Store"}
 
@@ -133,7 +138,19 @@ TEXT_EXTS = {
 }
 
 
+def bind_active_workspace(path: Path | str) -> Any:
+    """Pin fs helpers to this agent's workspace for the current context/thread."""
+    return _ACTIVE_WORKSPACE.set(resolve_path(Path(path)))
+
+
+def reset_active_workspace(token: Any) -> None:
+    _ACTIVE_WORKSPACE.reset(token)
+
+
 def workspace_root() -> Path:
+    bound = _ACTIVE_WORKSPACE.get()
+    if bound is not None:
+        return resolve_path(bound)
     return resolve_path(get_settings().workspace)
 
 

@@ -34,9 +34,15 @@ def health() -> dict[str, Any]:
     s = get_settings()
     active = get_active_workspace()
     configured = bool(active.get("configured"))
+    demo = bool(s.demo_mode)
+    try:
+        cfg = load_model_config()
+        demo = not cfg.any_key_set()
+    except Exception:
+        pass
     return {
         "ok": True,
-        "demo": s.demo_mode,
+        "demo": demo,
         "model": s.model,
         "base_url": s.base_url,
         "provider": getattr(s, "provider", ""),

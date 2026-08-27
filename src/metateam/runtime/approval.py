@@ -27,12 +27,17 @@ class ApprovalGate:
     def __init__(self, timeout_sec: float = 300.0) -> None:
         self.timeout_sec = timeout_sec
         self._lock = threading.Lock()
+        self._ui_lock = threading.Lock()
         self._events: dict[str, threading.Event] = {}
         self._decisions: dict[str, bool] = {}
         self._pending: dict[str, ApprovalRequest] = {}
         self._allowed_tools: set[str] = set()
         self._early: dict[str, bool] = {}
         self._patches: dict[str, dict[str, Any]] = {}
+
+    def serialize_ui(self) -> threading.Lock:
+        """One in-flight approval dialog at a time (parallel subagents share this gate)."""
+        return self._ui_lock
 
     def begin_turn(self) -> None:
         with self._lock:
@@ -208,6 +213,10 @@ def summarize_tool_call(name: str, args: dict[str, Any]) -> str:
     if name == "delegate_task":
         goal = str(args.get("goal") or args.get("task") or "")
         return f"委派: {_short(goal, 80)}"
+    if name == "delegate_dialogue":
+        topic = str(args.get("topic") or "")
+        n = len(args.get("speakers") or [])
+        return f"多智能体会话: {_short(topic, 60)}（{n} 方）"
     if name == "ask_user":
         q = str(args.get("question") or "")
         return f"询问用户: {_short(q, 80)}"

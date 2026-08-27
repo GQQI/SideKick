@@ -25,13 +25,18 @@ def build_registry(
     allow_delegate: bool = True,
     run_child: Optional[Callable[..., str]] = None,
     ask_user_fn: Optional[Callable[..., str]] = None,
+    talk_only: bool = False,
+    end_party_session: Optional[Callable[[], None]] = None,
 ) -> ToolRegistry:
     reg = ToolRegistry()
+    if talk_only:
+        return reg
     ctx = ToolContext(
         settings=settings,
         skills=skills,
         run_child=run_child if allow_delegate else None,
         ask_user_fn=ask_user_fn,
+        end_party_session=end_party_session,
     )
     register_file_tools(reg, ctx)
     register_codebase_tools(reg, ctx)

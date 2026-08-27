@@ -1,6 +1,5 @@
 import { useCallback, useRef } from "react";
 import {
-  createSession,
   ensureApiToken,
   fetchHealth,
   fetchMemory,
@@ -95,13 +94,18 @@ export function useSessionBootstrap(deps: SessionBootstrapDeps) {
     (detail: SessionDetail) => {
       setSessionId(detail.id);
       syncContextFromSession(detail);
-      commit(mapSessionMessages(detail.messages));
+      const mapped = mapSessionMessages(detail.messages);
+      commit(mapped);
       streamIdRef.current = null;
       streamTextRef.current = "";
       streamReasoningRef.current = "";
       nativeReasoningRef.current = false;
       setLive([]);
-      setSubs([]);
+      setSubs(
+        mapped
+          .filter((m) => m.role === "subagent" && m.subagent)
+          .map((m) => m.subagent!),
+      );
       onResumeRuntimeRef.current?.(detail);
     },
     [
@@ -176,8 +180,7 @@ export function useSessionBootstrap(deps: SessionBootstrapDeps) {
         /* ignore */
       }
 
-      const s = await createSession();
-      setSessionId(s.id);
+      setSessionId(null);
       commit([]);
       resetContextUsage();
     },

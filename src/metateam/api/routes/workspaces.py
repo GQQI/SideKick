@@ -41,7 +41,7 @@ def api_workspaces_create(body: WorkspaceCreate) -> dict[str, Any]:
         active = create_workspace(target)
     except ValueError as exc:
         raise HTTPException(400, str(exc)) from exc
-    STORE.refresh_settings(rebind_llm=False, rebind_workspace=True)
+    STORE.refresh_settings(rebind_llm=False, rebind_workspace=False)
     return {
         "status": "ok",
         "configured": True,
@@ -59,7 +59,7 @@ def api_workspaces_set(body: WorkspaceSet) -> dict[str, Any]:
         active = set_workspace(target, create=body.create)
     except ValueError as exc:
         raise HTTPException(400, str(exc)) from exc
-    STORE.refresh_settings(rebind_llm=False, rebind_workspace=True)
+    STORE.refresh_settings(rebind_llm=False, rebind_workspace=False)
     return {
         "status": "ok",
         "configured": True,

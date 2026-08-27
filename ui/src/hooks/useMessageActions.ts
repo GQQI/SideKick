@@ -1,6 +1,5 @@
 import {
   browseWorkspace,
-  createSession,
   deleteSession,
   fetchHealth,
   fetchMemory,
@@ -70,6 +69,7 @@ export type MessageActionsDeps = {
   composerRef: React.RefObject<HTMLTextAreaElement | null>;
   busy: boolean;
   sessionId: string | null;
+  sessionIdRef: React.MutableRefObject<string | null>;
   sessionsPage: number;
   skills: SkillItem[];
   setSkills: (s: SkillItem[]) => void;
@@ -139,12 +139,14 @@ export type MessageActionsDeps = {
     },
   ) => Promise<void>;
   stopChat: () => Promise<void>;
+  detachListener: () => void;
+  setBusy: React.Dispatch<React.SetStateAction<boolean>>;
 };
 
 export function useMessageActions(deps: MessageActionsDeps) {
   const {
     t, locale, input, setInput, attachments, setAttachments, attachBusy, setAttachBusy,
-    attachInputRef, composerRef, busy, sessionId, sessionsPage, skills, setSkills,
+    attachInputRef, composerRef, busy, sessionId, sessionIdRef, sessionsPage, skills, setSkills,
     memory, setMemory, model, health, stats, ctx, activeWs, setActiveWs, setWorkspaces,
     setHealth, setModel, setWsBusy, setFsRefresh, setToast, setSessionId, setSessions, setSessionsPage,
     setSessionsTotal, setSessionsTotalPages, setSidePanel, setExplorerCollapsed, setDetail,
@@ -153,7 +155,7 @@ export function useMessageActions(deps: MessageActionsDeps) {
     setCopiedId, openSettings, openMemory, openChat, openHistoryPanel, refreshSessions, applySessionDetail,
     resetContextUsage, commit, appendMsg, transcriptRef, busyRef, streamIdRef,
     streamTextRef, streamReasoningRef, nativeReasoningRef, enqueueMessage, clearQueued,
-    sendChat, stopChat,
+    sendChat, stopChat, detachListener, setBusy,
   } = deps;
 
 async function applyAtFile(item: { path: string; name: string; kind?: string }) {
@@ -481,8 +483,8 @@ function applySlashItem(item: SlashMenuItem) {
 }
 
 async function newChat() {
-  // Instant UI switch — don't wait for stop / session list before clearing.
-  const wasBusy = busy;
+  sessionIdRef.current = null;
+  detachListener();
   clearQueued();
   setAttachments([]);
   streamIdRef.current = null;
@@ -493,29 +495,25 @@ async function newChat() {
   setLive([]);
   setSubs([]);
   setDetail(null);
+  setApproval(null);
+  setAskPrompt(null);
+  setAskChoice("");
+  setAskOtherText("");
   resetContextUsage();
-  setToast(t("chatStarted"));
-
-  if (wasBusy) {
-    // Stop old turn in background; new session id will replace it.
-    void stopChat();
-  }
-
-  try {
-    const s = await createSession();
-    setSessionId(s.id);
-  } catch (e) {
-    setToast(e instanceof Error ? e.message : String(e));
-    return;
-  }
+  setBusy(false);
+  setSessionId(null);
+  setToast(t("chatDraftStarted"));
   void refreshSessions(1);
 }
 
 async function openSession(id: string) {
-  if (id === sessionId) {
+  if (id === sessionIdRef.current) {
     return;
   }
-  if (busy) await stopChat();
+  sessionIdRef.current = id;
+  detachListener();
+  clearQueued();
+  setBusy(false);
   const detailSession = await fetchSession(id);
   applySessionDetail(detailSession);
   {
@@ -539,6 +537,10 @@ async function switchWorkspace(path: string, create = false) {
     /* keep previous model if reload fails */
   }
   setFsRefresh((n) => n + 1);
+  setSessions([]);
+  setSessionsPage(1);
+  setSessionsTotal(0);
+  setSessionsTotalPages(1);
   await newChat();
   setToast(`工作区：${res.active.path}`);
 }
@@ -561,7 +563,20 @@ async function browseAndSetWorkspace() {
 
 async function removeSession(id: string) {
   await deleteSession(id);
-  if (sessionId === id) await newChat();
+  if (sessionIdRef.current === id) {
+    sessionIdRef.current = null;
+    detachListener();
+    clearQueued();
+    commit([]);
+    setLive([]);
+    setSubs([]);
+    setDetail(null);
+    setApproval(null);
+    setAskPrompt(null);
+    resetContextUsage();
+    setBusy(false);
+    setSessionId(null);
+  }
   const res = await fetchSessions(sessionsPage, HISTORY_PAGE_SIZE);
   if ((res.items || []).length === 0 && sessionsPage > 1) {
     await refreshSessions(sessionsPage - 1);

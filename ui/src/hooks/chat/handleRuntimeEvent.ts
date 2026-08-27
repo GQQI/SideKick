@@ -17,7 +17,7 @@ import {
 import type { PlanConfirmState, ShapeContract } from "../../types/plan";
 import { formatToolSummary } from "../../utils/toolSummary";
 import { isFileMutatingTool } from "../../utils/diffPreview";
-import { softParseToolArgs, uid } from "../../utils/chatHelpers";
+import { findSubNode, softParseToolArgs, uid } from "../../utils/chatHelpers";
 import type { MsgKey } from "../../i18n";
 import { upsertToolDelta, upsertToolEnd, upsertToolStart, type ToolUpsertCtx } from "./toolUpserts";
 
@@ -282,13 +282,28 @@ export function handleRuntimeEvent(ev: RuntimeEvent, ctx: RuntimeEventHandlerCtx
     ctx.setActivePlan(null);
   }
 
-  // Subagent events share the bus — accumulate into subagent transcript
+  // Subagent events share the bus — accumulate into subagent transcript.
+  // Gate events (approval / ask / nested spawn) must still reach the main UI;
+  // otherwise a leaf that needs confirmation stays "running" forever.
+  const childGateTypes = new Set([
+    "approval_request",
+    "approval_resolved",
+    "ask_request",
+    "ask_resolved",
+    "plan_created",
+    "plan_confirm_request",
+    "plan_confirm_resolved",
+    "plan_step",
+    "plan_done",
+    "subagent_start",
+    "subagent_end",
+    "cancelled",
+    "error",
+    "final",
+  ]);
   if (ev.parent_id) {
     const childId = String(ev.agent_id || "");
-    if (!childId) {
-      return;
-    }
-    if (type === "assistant_delta") {
+    if (childId && type === "assistant_delta") {
       const reset = Boolean(ev.data.reset);
       const chunk = String(ev.data.chunk ?? ev.data.text ?? "");
       ctx.patchSubagent(childId, (s) => {
@@ -326,7 +341,7 @@ export function handleRuntimeEvent(ev: RuntimeEvent, ctx: RuntimeEventHandlerCtx
         }
         return { ...s, transcript: tr, activity: "生成中…" };
       });
-    } else if (type === "assistant_reasoning_delta") {
+    } else if (childId && type === "assistant_reasoning_delta") {
       const chunk = String(ev.data.chunk ?? "");
       ctx.patchSubagent(childId, (s) => {
         let tr = [...(s.transcript || [])];
@@ -350,7 +365,7 @@ export function handleRuntimeEvent(ev: RuntimeEvent, ctx: RuntimeEventHandlerCtx
         }
         return { ...s, transcript: tr, activity: ctx.t("thinkingActivity") };
       });
-    } else if (type === "tool_call_delta") {
+    } else if (childId && type === "tool_call_delta") {
       const callId = String(ev.data.id || `stream_${ev.data.index ?? 0}`);
       const name = String(ev.data.name || "");
       const argsRaw = String(ev.data.arguments || "");
@@ -378,7 +393,7 @@ export function handleRuntimeEvent(ev: RuntimeEvent, ctx: RuntimeEventHandlerCtx
         else tr.push({ id: tool.id, kind: "tool", tool });
         return { ...s, transcript: tr, activity: summary };
       });
-    } else if (type === "tool_start") {
+    } else if (childId && type === "tool_start") {
       const callId = String(ev.data.call_id || uid());
       const name = String(ev.data.name || "tool");
       const summary =
@@ -405,7 +420,7 @@ export function handleRuntimeEvent(ev: RuntimeEvent, ctx: RuntimeEventHandlerCtx
         else tr.push({ id: tool.id, kind: "tool", tool });
         return { ...s, transcript: tr, activity: summary };
       });
-    } else if (type === "tool_end") {
+    } else if (childId && type === "tool_end") {
       const callId = String(ev.data.call_id || "");
       const name = String(ev.data.name || "tool");
       const ok = Boolean(ev.data.ok !== false);
@@ -443,13 +458,15 @@ export function handleRuntimeEvent(ev: RuntimeEvent, ctx: RuntimeEventHandlerCtx
         ctx.setFsRefresh((n) => n + 1);
       }
     }
-    const label =
-      (ev.data.message as string) ||
-      `${type}${ev.data.name ? " " + ev.data.name : ""}`;
-    ctx.setLive((prev) =>
-      [...prev, { id: uid(), text: `[子] ${label}`, kind: type }].slice(-120),
-    );
-    return;
+    if (!childGateTypes.has(type)) {
+      const label =
+        (ev.data.message as string) ||
+        `${type}${ev.data.name ? " " + ev.data.name : ""}`;
+      ctx.setLive((prev) =>
+        [...prev, { id: uid(), text: `[子] ${label}`, kind: type }].slice(-120),
+      );
+      return;
+    }
   }
 
   if (type === "session") {
@@ -621,23 +638,132 @@ export function handleRuntimeEvent(ev: RuntimeEvent, ctx: RuntimeEventHandlerCtx
   }
 
   if (type === "subagent_start") {
+    const party = String(ev.data.party || "");
+    const label = String(ev.data.label || party || "").trim();
+    const replay = Boolean(ev.data.replay);
+    const goal = label || String(ev.data.goal || "");
+    const replayItems = Array.isArray(ev.data.transcript)
+      ? (ev.data.transcript as Array<Record<string, unknown>>)
+      : [];
+    const transcript: SubTranscriptItem[] = replayItems.flatMap((item) => {
+      if (!item || typeof item !== "object") return [];
+      if (item.kind === "tool") {
+        const name = String(item.name || "tool");
+        return [
+          {
+            id: uid(),
+            kind: "tool" as const,
+            tool: {
+              id: uid(),
+              callId: String(item.call_id || uid()),
+              name,
+              summary: name,
+              status: "done" as const,
+              result: String(item.result || ""),
+            },
+          },
+        ];
+      }
+      const text = String(item.text || item.content || "").trim();
+      return text ? [{ id: uid(), kind: "assistant" as const, text }] : [];
+    });
     const node: SubNode = {
       id: String(ev.data.child_id),
-      goal: String(ev.data.goal || ""),
+      goal,
       status: "running",
-      role: String(ev.data.role || "leaf"),
-      activity: "启动中…",
-      transcript: [],
+      role: party || String(ev.data.role || "leaf"),
+      activity: String(ev.data.activity || "启动中…"),
+      transcript,
     };
-    ctx.setSubs((prev) => [...prev, node]);
-    ctx.appendMsg({
-      id: uid(),
-      role: "subagent",
-      content: node.goal,
-      subagent: node,
+    const spawnerId = String(ev.agent_id || "");
+    const nestedParent =
+      ev.parent_id && spawnerId
+        ? ctx.transcriptRef.current.find(
+            (m) =>
+              m.role === "subagent" &&
+              m.subagent &&
+              findSubNode(m.subagent, spawnerId),
+          )
+        : undefined;
+    if (nestedParent?.subagent) {
+      ctx.patchSubagent(spawnerId, (s) => {
+        const kids = [...(s.children || [])];
+        const idx = kids.findIndex((k) => k.id === node.id);
+        if (idx >= 0) {
+          const prev = kids[idx];
+          kids[idx] = {
+            ...prev,
+            ...node,
+            children: prev.children,
+            transcript:
+              prev.transcript?.length && !node.transcript.length
+                ? prev.transcript
+                : node.transcript.length
+                  ? node.transcript
+                  : prev.transcript,
+          };
+        } else {
+          kids.push(node);
+        }
+        return {
+          ...s,
+          children: kids,
+          activity: s.status === "running" ? `子任务 · ${node.goal}` : s.activity,
+        };
+      });
+    } else {
+    const keys = [party, label, node.goal, String(ev.data.goal || "")].filter(Boolean);
+    const existing = ctx.transcriptRef.current.find((m) => {
+      if (m.role !== "subagent" || !m.subagent) return false;
+      const s = m.subagent;
+      if (s.id === node.id) return true;
+      return keys.some(
+        (k) =>
+          s.role === k ||
+          s.goal === k ||
+          s.goal.startsWith(`${k} —`) ||
+          s.goal.startsWith(`You are ${k}`) ||
+          String(ev.data.goal || "").startsWith(`You are ${s.role}`),
+      );
     });
-    // Auto-open detail so progress is visible immediately
-    ctx.setDetail({ type: "subagent", subagent: node });
+    if (existing?.subagent) {
+      const merged: SubNode = {
+        ...existing.subagent,
+        ...node,
+        id: node.id,
+        children: existing.subagent.children,
+        transcript:
+          existing.subagent.transcript?.length && !transcript.length
+            ? existing.subagent.transcript
+            : transcript.length
+              ? transcript
+              : existing.subagent.transcript,
+      };
+      ctx.updateMsg(existing.id, {
+        subagent: merged,
+        content: merged.summary || merged.goal,
+      });
+      ctx.setSubs((prev) => {
+        const without = prev.filter((s) => s.id !== existing.subagent?.id && s.id !== merged.id);
+        return [...without, merged];
+      });
+      ctx.setDetail((d) =>
+        d?.type === "subagent" &&
+        (d.subagent.id === existing.subagent?.id || d.subagent.id === merged.id)
+          ? { type: "subagent", subagent: merged }
+          : d,
+      );
+    } else {
+      ctx.setSubs((prev) => (prev.some((s) => s.id === node.id) ? prev : [...prev, node]));
+      ctx.appendMsg({
+        id: uid(),
+        role: "subagent",
+        content: node.goal,
+        subagent: node,
+      });
+      if (!replay) ctx.setDetail({ type: "subagent", subagent: node });
+    }
+    }
   }
   if (type === "subagent_end") {
     const childId = String(ev.data.child_id);

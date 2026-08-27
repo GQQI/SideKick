@@ -40,7 +40,7 @@ class ToolRegistry:
         out: list[dict[str, Any]] = []
         for tool in self._tools.values():
             if not allow_mutating and (
-                tool.requires_approval or tool.name == "delegate_task"
+                tool.requires_approval or tool.name in ("delegate_task", "delegate_dialogue")
             ):
                 continue
             out.append(tool.openai_schema())

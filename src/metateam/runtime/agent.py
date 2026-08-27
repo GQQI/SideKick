@@ -53,6 +53,39 @@ from .tools import ToolRegistry, build_registry
 PrintFn = Callable[[str], None]
 
 
+def _subagent_snapshot_item(child: Agent, party: str = "") -> dict[str, Any]:
+    kind = "party" if child.full_agent else ("talk" if child.talk_only else "task")
+    label = party or (child.goal or "").strip().split("\n")[0][:80]
+    transcript: list[dict[str, Any]] = []
+    for m in child.messages:
+        role = m.get("role")
+        if role == "assistant":
+            text = str(m.get("content") or "").strip()
+            if text:
+                transcript.append({"kind": "assistant", "text": text})
+        elif role == "tool":
+            transcript.append(
+                {
+                    "kind": "tool",
+                    "name": str(m.get("name") or "tool"),
+                    "result": str(m.get("content") or "")[:2000],
+                }
+            )
+    return {
+        "child_id": child.agent_id,
+        "goal": child.goal or label,
+        "role": child.role,
+        "kind": kind,
+        "party": party,
+        "label": label,
+        "parent_id": child.parent_id,
+        "replay": True,
+        "transcript": transcript[-30:],
+        "activity": "运行中…",
+        "message": f"resume {child.role}: {label}",
+    }
+
+
 @dataclass
 class AgentResult:
     text: str
@@ -83,9 +116,13 @@ class Agent(AgentHistoryMixin, AgentExecuteMixin, AgentGroundingMixin):
         approval: Optional[ApprovalGate] = None,
         ask: Optional[AskGate] = None,
         plan_gate: Optional[PlanGate] = None,
+        talk_only: bool = False,
+        full_agent: bool = False,
     ):
         self.settings = (settings or get_settings()).clone()
         self.is_subagent = is_subagent
+        self.talk_only = bool(talk_only)
+        self.full_agent = bool(full_agent) and not self.talk_only
         self.role = role if role in ("leaf", "orchestrator") else "leaf"
         self.goal = goal
         self.context = context
@@ -102,9 +139,10 @@ class Agent(AgentHistoryMixin, AgentExecuteMixin, AgentGroundingMixin):
         self.ask = ask or AskGate()
         self.plan_gate = plan_gate or PlanGate()
         self._children: list[Agent] = []
-        self._allow_mutating_tools = True
+        self._party_agents: dict[str, Agent] = {}
+        self._allow_mutating_tools = not self.talk_only
 
-        self.skills: list[Skill] = load_skills(self.settings.skills_dir)
+        self.skills: list[Skill] = [] if self.talk_only else load_skills(self.settings.skills_dir)
         if is_subagent:
             self.llm = LLM(
                 self.settings,
@@ -121,15 +159,17 @@ class Agent(AgentHistoryMixin, AgentExecuteMixin, AgentGroundingMixin):
             base_url=getattr(self.settings, "compress_base_url", None) or self.settings.base_url,
         )
 
-        can_delegate = (not is_subagent) or (
-            self.role == "orchestrator" and depth < self.settings.max_spawn_depth
+        can_delegate = (not self.talk_only) and (
+            (not is_subagent) or (depth < self.settings.max_spawn_depth)
         )
         self.registry: ToolRegistry = build_registry(
             self.settings,
             skills=self.skills,
             allow_delegate=can_delegate,
             run_child=self._run_child if can_delegate else None,
-            ask_user_fn=self._ask_user,
+            ask_user_fn=None if self.talk_only else self._ask_user,
+            talk_only=self.talk_only,
+            end_party_session=self._end_party_session if can_delegate else None,
         )
         # Sticky facts from tools (list_dir / codebase_*) so later turns don't invent paths.
         self.workspace_facts: list[str] = []
@@ -150,9 +190,11 @@ class Agent(AgentHistoryMixin, AgentExecuteMixin, AgentGroundingMixin):
                 context=context,
                 depth=depth,
                 max_depth=self.settings.max_spawn_depth,
+                talk_only=self.talk_only,
+                full_agent=self.full_agent,
             )
             self.messages = [{"role": "system", "content": system}]
-        if not is_subagent:
+        if (not is_subagent) or self.full_agent:
             self._refresh_workspace_grounding()
 
     def request_cancel(self) -> None:
@@ -192,14 +234,33 @@ class Agent(AgentHistoryMixin, AgentExecuteMixin, AgentGroundingMixin):
         if data and "message" in (data or {}):
             self._log(str(data["message"]))
 
-    def _run_child(self, *, goal: str, context: str = "", role: str = "leaf") -> str:
+    def _run_child(
+        self,
+        *,
+        goal: str,
+        context: str = "",
+        role: str = "leaf",
+        kind: str = "task",
+        persist_key: str = "",
+    ) -> str:
         child_role = role if role in ("leaf", "orchestrator") else "leaf"
-        # Depth gate: only allow orchestrator if next depth still can spawn
         next_depth = self.depth + 1
         if child_role == "orchestrator" and next_depth >= self.settings.max_spawn_depth:
             child_role = "leaf"
+        kind_s = (kind or "task").strip().lower()
+        talk_only = kind_s == "talk"
+        full_agent = kind_s in ("party", "full")
+        key = (persist_key or "").strip()
+        resumed = bool(key and key in self._party_agents)
 
-        child_id = new_id("agent")
+        if resumed:
+            child = self._party_agents[key]
+            child_id = child.agent_id
+        else:
+            child_id = new_id("agent")
+
+        event_kind = "party" if full_agent else ("talk" if talk_only else "task")
+        label = key or (goal or context or "").strip().split("\n")[0][:80]
         self._emit(
             "subagent_start",
             {
@@ -207,43 +268,110 @@ class Agent(AgentHistoryMixin, AgentExecuteMixin, AgentGroundingMixin):
                 "goal": goal,
                 "role": child_role,
                 "depth": next_depth,
-                "message": f"spawn {child_role}: {goal[:100]}",
+                "kind": event_kind,
+                "party": key,
+                "label": label,
+                "resumed": resumed,
+                "message": f"{'resume' if resumed else 'spawn'} {child_role}: {label}",
             },
         )
-        child = Agent(
-            self.settings,
-            is_subagent=True,
-            role=child_role,
-            goal=goal,
-            context=context,
-            depth=next_depth,
-            parent_id=self.agent_id,
-            agent_id=child_id,
-            bus=self.bus,
-            on_event=self.on_event,
-            approval=self.approval,
-            ask=self.ask,
-            plan_gate=self.plan_gate,
-        )
-        self._children.append(child)
+        if not resumed:
+            child = Agent(
+                self.settings,
+                is_subagent=True,
+                role=child_role,
+                goal=goal,
+                context="" if (full_agent or key) else context,
+                depth=next_depth,
+                parent_id=self.agent_id,
+                agent_id=child_id,
+                bus=self.bus,
+                on_event=self.on_event,
+                approval=self.approval,
+                ask=self.ask,
+                plan_gate=self.plan_gate,
+                talk_only=talk_only,
+                full_agent=full_agent,
+            )
+            self._children.append(child)
+            if key:
+                self._party_agents[key] = child
         if self.cancelled():
             child.request_cancel()
+        if resumed or full_agent:
+            user_text = (context or "").strip() or (goal or "").strip() or "Your turn."
+        elif talk_only:
+            user_text = (
+                "Speak your turn now. Do not write code or files. "
+                "Output only in-character dialogue."
+            )
+        else:
+            user_text = "Begin now. Use tools, then summarize."
+        result_text = "(empty summary)"
+        iterations = 0
+        cancelled = False
         try:
-            result = child.run("Begin now. Use tools, then summarize.")
+            result = child.run(user_text, do_review=False)
+            result_text = result.text or "(empty summary)"
+            iterations = result.iterations
+            cancelled = bool(result.cancelled)
+        except Exception as exc:  # noqa: BLE001
+            from ..core.logutil import get_logger, log_exception
+
+            log_exception(get_logger("metateam.agent"), f"child {child_id} failed", exc)
+            result_text = f"ERROR: child failed: {exc}"
+            cancelled = True
         finally:
+            if not key:
+                self._children = [c for c in self._children if c is not child]
+            self._emit(
+                "subagent_end",
+                {
+                    "child_id": child_id,
+                    "goal": goal,
+                    "summary": (result_text or "")[:2000],
+                    "iterations": iterations,
+                    "cancelled": cancelled,
+                    "message": f"done: {(goal or context)[:60]}",
+                },
+            )
+        return result_text
+
+    def _end_party_session(self) -> None:
+        for child in list(self._party_agents.values()):
             self._children = [c for c in self._children if c is not child]
-        self._emit(
-            "subagent_end",
-            {
-                "child_id": child_id,
-                "goal": goal,
-                "summary": (result.text or "")[:2000],
-                "iterations": result.iterations,
-                "cancelled": bool(result.cancelled),
-                "message": f"done: {goal[:60]}",
-            },
-        )
-        return result.text or "(empty summary)"
+        self._party_agents.clear()
+
+    def live_subagent_snapshot(self) -> list[dict[str, Any]]:
+        """Running children (including nested) so a reattached UI can restore cards."""
+        out: list[dict[str, Any]] = []
+        seen: set[str] = set()
+
+        def party_name(agent: Agent, child: Agent) -> str:
+            for name, party in agent._party_agents.items():
+                if party is child or party.agent_id == child.agent_id:
+                    return str(name)
+            return ""
+
+        def walk(agent: Agent) -> None:
+            ordered: list[tuple[str, Agent]] = []
+            local: set[str] = set()
+            for child in list(agent._children):
+                ordered.append((party_name(agent, child), child))
+                local.add(child.agent_id)
+            for name, child in list(agent._party_agents.items()):
+                if child.agent_id in local:
+                    continue
+                ordered.append((str(name), child))
+            for party, child in ordered:
+                if child.agent_id in seen:
+                    continue
+                seen.add(child.agent_id)
+                out.append(_subagent_snapshot_item(child, party))
+                walk(child)
+
+        walk(self)
+        return out
 
     def _ask_user(
         self,
@@ -282,39 +410,42 @@ class Agent(AgentHistoryMixin, AgentExecuteMixin, AgentGroundingMixin):
 
         allow_other = bool(allow_custom)
         other_label = str(custom_label or "其他（请补充）").strip() or "其他（请补充）"
-        ask_id = new_id("ask")
-        call_id = new_id("call")
-        self._emit("assistant_delta", {"chunk": "", "reset": True, "discard": True})
-        self._emit(
-            "ask_request",
-            {
-                "ask_id": ask_id,
-                "call_id": call_id,
-                "session_id": self.session_id or "",
-                "question": q,
-                "options": built,
-                "allow_custom": allow_other,
-                "custom_label": other_label,
-                "summary": f"询问用户: {q[:120]}",
-                "message": f"等待用户选择：{q[:80]}",
-            },
-        )
-        answer = self.ask.request(
-            ask_id,
-            q,
-            built,
-            allow_custom=allow_other,
-            custom_label=other_label,
-        )
-        self._emit(
-            "ask_resolved",
-            {
-                "ask_id": ask_id,
-                "call_id": call_id,
-                "answer": answer,
-                "message": "用户已回答" if not str(answer).startswith("ERROR:") else "询问已取消或超时",
-            },
-        )
+        with self.ask.serialize_ui():
+            if self.cancelled():
+                return "ERROR: cancelled — proceed with a reasonable default or stop."
+            ask_id = new_id("ask")
+            call_id = new_id("call")
+            self._emit("assistant_delta", {"chunk": "", "reset": True, "discard": True})
+            self._emit(
+                "ask_request",
+                {
+                    "ask_id": ask_id,
+                    "call_id": call_id,
+                    "session_id": self.session_id or "",
+                    "question": q,
+                    "options": built,
+                    "allow_custom": allow_other,
+                    "custom_label": other_label,
+                    "summary": f"询问用户: {q[:120]}",
+                    "message": f"等待用户选择：{q[:80]}",
+                },
+            )
+            answer = self.ask.request(
+                ask_id,
+                q,
+                built,
+                allow_custom=allow_other,
+                custom_label=other_label,
+            )
+            self._emit(
+                "ask_resolved",
+                {
+                    "ask_id": ask_id,
+                    "call_id": call_id,
+                    "answer": answer,
+                    "message": "用户已回答" if not str(answer).startswith("ERROR:") else "询问已取消或超时",
+                },
+            )
         return answer
 
     def _maybe_compress(self) -> None:
@@ -828,6 +959,24 @@ class Agent(AgentHistoryMixin, AgentExecuteMixin, AgentGroundingMixin):
         do_review: bool = True,
         display: str = "",
     ) -> AgentResult:
+        from ..services.fs_api import bind_active_workspace, reset_active_workspace
+
+        ws_token = bind_active_workspace(self.settings.workspace)
+        try:
+            return self._run_turn(
+                user_text, mode=mode, do_review=do_review, display=display
+            )
+        finally:
+            reset_active_workspace(ws_token)
+
+    def _run_turn(
+        self,
+        user_text: str,
+        *,
+        mode: str = "agent",
+        do_review: bool = True,
+        display: str = "",
+    ) -> AgentResult:
         # Top-level turns reset cancel; subagents keep a cancel already set by parent.
         if not self.is_subagent:
             self.clear_cancel()
@@ -838,6 +987,11 @@ class Agent(AgentHistoryMixin, AgentExecuteMixin, AgentGroundingMixin):
             # Re-pin live workspace truth so the model does not fall back to src/ priors
             self._refresh_workspace_grounding()
             self._apply_turn_coherence_policy(user_text)
+            self._turn_mutated = False
+            self._turn_verified = False
+        elif self.full_agent:
+            self._repair_dangling_tool_calls()
+            self._refresh_workspace_grounding()
             self._turn_mutated = False
             self._turn_verified = False
         user_turn = sum(1 for m in self.messages if m.get("role") == "user")
@@ -873,9 +1027,9 @@ class Agent(AgentHistoryMixin, AgentExecuteMixin, AgentGroundingMixin):
         )
 
         max_iters = (
-            self.settings.subagent_max_iterations
-            if self.is_subagent
-            else self.settings.max_iterations
+            self.settings.max_iterations
+            if (not self.is_subagent or self.full_agent)
+            else self.settings.subagent_max_iterations
         )
         compressed = False
         self._last_compressed = False

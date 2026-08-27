@@ -427,32 +427,28 @@ def _resolve_session_id(stack: list[dict[str, Any]], session_id: Optional[str]) 
 def _session_records(
     stack: list[dict[str, Any]], session_id: Optional[str]
 ) -> list[dict[str, Any]]:
-    """Records for one conversation.
+    """Records belonging to one conversation, including interleaved turns.
 
-    Slice from that session's first checkpoint until another session's
-    checkpoint. Untagged writes after the checkpoint belong to it (file
-    tools do not always stamp session_id). With no checkpoints, use the
-    whole stack.
+    A record belongs to the session if it is stamped with that session_id, or
+    it is untagged and follows that session's checkpoint (file tools / explorer
+    ops that did not stamp an id).
     """
     sid = _resolve_session_id(stack, session_id)
     if not sid:
         return list(stack)
-    start: Optional[int] = None
-    for i, rec in enumerate(stack):
-        if rec.get("op") == "checkpoint" and str(rec.get("session_id") or "") == sid:
-            start = i
-            break
-    if start is None:
-        tagged = [rec for rec in stack if str(rec.get("session_id") or "") == sid]
-        return tagged if tagged else list(stack)
-    end = len(stack)
-    for i in range(start + 1, len(stack)):
-        rec = stack[i]
-        other = rec.get("session_id")
-        if rec.get("op") == "checkpoint" and other and str(other) != sid:
-            end = i
-            break
-    return stack[start:end]
+    out: list[dict[str, Any]] = []
+    owner: Optional[str] = None
+    for rec in stack:
+        rec_sid = str(rec.get("session_id") or "").strip() or None
+        if rec.get("op") == "checkpoint" and rec_sid:
+            owner = rec_sid
+        if rec_sid:
+            if rec_sid == sid:
+                out.append(rec)
+            continue
+        if owner == sid:
+            out.append(rec)
+    return out
 
 
 def _collect_tracked(
@@ -724,10 +720,14 @@ def _status_item(rec: dict[str, Any]) -> dict[str, Any]:
     }
 
 
-def status(workspace: Optional[Path] = None) -> dict[str, Any]:
+def status(
+    workspace: Optional[Path] = None, *, session_id: Optional[str] = None
+) -> dict[str, Any]:
     """One timeline row per conversation turn (checkpoint + its file ops)."""
     with _lock:
         stack = _load_stack(workspace)
+    if session_id:
+        stack = _session_records(stack, session_id)
     grouped: list[dict[str, Any]] = []
     open_idx: Optional[int] = None
     for rec in stack:
@@ -756,52 +756,136 @@ def undo_to_turn(
     before_user_turn: int,
     workspace: Optional[Path] = None,
 ) -> dict[str, Any]:
-    """Restore workspace to the state before `before_user_turn` of this session.
+    """Restore this session's files to the state before `before_user_turn`.
 
-    Undoes every stack entry from the top down through the matching checkpoint
-    (inclusive). Untagged / other-session ops above that checkpoint are also
-    reversed so the workspace matches that moment.
+    Only records belonging to ``session_id`` are reversed; other conversations
+    keep their file ops.
     """
     with _lock:
         stack = _load_stack(workspace)
-        target_idx: Optional[int] = None
-        for i, rec in enumerate(stack):
-            if (
-                rec.get("op") == "checkpoint"
-                and rec.get("session_id") == session_id
-                and rec.get("user_turn") == before_user_turn
-            ):
-                target_idx = i
+    recs = _session_records(stack, session_id)
+    target_id = ""
+    for rec in recs:
+        if (
+            rec.get("op") == "checkpoint"
+            and rec.get("session_id") == session_id
+            and rec.get("user_turn") == before_user_turn
+        ):
+            target_id = str(rec.get("id") or "")
+            break
+    if not target_id:
+        n_ids: list[str] = []
+        for rec in reversed(recs):
+            turn = rec.get("user_turn")
+            if turn is None or int(turn) < before_user_turn:
                 break
-        if target_idx is None:
-            # Fallback: drop tagged ops for this session at/after the turn
-            n = 0
-            for rec in reversed(stack):
-                if rec.get("session_id") != session_id:
-                    break
-                turn = rec.get("user_turn")
-                if turn is None or int(turn) < before_user_turn:
-                    break
-                n += 1
-            to_undo = n
-            partial = True
-        else:
-            to_undo = len(stack) - target_idx
-            partial = False
+            rid = str(rec.get("id") or "")
+            if rid:
+                n_ids.append(rid)
+        return _undo_ids(n_ids, workspace, partial=True)
+    return _undo_through_id(target_id, workspace, session_id=session_id)
 
+
+def undo_latest_turn(
+    workspace: Optional[Path] = None, *, session_id: Optional[str] = None
+) -> dict[str, Any]:
+    """Undo the latest conversation turn (checkpoint + file ops), not a single write."""
+    with _lock:
+        stack = _load_stack(workspace)
+    recs = _session_records(stack, session_id) if session_id else list(stack)
+    if not recs:
+        raise ValueError("nothing to undo")
+    last_file = None
+    for i in range(len(recs) - 1, -1, -1):
+        if recs[i].get("op") != "checkpoint":
+            last_file = i
+            break
+    if last_file is None:
+        target = str(recs[-1].get("id") or "")
+    else:
+        cp = None
+        for i in range(last_file, -1, -1):
+            if recs[i].get("op") == "checkpoint":
+                cp = i
+                break
+        rec = recs[cp] if cp is not None else recs[last_file]
+        target = str(rec.get("id") or "")
+    if not target:
+        raise ValueError("nothing to undo")
+    return undo_to_id(target, workspace, session_id=session_id)
+
+
+def undo_to_id(
+    entry_id: str,
+    workspace: Optional[Path] = None,
+    *,
+    session_id: Optional[str] = None,
+) -> dict[str, Any]:
+    """Undo from the newest matching records down through ``entry_id`` (inclusive).
+
+    When ``session_id`` is set, other conversations' stack entries are skipped.
+    """
+    target = str(entry_id or "").strip()
+    if not target:
+        raise ValueError("missing undo id")
+    return _undo_through_id(target, workspace, session_id=session_id)
+
+
+def _undo_through_id(
+    entry_id: str,
+    workspace: Optional[Path] = None,
+    *,
+    session_id: Optional[str] = None,
+    partial: bool = False,
+) -> dict[str, Any]:
+    with _lock:
+        stack = _load_stack(workspace)
+    recs = _session_records(stack, session_id) if session_id else list(stack)
+    idx: Optional[int] = None
+    for i, rec in enumerate(recs):
+        if str(rec.get("id") or "") == entry_id:
+            idx = i
+            break
+    if idx is None:
+        raise ValueError("undo entry not found")
+    ids = [str(r.get("id") or "") for r in recs[idx:] if r.get("id")]
+    ids.reverse()
+    return _undo_ids(ids, workspace, partial=partial)
+
+
+def _take_record(entry_id: str, workspace: Optional[Path] = None) -> Optional[dict[str, Any]]:
+    with _lock:
+        stack = _load_stack(workspace)
+        for i, rec in enumerate(stack):
+            if str(rec.get("id") or "") == entry_id:
+                rec = stack.pop(i)
+                _save_stack(stack, workspace)
+                return rec
+    return None
+
+
+def _undo_ids(
+    ids_newest_first: list[str],
+    workspace: Optional[Path] = None,
+    *,
+    partial: bool = False,
+) -> dict[str, Any]:
     undone: list[dict[str, Any]] = []
     errors: list[str] = []
-    for _ in range(to_undo):
+    for eid in ids_newest_first:
+        if not eid:
+            continue
+        rec = _take_record(eid, workspace)
+        if not rec:
+            continue
         try:
-            result = undo_one(workspace)
-            if result.get("undone"):
-                undone.append(result["undone"])
+            _apply_undo_record(rec, workspace)
+            undone.append({"id": rec.get("id"), "label": rec.get("label"), "op": rec.get("op")})
         except ValueError:
             break
         except Exception as exc:  # noqa: BLE001
             errors.append(str(exc))
             break
-
     with _lock:
         remaining = len(_load_stack(workspace))
     return {
@@ -814,83 +898,10 @@ def undo_to_turn(
     }
 
 
-def undo_latest_turn(workspace: Optional[Path] = None) -> dict[str, Any]:
-    """Undo the latest conversation turn (checkpoint + file ops), not a single write."""
-    with _lock:
-        stack = _load_stack(workspace)
-        if not stack:
-            raise ValueError("nothing to undo")
-        last_file = None
-        for i in range(len(stack) - 1, -1, -1):
-            if stack[i].get("op") != "checkpoint":
-                last_file = i
-                break
-        if last_file is None:
-            target = str(stack[-1].get("id") or "")
-        else:
-            cp = None
-            for i in range(last_file, -1, -1):
-                if stack[i].get("op") == "checkpoint":
-                    cp = i
-                    break
-            rec = stack[cp] if cp is not None else stack[last_file]
-            target = str(rec.get("id") or "")
-    if not target:
-        raise ValueError("nothing to undo")
-    return undo_to_id(target, workspace)
-
-
-def undo_to_id(entry_id: str, workspace: Optional[Path] = None) -> dict[str, Any]:
-    """Undo from the top of the stack down through ``entry_id`` (inclusive)."""
-    target = str(entry_id or "").strip()
-    if not target:
-        raise ValueError("missing undo id")
-    with _lock:
-        stack = _load_stack(workspace)
-        idx: Optional[int] = None
-        for i, rec in enumerate(stack):
-            if str(rec.get("id") or "") == target:
-                idx = i
-                break
-        if idx is None:
-            raise ValueError("undo entry not found")
-        to_undo = len(stack) - idx
-    undone: list[dict[str, Any]] = []
-    errors: list[str] = []
-    for _ in range(to_undo):
-        try:
-            result = undo_one(workspace)
-            if result.get("undone"):
-                undone.append(result["undone"])
-        except ValueError:
-            break
-        except Exception as exc:  # noqa: BLE001
-            errors.append(str(exc))
-            break
-    with _lock:
-        remaining = len(_load_stack(workspace))
-    return {
-        "status": "ok",
-        "undone_count": len(undone),
-        "undone": undone,
-        "remaining": remaining,
-        "errors": errors,
-    }
-
-
-def undo_one(workspace: Optional[Path] = None) -> dict[str, Any]:
-    """Pop and reverse the latest FS mutation. Returns summary."""
-    with _lock:
-        stack = _load_stack(workspace)
-        if not stack:
-            raise ValueError("nothing to undo")
-        rec = stack.pop()
-        _save_stack(stack, workspace)
-
+def _apply_undo_record(rec: dict[str, Any], workspace: Optional[Path] = None) -> None:
     op = rec.get("op")
     blob = rec.get("blob")
     blob_path = (_undo_root(workspace) / "blobs" / str(blob)) if blob else None
-
     try:
         if op == "checkpoint":
             pass
@@ -937,6 +948,19 @@ def undo_one(workspace: Optional[Path] = None) -> dict[str, Any]:
             raise ValueError(f"unknown undo op: {op}")
     finally:
         _discard_blob(rec, workspace)
+
+
+def undo_one(workspace: Optional[Path] = None) -> dict[str, Any]:
+    """Pop and reverse the latest FS mutation. Returns summary."""
+    with _lock:
+        stack = _load_stack(workspace)
+        if not stack:
+            raise ValueError("nothing to undo")
+        rec = stack.pop()
+        _save_stack(stack, workspace)
+
+    op = rec.get("op")
+    _apply_undo_record(rec, workspace)
 
     with _lock:
         remaining = len(_load_stack(workspace))

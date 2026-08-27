@@ -5,10 +5,11 @@ import { IconRefresh, IconUndo } from "./icons";
 
 type Props = {
   refreshKey?: number;
+  sessionId?: string | null;
   onRestored?: () => void;
 };
 
-export function UndoTimeline({ refreshKey = 0, onRestored }: Props) {
+export function UndoTimeline({ refreshKey = 0, sessionId = null, onRestored }: Props) {
   const { t, locale } = usePrefs();
   const [items, setItems] = useState<UndoItem[]>([]);
   const [count, setCount] = useState(0);
@@ -17,10 +18,16 @@ export function UndoTimeline({ refreshKey = 0, onRestored }: Props) {
   const [busyId, setBusyId] = useState("");
 
   const load = useCallback(async () => {
+    if (!sessionId) {
+      setItems([]);
+      setCount(0);
+      setErr("");
+      return;
+    }
     setLoading(true);
     setErr("");
     try {
-      const res = await fetchUndo();
+      const res = await fetchUndo(sessionId);
       setItems(res.items || []);
       setCount(res.count || 0);
     } catch (e) {
@@ -28,7 +35,7 @@ export function UndoTimeline({ refreshKey = 0, onRestored }: Props) {
     } finally {
       setLoading(false);
     }
-  }, []);
+  }, [sessionId]);
 
   useEffect(() => {
     void load();
@@ -38,7 +45,7 @@ export function UndoTimeline({ refreshKey = 0, onRestored }: Props) {
     setBusyId(id || "*");
     setErr("");
     try {
-      await postUndo(id);
+      await postUndo(id, sessionId);
       await load();
       onRestored?.();
     } catch (e) {

@@ -5,7 +5,7 @@ import { IconRobotCube } from "./IconRobotCube";
 import { MarkdownView } from "./MarkdownView";
 import { ThinkingBlock } from "./ThinkingBlock";
 import { readFileContent } from "../api";
-import type { ChatMsg, DetailView } from "../types/chat";
+import type { ChatMsg, DetailView, SubNode } from "../types/chat";
 import {
   buildSuggestions,
   fileToDetail,
@@ -16,6 +16,65 @@ import {
 import { formatToolSummary } from "../utils/toolSummary";
 import { roleIcon } from "../utils/roleIcon";
 import type { MsgKey } from "../i18n";
+
+function SubAgentCard({
+  node,
+  t,
+  detail,
+  onSetDetail,
+}: {
+  node: SubNode;
+  t: (key: MsgKey, ...args: string[]) => string;
+  detail: DetailView;
+  onSetDetail: (d: DetailView) => void;
+}) {
+  const s = node;
+  const active = detail?.type === "subagent" && detail.subagent.id === s.id;
+  return (
+    <div className={`subagent-card-wrap ${s.status}`}>
+      <button
+        type="button"
+        className={`subagent-card ${s.status}${active ? " active" : ""}`}
+        onClick={() => onSetDetail({ type: "subagent", subagent: s })}
+      >
+        <div className="subagent-card-head">
+          <span className="subagent-card-badge">
+            <span className="subagent-card-icon">{roleIcon(s.role || "")}</span>
+            {t("subtaskLabel")}
+            {s.role ? ` · ${s.role}` : ""}
+          </span>
+          <span className="subagent-card-status">
+            {s.status === "running"
+              ? t("subtaskRunning")
+              : s.status === "error"
+                ? t("toolStatusError")
+                : t("toolStatusDone")}
+          </span>
+        </div>
+        <div className="subagent-card-goal">{s.goal}</div>
+        {s.status === "running" && s.activity && (
+          <div className="subagent-card-activity">{s.activity}</div>
+        )}
+        {s.summary && s.status !== "running" && (
+          <pre className="subagent-card-summary">{s.summary}</pre>
+        )}
+      </button>
+      {(s.children || []).length > 0 ? (
+        <div className="subagent-children">
+          {s.children!.map((child) => (
+            <SubAgentCard
+              key={child.id}
+              node={child}
+              t={t}
+              detail={detail}
+              onSetDetail={onSetDetail}
+            />
+          ))}
+        </div>
+      ) : null}
+    </div>
+  );
+}
 
 export type ChatThreadProps = {
   t: (key: MsgKey, ...args: string[]) => string;
@@ -197,37 +256,14 @@ export function ChatThread({
             );
           }
           if (m.role === "subagent" && m.subagent) {
-            const s = m.subagent;
-            const active = detail?.type === "subagent" && detail.subagent.id === s.id;
             return (
-              <button
+              <SubAgentCard
                 key={m.id}
-                type="button"
-                className={`subagent-card ${s.status}${active ? " active" : ""}`}
-                onClick={() => onSetDetail({ type: "subagent", subagent: s })}
-              >
-                <div className="subagent-card-head">
-                  <span className="subagent-card-badge">
-                    <span className="subagent-card-icon">{roleIcon(s.role || "")}</span>
-                    {t("subtaskLabel")}
-                    {s.role ? ` · ${s.role}` : ""}
-                  </span>
-                  <span className="subagent-card-status">
-                    {s.status === "running"
-                      ? t("subtaskRunning")
-                      : s.status === "error"
-                        ? t("toolStatusError")
-                        : t("toolStatusDone")}
-                  </span>
-                </div>
-                <div className="subagent-card-goal">{s.goal}</div>
-                {s.status === "running" && s.activity && (
-                  <div className="subagent-card-activity">{s.activity}</div>
-                )}
-                {s.summary && s.status !== "running" && (
-                  <pre className="subagent-card-summary">{s.summary}</pre>
-                )}
-              </button>
+                node={m.subagent}
+                t={t}
+                detail={detail}
+                onSetDetail={onSetDetail}
+              />
             );
           }
           return (

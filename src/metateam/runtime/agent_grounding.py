@@ -10,7 +10,7 @@ from .coherence import format_turn_policy_block, merge_policy_into_system, polic
 class AgentGroundingMixin:
     def _ingest_workspace_fact(self, name: str, args: dict[str, Any], content: str) -> None:
         """Pin layout discoveries so the next user turn still respects them."""
-        if self.is_subagent:
+        if self.is_subagent and not getattr(self, "full_agent", False):
             return
         key_tools = {
             "list_dir",
@@ -37,7 +37,7 @@ class AgentGroundingMixin:
 
     def _refresh_workspace_grounding(self) -> None:
         """Rewrite pinned ground-truth in the system message each user turn."""
-        if self.is_subagent:
+        if self.is_subagent and not getattr(self, "full_agent", False):
             return
         if not self.messages or self.messages[0].get("role") != "system":
             return
@@ -122,7 +122,7 @@ class AgentGroundingMixin:
 
     def _refresh_memory_block(self) -> None:
         """Replace the ## Memory section with the current MEMORY.md contents."""
-        if self.is_subagent:
+        if self.is_subagent and not getattr(self, "full_agent", False):
             return
         if not self.messages or self.messages[0].get("role") != "system":
             return

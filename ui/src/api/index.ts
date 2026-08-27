@@ -211,6 +211,7 @@ export type SessionItem = {
   updated_at: number;
   messages: number;
   user_turns?: number;
+  busy?: boolean;
   demo?: boolean;
   source?: string;
 };
@@ -976,14 +977,22 @@ export type UndoItem = {
   files?: string[];
 };
 
-export const fetchUndo = () => json<{ count: number; items: UndoItem[] }>("/api/files/undo");
-export const postUndo = (id?: string) =>
+export const fetchUndo = (sessionId?: string | null) =>
+  json<{ count: number; items: UndoItem[] }>(
+    sessionId
+      ? `/api/files/undo?session_id=${encodeURIComponent(sessionId)}`
+      : "/api/files/undo",
+  );
+export const postUndo = (id?: string, sessionId?: string | null) =>
   json<{ status: string; undone_count?: number; remaining?: number; errors?: string[] }>(
     "/api/files/undo",
     {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify(id ? { id } : {}),
+      body: JSON.stringify({
+        ...(id ? { id } : {}),
+        ...(sessionId ? { session_id: sessionId } : {}),
+      }),
     },
   );
 
