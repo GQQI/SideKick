@@ -34,6 +34,42 @@ def test_approval_required_uses_tool_flag() -> None:
     assert approval_required("mcp_x", None)
 
 
+def test_serialize_ui_one_pending_at_a_time() -> None:
+    gate = ApprovalGate(timeout_sec=5)
+    started = threading.Event()
+
+    def first() -> None:
+        with gate.serialize_ui():
+            started.set()
+            gate.request("a", "write_file", {}, "a")
+
+    def second() -> None:
+        started.wait(timeout=2)
+        with gate.serialize_ui():
+            gate.request("b", "run_shell", {}, "b")
+
+    t1 = threading.Thread(target=first)
+    t2 = threading.Thread(target=second)
+    t1.start()
+    for _ in range(80):
+        if any(p["id"] == "a" for p in gate.pending()):
+            break
+        time.sleep(0.025)
+    t2.start()
+    time.sleep(0.08)
+    assert [p["id"] for p in gate.pending()] == ["a"]
+    gate.decide("a", True)
+    for _ in range(80):
+        if any(p["id"] == "b" for p in gate.pending()):
+            break
+        time.sleep(0.025)
+    assert any(p["id"] == "b" for p in gate.pending())
+    gate.decide("b", True)
+    t1.join(timeout=2)
+    t2.join(timeout=2)
+    assert not t1.is_alive() and not t2.is_alive()
+
+
 def test_patch_merges_into_original_args() -> None:
     gate = ApprovalGate(timeout_sec=5)
     args = {"path": "a.txt", "content": "old"}

@@ -187,3 +187,31 @@ def test_undo_latest_turn_restores_whole_conversation(tmp_path: Path) -> None:
     assert result["undone_count"] >= 2
     assert not (tmp_path / "doc.md").exists()
     assert fs_undo.status(tmp_path)["count"] == 0
+
+
+def test_status_and_undo_are_scoped_to_session(tmp_path: Path) -> None:
+    (tmp_path / "a.md").write_text("a0\n", encoding="utf-8")
+    (tmp_path / "b.md").write_text("b0\n", encoding="utf-8")
+    fs_undo.push_checkpoint("sess-a", 0, workspace=tmp_path, user_text="改 A")
+    fs_undo.set_turn_context("sess-a", 0)
+    fs_undo.push_before_write("a.md", tmp_path / "a.md", tmp_path)
+    (tmp_path / "a.md").write_text("a1\n", encoding="utf-8")
+    fs_undo.clear_turn_context()
+    fs_undo.push_checkpoint("sess-b", 0, workspace=tmp_path, user_text="改 B")
+    fs_undo.set_turn_context("sess-b", 0)
+    fs_undo.push_before_write("b.md", tmp_path / "b.md", tmp_path)
+    (tmp_path / "b.md").write_text("b1\n", encoding="utf-8")
+    fs_undo.clear_turn_context()
+
+    a_items = fs_undo.status(tmp_path, session_id="sess-a")["items"]
+    b_items = fs_undo.status(tmp_path, session_id="sess-b")["items"]
+    assert [i["user_text"] for i in a_items] == ["改 A"]
+    assert [i["user_text"] for i in b_items] == ["改 B"]
+    assert a_items[0]["files"] == ["a.md"]
+    assert b_items[0]["files"] == ["b.md"]
+
+    fs_undo.undo_latest_turn(tmp_path, session_id="sess-a")
+    assert (tmp_path / "a.md").read_text(encoding="utf-8") == "a0\n"
+    assert (tmp_path / "b.md").read_text(encoding="utf-8") == "b1\n"
+    assert fs_undo.status(tmp_path, session_id="sess-a")["count"] == 0
+    assert fs_undo.status(tmp_path, session_id="sess-b")["count"] == 1
