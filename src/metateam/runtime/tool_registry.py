@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import inspect
 from dataclasses import dataclass
 from typing import Any, Callable, Optional
 
@@ -48,6 +49,31 @@ class ToolRegistry:
 
     def names(self) -> list[str]:
         return sorted(self._tools.keys())
+
+
+def bind_tool_args(handler: Callable[..., Any], args: dict[str, Any]) -> dict[str, Any]:
+    """Drop unknown kwargs so models can pass extra fields like description."""
+    cleaned = {
+        str(k): v for k, v in (args or {}).items() if not str(k).startswith("_")
+    }
+    try:
+        sig = inspect.signature(handler)
+    except (TypeError, ValueError):
+        return cleaned
+    if any(p.kind == inspect.Parameter.VAR_KEYWORD for p in sig.parameters.values()):
+        return cleaned
+    allowed = {
+        name
+        for name, p in sig.parameters.items()
+        if p.kind
+        in (
+            inspect.Parameter.POSITIONAL_ONLY,
+            inspect.Parameter.POSITIONAL_OR_KEYWORD,
+            inspect.Parameter.KEYWORD_ONLY,
+        )
+        and name not in ("self", "cls")
+    }
+    return {k: v for k, v in cleaned.items() if k in allowed}
 
 
 def skill_tool_name(name: str) -> str:

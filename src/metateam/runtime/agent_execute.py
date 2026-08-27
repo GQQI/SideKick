@@ -10,7 +10,7 @@ from typing import Any
 from ..core.events import new_id
 from .approval import approval_required, summarize_tool_call
 from .llm import parse_tool_args
-from .tools import plan_parallel_batches
+from .tools import bind_tool_args, plan_parallel_batches
 
 
 class AgentExecuteMixin:
@@ -168,7 +168,7 @@ class AgentExecuteMixin:
             content = f"ERROR: unknown tool {name}"
         else:
             try:
-                content = tool.handler(**{k: v for k, v in args.items() if not k.startswith("_")})
+                content = tool.handler(**bind_tool_args(tool.handler, args))
             except TypeError as exc:
                 content = f"ERROR: bad arguments for {name}: {exc}"
             except Exception as exc:  # noqa: BLE001

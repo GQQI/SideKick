@@ -143,9 +143,7 @@ export function upsertToolDelta(ev: RuntimeEvent, ctx: ToolUpsertCtx) {
     };
     ctx.updateMsg(existing.id, { tool });
     ctx.syncToolPanel(tool, prevCallId);
-    if ((name || existing.tool.name) === "write_file") {
-      revealWriteFileDetail(ctx.setDetail, tool);
-    }
+    revealWriteFileDetail(ctx.setDetail, tool);
     return;
   }
 
@@ -159,9 +157,8 @@ export function upsertToolDelta(ev: RuntimeEvent, ctx: ToolUpsertCtx) {
     summary,
   };
   ctx.appendMsg({ id: tool.id, role: "tool", content: "", tool });
-  if (name === "write_file" || !name) {
-    revealWriteFileDetail(ctx.setDetail, tool);
-  }
+  ctx.syncToolPanel(tool);
+  revealWriteFileDetail(ctx.setDetail, tool);
 }
 
 export function upsertToolEnd(ev: RuntimeEvent, ctx: ToolUpsertCtx) {

@@ -9,6 +9,11 @@ from typing import Any, Iterator, Optional
 from openai import OpenAI
 
 from .think_tags import ThinkTagSplitter, split_think_tags
+from .text_tool_calls import (
+    XmlToolStream,
+    merge_text_tool_calls,
+    split_before_tool_markup,
+)
 from ..core.config import Settings
 
 
@@ -176,7 +181,7 @@ class LLM:
                 }
                 for tc in msg.tool_calls
             ]
-        return out
+        return merge_text_tool_calls(out)
 
     def stream_chat(
         self,
@@ -206,6 +211,8 @@ class LLM:
         reasoning_parts: list[str] = []
         tool_acc: dict[int, dict[str, str]] = {}
         cancelled = False
+        xml_hold = ""
+        xml_tools = XmlToolStream()
         # Stateful splitter for <think>…</think> embedded in content stream
         tag_split = ThinkTagSplitter()
 
@@ -241,8 +248,13 @@ class LLM:
                             reasoning_parts.append(piece)
                             yield ("reasoning_delta", piece)
                         else:
-                            content_parts.append(piece)
-                            yield ("delta", piece)
+                            visible, xml_hold = split_before_tool_markup(xml_hold + piece)
+                            if visible:
+                                content_parts.append(visible)
+                                yield ("delta", visible)
+                            if not tool_acc:
+                                for payload in xml_tools.feed(xml_hold):
+                                    yield ("tool_delta", payload)
 
                 for tc in getattr(delta, "tool_calls", None) or []:
                     idx = int(getattr(tc, "index", 0) or 0)
@@ -293,10 +305,16 @@ class LLM:
                 reasoning_parts.append(piece)
                 yield ("reasoning_delta", piece)
             else:
-                content_parts.append(piece)
-                yield ("delta", piece)
+                visible, xml_hold = split_before_tool_markup(xml_hold + piece)
+                if visible:
+                    content_parts.append(visible)
+                    yield ("delta", visible)
 
-        content = "".join(content_parts)
+        if not tool_acc:
+            for payload in xml_tools.feed(xml_hold):
+                yield ("tool_delta", payload)
+
+        content = "".join(content_parts) + xml_hold
         reasoning = "".join(reasoning_parts)
         out: dict[str, Any] = {"role": "assistant", "content": content}
         if reasoning:
@@ -314,7 +332,7 @@ class LLM:
                 for i in sorted(tool_acc)
                 if tool_acc[i].get("name")
             ]
-        yield ("done", out)
+        yield ("done", merge_text_tool_calls(out))
 
     def stream_text(
         self,

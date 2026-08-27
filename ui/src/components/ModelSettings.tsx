@@ -76,12 +76,6 @@ function newProvider(
   };
 }
 
-function setRole(setup: ModelSetup, role: "main" | "subagent", ref: ModelRef): ModelSetup {
-  const next: ModelSetup = { ...setup, [role]: ref };
-  if (role === "subagent") next.compress = { ...ref };
-  return next;
-}
-
 function badge(kind: string): string {
   if (kind === "deepseek") return "DS";
   if (kind === "openai") return "OA";
@@ -236,6 +230,17 @@ export function ModelSettings({ setup, locale, onChange, onSave, saving, t }: Pr
   const [renamingProv, setRenamingProv] = useState("");
   const [renameValue, setRenameValue] = useState("");
   const [confirmProvId, setConfirmProvId] = useState("");
+  const [roleDraft, setRoleDraft] = useState<{
+    main?: ModelRef;
+    subagent?: ModelRef;
+  }>({});
+
+  const view: ModelSetup = {
+    ...setup,
+    main: roleDraft.main ?? setup.main,
+    subagent: roleDraft.subagent ?? setup.subagent,
+    compress: roleDraft.subagent ?? setup.compress,
+  };
 
   const editingModel = useMemo(() => {
     if (!edit) return null;
@@ -269,8 +274,15 @@ export function ModelSettings({ setup, locale, onChange, onSave, saving, t }: Pr
   }, [setup.providers, mineQuery]);
 
   function persist(next: ModelSetup) {
-    onChange(next);
-    onSave(next, { restartChat: false });
+    const merged: ModelSetup = {
+      ...next,
+      main: roleDraft.main ?? next.main,
+      subagent: roleDraft.subagent ?? next.subagent,
+      compress: roleDraft.subagent ?? next.compress,
+    };
+    onChange(merged);
+    onSave(merged, { restartChat: false });
+    setRoleDraft({});
   }
 
   function patchModel(
@@ -389,12 +401,13 @@ export function ModelSettings({ setup, locale, onChange, onSave, saving, t }: Pr
   function pickRole(role: "main" | "subagent", key: string) {
     const i = key.indexOf("::");
     if (i <= 0) return;
-    persist(
-      setRole(setup, role, {
+    setRoleDraft((d) => ({
+      ...d,
+      [role]: {
         provider_id: key.slice(0, i),
         model_id: key.slice(i + 2),
-      }),
-    );
+      },
+    }));
   }
 
   function openEdit(providerId: string, modelId: string) {
@@ -443,7 +456,7 @@ export function ModelSettings({ setup, locale, onChange, onSave, saving, t }: Pr
             <h3 className="rf-block-title">{t("modelStepAgents")}</h3>
             <div className="rf-defaults">
               {(["main", "subagent"] as const).map((role) => {
-                const ref = role === "main" ? setup.main : setup.subagent;
+                const ref = role === "main" ? view.main : view.subagent;
                 return (
                   <label key={role}>
                     <span>{role === "main" ? t("mainModel") : t("subModel")}</span>
@@ -586,10 +599,10 @@ export function ModelSettings({ setup, locale, onChange, onSave, saving, t }: Pr
                             <ul className="rf-model-rows">
                               {p.models.map((m) => {
                                 const mainOn =
-                                  setup.main.provider_id === p.id && setup.main.model_id === m.id;
+                                  view.main.provider_id === p.id && view.main.model_id === m.id;
                                 const subOn =
-                                  setup.subagent.provider_id === p.id &&
-                                  setup.subagent.model_id === m.id;
+                                  view.subagent.provider_id === p.id &&
+                                  view.subagent.model_id === m.id;
                                 const ready = Boolean(m.api_key_set || m.api_key);
                                 const active = edit?.providerId === p.id && edit?.modelId === m.id;
                                 return (

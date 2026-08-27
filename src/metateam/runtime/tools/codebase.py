@@ -19,10 +19,14 @@ def register_codebase_tools(reg: ToolRegistry, ctx: ToolContext) -> None:
         ov = cbm.overview(index)
         return json.dumps(ov, ensure_ascii=False, indent=2)
 
-    def codebase_find_similar(query: str, limit: int = 12) -> str:
+    def codebase_find_similar(
+        query: str = "",
+        limit: int = 12,
+        description: str = "",
+    ) -> str:
         from ...services import codebase_memory as cbm
 
-        q = (query or "").strip()
+        q = (query or description or "").strip()
         if not q:
             return "ERROR: empty query"
         index = cbm.get_or_build_index(live_ws())

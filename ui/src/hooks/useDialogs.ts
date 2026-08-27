@@ -1,4 +1,4 @@
-import { useCallback } from "react";
+import { useCallback, useRef } from "react";
 import {
   answerAsk,
   confirmPlan,
@@ -92,6 +92,9 @@ export function useDialogs(deps: DialogsDeps) {
     onNewChat,
   } = deps;
 
+  const applySeq = useRef(0);
+  const switchSeq = useRef(0);
+
   const openSettings = useCallback(
     (tab: SettingsTab = "workspace") => {
       setSettingsTab(tab);
@@ -104,15 +107,17 @@ export function useDialogs(deps: DialogsDeps) {
     async (next?: ModelSetup, opts?: { restartChat?: boolean }) => {
       const cfg = next ?? model;
       if (!cfg) return;
+      const seq = ++applySeq.current;
       setModelSaving(true);
       try {
         const res = await saveModel({ ...cfg, version: 3 });
+        if (seq !== applySeq.current) return;
         setModel(res.config);
         setHealth(await fetchHealth());
         setToast(res.note);
         if (opts?.restartChat) await onNewChat();
       } finally {
-        setModelSaving(false);
+        if (seq === applySeq.current) setModelSaving(false);
       }
     },
     [model, setModelSaving, setModel, setHealth, setToast, onNewChat],
@@ -120,12 +125,15 @@ export function useDialogs(deps: DialogsDeps) {
 
   const switchModelRole = useCallback(
     async (role: ModelRole, providerId: string, modelId: string) => {
+      const seq = ++switchSeq.current;
       try {
         const res = await selectModel(role, providerId, modelId);
+        if (seq !== switchSeq.current) return;
         setModel(res.config);
         setHealth(await fetchHealth());
         setToast(res.note);
       } catch (e) {
+        if (seq !== switchSeq.current) return;
         setToast(e instanceof Error ? e.message : String(e));
       }
     },
