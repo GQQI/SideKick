@@ -12,6 +12,37 @@ from .think_tags import ThinkTagSplitter, split_think_tags
 from ..core.config import Settings
 
 
+def _is_tool_choice_error(exc: BaseException) -> bool:
+    msg = str(exc).lower()
+    return (
+        "enable-auto-tool-choice" in msg
+        or "tool-call-parser" in msg
+        or '"auto" tool choice' in msg
+        or "auto tool choice" in msg
+    )
+
+
+def _retry_kwargs_for_exc(kwargs: dict[str, Any], exc: BaseException) -> dict[str, Any] | None:
+    msg = str(exc).lower()
+    retry = dict(kwargs)
+    changed = False
+    if _is_tool_choice_error(exc):
+        if "tools" in retry or "tool_choice" in retry:
+            retry.pop("tools", None)
+            retry.pop("tool_choice", None)
+            changed = True
+    if "thinking" in msg or "reasoning" in msg or "extra_body" in msg:
+        if "extra_body" in retry or "reasoning_effort" in retry:
+            retry.pop("extra_body", None)
+            retry.pop("reasoning_effort", None)
+            changed = True
+    if "stream_options" in msg or "include_usage" in msg:
+        if "stream_options" in retry:
+            retry.pop("stream_options", None)
+            changed = True
+    return retry if changed else None
+
+
 class LLM:
     def __init__(
         self,
@@ -30,6 +61,7 @@ class LLM:
             self.demo = False
         self.client: OpenAI | None = None
         self._active_stream: Any = None
+        self._disable_tools = False
         if not self.demo:
             if not key.strip():
                 raise RuntimeError("API key empty — configure in UI or META_DEMO_MODE=1")
@@ -65,9 +97,10 @@ class LLM:
             "temperature": temperature,
             "stream": stream,
         }
-        if tools:
+        if tools and not self._disable_tools:
             kwargs["tools"] = tools
-            kwargs["tool_choice"] = "auto"
+            # Do not send tool_choice="auto": vLLM 400s unless the server was
+            # started with --enable-auto-tool-choice --tool-call-parser.
 
         # DeepSeek / reasoning models
         effort = getattr(self.settings, "reasoning_effort", None)
@@ -80,6 +113,29 @@ class LLM:
         if extra:
             kwargs["extra_body"] = extra
         return kwargs
+
+    def _create(self, kwargs: dict[str, Any]) -> Any:
+        assert self.client is not None
+        pending = dict(kwargs)
+        last: BaseException | None = None
+        for _ in range(4):
+            try:
+                return self.client.chat.completions.create(**pending)
+            except TypeError as exc:
+                last = exc
+                pending.pop("reasoning_effort", None)
+                pending.pop("stream_options", None)
+                continue
+            except Exception as exc:
+                last = exc
+                retry = _retry_kwargs_for_exc(pending, exc)
+                if retry is None:
+                    raise
+                if _is_tool_choice_error(exc):
+                    self._disable_tools = True
+                pending = retry
+        assert last is not None
+        raise last
 
     def chat(
         self,
@@ -95,22 +151,7 @@ class LLM:
         kwargs = self._call_kwargs(messages, tools, temp, stream=False)
         # create() doesn't take stream=False as needed if we pop it
         kwargs.pop("stream", None)
-
-        try:
-            resp = self.client.chat.completions.create(**kwargs)
-        except TypeError:
-            # Older SDKs may not accept reasoning_effort
-            kwargs.pop("reasoning_effort", None)
-            resp = self.client.chat.completions.create(**kwargs)
-        except Exception as exc:
-            # Retry without thinking if provider rejects
-            msg = str(exc).lower()
-            if "thinking" in msg or "reasoning" in msg or "extra_body" in msg:
-                kwargs.pop("extra_body", None)
-                kwargs.pop("reasoning_effort", None)
-                resp = self.client.chat.completions.create(**kwargs)
-            else:
-                raise
+        resp = self._create(kwargs)
 
         msg = resp.choices[0].message
         content = extract_content_text(msg)
@@ -158,19 +199,7 @@ class LLM:
         assert self.client is not None
         temp = self.settings.temperature if temperature is None else temperature
         kwargs = self._call_kwargs(messages, tools, temp, stream=True)
-        try:
-            stream = self.client.chat.completions.create(**kwargs)
-        except TypeError:
-            kwargs.pop("reasoning_effort", None)
-            stream = self.client.chat.completions.create(**kwargs)
-        except Exception as exc:
-            msg = str(exc).lower()
-            if "thinking" in msg or "reasoning" in msg or "extra_body" in msg:
-                kwargs.pop("extra_body", None)
-                kwargs.pop("reasoning_effort", None)
-                stream = self.client.chat.completions.create(**kwargs)
-            else:
-                raise
+        stream = self._create(kwargs)
 
         self._active_stream = stream
         content_parts: list[str] = []

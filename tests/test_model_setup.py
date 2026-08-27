@@ -43,3 +43,30 @@ def test_find_entry_matches_without_provider_id() -> None:
     assert entry is not None
     assert entry.api_key == "sk-1"
     assert prov is not None
+
+
+def test_llm_omits_auto_tool_choice() -> None:
+    from metateam.core.config import Settings
+    from metateam.runtime.llm import LLM, _is_tool_choice_error, _retry_kwargs_for_exc
+
+    settings = Settings(
+        demo_mode=True,
+        api_key="",
+        thinking_enabled=False,
+        reasoning_effort="",
+    )
+    llm = LLM(settings)
+    tools = [{"type": "function", "function": {"name": "list_dir"}}]
+    kwargs = llm._call_kwargs([{"role": "user", "content": "hi"}], tools, 0.2)
+    assert "tool_choice" not in kwargs
+    assert kwargs["tools"] == tools
+
+    err = Exception(
+        "Error code: 400 - {'error': {'message': '\"auto\" tool choice requires "
+        "--enable-auto-tool-choice and --tool-call-parser to be set'}}"
+    )
+    assert _is_tool_choice_error(err)
+    retry = _retry_kwargs_for_exc(kwargs, err)
+    assert retry is not None
+    assert "tools" not in retry
+    assert "tool_choice" not in retry
