@@ -152,3 +152,22 @@ def test_review_conversation_net_not_last_turn(tmp_path: Path) -> None:
     git_snap = panel_snapshot(tmp_path)
     git_paths = {f["path"]: f for f in git_snap["files"]}
     assert git_paths["new.md"]["kind"] == "untracked"
+
+
+def test_classify_push_empty_output_is_unknown() -> None:
+    from metateam.services.git_ops import classify_push_result
+
+    kind, _text = classify_push_result("", "", had_upstream=False, ahead_before=0)
+    assert kind == "unknown"
+
+
+def test_commit_staged_is_local_only(tmp_path: Path) -> None:
+    from metateam.services.git_ops import commit_staged, stage_paths
+
+    _init_repo(tmp_path)
+    (tmp_path / "b.txt").write_text("x\n", encoding="utf-8")
+    assert stage_paths(tmp_path, ["b.txt"]) == "ok"
+    result = commit_staged(tmp_path, "local only")
+    assert result.startswith("COMMITTED_LOCAL:")
+    snap = panel_snapshot(tmp_path)
+    assert not any(f.get("path") == "b.txt" for f in snap["files"])

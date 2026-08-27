@@ -895,6 +895,7 @@ export type GitBranch = {
 export type GitSnapshot = {
   is_repo: boolean;
   branch?: string;
+  head?: string;
   files?: GitFileEntry[];
   status?: string;
   error?: string;
@@ -902,6 +903,7 @@ export type GitSnapshot = {
   branches?: GitBranch[];
   ahead?: number;
   behind?: number;
+  unpublished?: number;
   upstream?: string;
   remote?: string;
   remote_url?: string;

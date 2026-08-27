@@ -41,6 +41,37 @@ def _fail(code: int, out: str, err: str, prefix: str) -> str:
     return f"ERROR: {prefix} failed ({code}): {detail}"
 
 
+def classify_push_result(
+    out: str,
+    err: str,
+    *,
+    had_upstream: bool,
+    ahead_before: int,
+) -> tuple[str, str]:
+    """Return (kind, text) where kind is 'pushed', 'up_to_date', or 'unknown'."""
+    text = "\n".join(
+        part for part in ((out or "").strip(), (err or "").strip()) if part
+    ).strip()
+    low = text.lower()
+    sent = any(
+        token in low
+        for token in (
+            " -> ",
+            "[new branch]",
+            "[new tag]",
+            "enumerating objects",
+            "writing objects",
+        )
+    )
+    if sent:
+        return "pushed", text
+    if "everything up-to-date" in low or "already up to date" in low:
+        return "up_to_date", text or "Everything up-to-date."
+    if had_upstream and ahead_before <= 0:
+        return "up_to_date", text or "Everything up-to-date."
+    return "unknown", text
+
+
 def validate_branch_name(name: str) -> str:
     n = (name or "").strip().replace("\\", "/")
     if (
@@ -175,6 +206,42 @@ def current_branch(workspace: Path) -> str:
     return out.strip()
 
 
+def current_head(workspace: Path, *, short: bool = False) -> str:
+    args = ["rev-parse", "--short=10", "HEAD"] if short else ["rev-parse", "HEAD"]
+    code, out, _ = _run_git(workspace, args, timeout=10)
+    return out.strip() if code == 0 else ""
+
+
+def _ls_remote_sha(workspace: Path, remote: str, branch: str) -> tuple[str, str]:
+    code, out, err = _run_git(
+        workspace, ["ls-remote", "--heads", remote, branch], timeout=60
+    )
+    if code != 0:
+        return "", (err or out).strip() or f"ls-remote failed ({code})"
+    for line in (out or "").splitlines():
+        sha, _, _ref = line.partition("\t")
+        sha = sha.strip()
+        if sha:
+            return sha, ""
+    return "", "empty ls-remote"
+
+
+def _pushed_branch_from_output(text: str) -> str:
+    for line in (text or "").splitlines():
+        if "->" not in line:
+            continue
+        dest = line.rsplit("->", 1)[-1].strip()
+        dest = dest.split()[0] if dest else ""
+        dest = dest.strip("[]")
+        if dest and dest not in {"HEAD"}:
+            return dest
+    return ""
+
+
+def _encode_sync(kind: str, remote_url: str, branch: str, sha: str, text: str) -> str:
+    return f"{kind}:{remote_url}\n{branch}\n{sha}\n{text}"
+
+
 def _file_kind(xy: str) -> str:
     if xy == "??":
         return "untracked"
@@ -274,6 +341,12 @@ def porcelain_entries(workspace: Path) -> list[dict[str, Any]]:
 def stage_paths(workspace: Path, paths: list[str]) -> str:
     if not is_git_repo(workspace):
         return "ERROR: not a git repository"
+    tokens = {str(p or "").strip().replace("\\", "/") for p in paths if str(p or "").strip()}
+    if tokens and tokens <= {".", "*"}:
+        code, out, err = _run_git(workspace, ["add", "-A"])
+        if code != 0:
+            return f"ERROR: git add failed ({code}): {err.strip() or out.strip()}"
+        return "ok"
     rels = _rel_paths(workspace, paths)
     if not rels:
         return "ERROR: no paths"
@@ -309,7 +382,9 @@ def commit_staged(workspace: Path, message: str) -> str:
     if code != 0:
         detail = (err or out).strip()
         return f"ERROR: git commit failed ({code}): {detail or 'nothing to commit?'}"
-    return (out or err).strip() or "committed"
+    sha = current_head(workspace, short=True)
+    body = (out or err).strip() or "committed"
+    return f"COMMITTED_LOCAL:{sha}\n{body}"
 
 
 def list_remotes(workspace: Path) -> list[dict[str, str]]:
@@ -352,6 +427,40 @@ def tracking_info(workspace: Path) -> dict[str, Any]:
                 except ValueError:
                     ahead = behind = 0
     return {"upstream": upstream, "ahead": ahead, "behind": behind}
+
+
+def unpublished_commits(
+    workspace: Path,
+    *,
+    tracking: dict[str, Any],
+    remotes: list[dict[str, str]],
+    branch: str,
+) -> int:
+    """How many local commits are not on the default remote branch."""
+    if tracking.get("upstream"):
+        return int(tracking.get("ahead") or 0)
+    if not remotes:
+        return 0
+    remote = remotes[0]["name"]
+    if not branch or branch in {"HEAD"}:
+        return 0
+    ref = f"refs/remotes/{remote}/{branch}"
+    code, _, _ = _run_git(workspace, ["show-ref", "--verify", "--quiet", ref], timeout=10)
+    if code != 0:
+        code, out, _ = _run_git(workspace, ["rev-list", "--count", "HEAD"], timeout=15)
+        try:
+            return int((out or "0").strip() or 0)
+        except ValueError:
+            return 0
+    code, out, _ = _run_git(
+        workspace, ["rev-list", "--count", f"{remote}/{branch}..HEAD"], timeout=15
+    )
+    if code != 0:
+        return 0
+    try:
+        return int((out or "0").strip() or 0)
+    except ValueError:
+        return 0
 
 
 def list_branches(workspace: Path) -> list[dict[str, Any]]:
@@ -438,29 +547,61 @@ def pull_remote(workspace: Path) -> str:
     code, out, err = _run_git(workspace, ["pull", "--no-edit"], timeout=180)
     if code != 0:
         return _fail(code, out, err, "git pull")
-    return (out or err).strip() or "pulled"
+    body = (out or err).strip() or "pulled"
+    return f"PULLED:{body}"
 
 
 def push_remote(workspace: Path) -> str:
     if not is_git_repo(workspace):
         return "ERROR: not a git repository"
-    code, _, _ = _run_git(
-        workspace,
-        ["rev-parse", "--abbrev-ref", "--symbolic-full-name", "@{upstream}"],
-        timeout=10,
-    )
-    if code == 0:
+    tracking = tracking_info(workspace)
+    ahead_before = int(tracking.get("ahead") or 0)
+    had_upstream = bool(tracking.get("upstream"))
+    remotes = list_remotes(workspace)
+    if had_upstream:
         args = ["push"]
+        remote_name = str(tracking.get("upstream") or "origin").split("/", 1)[0] or "origin"
     else:
-        remotes = list_remotes(workspace)
         if not remotes:
             return "ERROR: no remote configured"
         remote_name = remotes[0]["name"]
         args = ["push", "-u", remote_name, "HEAD"]
+    remote_url = next((r["url"] for r in remotes if r["name"] == remote_name), "")
+    if not remote_url and remotes:
+        remote_url = remotes[0]["url"]
+    branch = current_branch(workspace)
+    local_sha = current_head(workspace)
     code, out, err = _run_git(workspace, args, timeout=180)
     if code != 0:
         return _fail(code, out, err, "git push")
-    return (out or err).strip() or "pushed"
+    kind, text = classify_push_result(
+        out, err, had_upstream=had_upstream, ahead_before=ahead_before
+    )
+    tracking_after = tracking_info(workspace)
+    upstream_after = str(tracking_after.get("upstream") or "")
+    dest = ""
+    if "/" in upstream_after:
+        dest = upstream_after.split("/", 1)[-1]
+    dest = dest or _pushed_branch_from_output(text) or (branch if branch not in {"", "HEAD"} else "")
+    remote_sha, ls_err = ("", "no branch to check")
+    if dest:
+        remote_sha, ls_err = _ls_remote_sha(workspace, remote_name, dest)
+    where = f"{remote_url or remote_name} ({dest or branch or 'HEAD'})"
+    if local_sha and remote_sha and local_sha == remote_sha:
+        tag = "UP_TO_DATE" if kind == "up_to_date" else "PUSHED_OK"
+        return _encode_sync(tag, remote_url, dest or branch, local_sha[:10], text or "ok")
+    if local_sha and remote_sha and local_sha != remote_sha:
+        return (
+            "ERROR: local commit is not on the remote. "
+            f"Local {local_sha[:10]} vs {where} {remote_sha[:10]}. "
+            "Commit is only on this computer until push actually updates GitHub."
+        )
+    if ls_err:
+        return (
+            f"ERROR: git push could not be verified on {where}: {ls_err}. "
+            f"Output: {text or '(empty)'}"
+        )
+    return f"ERROR: git push did not update {where}. Output: {text or '(empty)'}"
 
 
 def set_remote_url(workspace: Path, url: str, *, name: str = "origin") -> str:
@@ -490,11 +631,13 @@ def review_panel_snapshot(
     return {
         "is_repo": repo,
         "branch": current_branch(workspace) if repo else "",
+        "head": current_head(workspace, short=True) if repo else "",
         "files": review.get("files") or [],
         "status": "",
         "branches": [],
         "ahead": 0,
         "behind": 0,
+        "unpublished": 0,
         "upstream": "",
         "remote": "",
         "remote_url": "",
@@ -513,11 +656,13 @@ def panel_snapshot(workspace: Path) -> dict[str, Any]:
         return {
             "is_repo": False,
             "branch": "",
+            "head": "",
             "files": review.get("files") or [],
             "status": "",
             "branches": [],
             "ahead": 0,
             "behind": 0,
+            "unpublished": 0,
             "upstream": "",
             "remote": "",
             "remote_url": "",
@@ -530,9 +675,11 @@ def panel_snapshot(workspace: Path) -> dict[str, Any]:
         return {
             "is_repo": True,
             "branch": current_branch(workspace),
+            "head": current_head(workspace, short=True),
             "files": [],
             "error": str(exc),
             "branches": [],
+            "unpublished": 0,
             "totals": empty_totals,
         }
     added_total = sum(int(f.get("added") or 0) for f in files)
@@ -540,14 +687,19 @@ def panel_snapshot(workspace: Path) -> dict[str, Any]:
     remotes = list_remotes(workspace)
     origin = next((r for r in remotes if r["name"] == "origin"), remotes[0] if remotes else None)
     tracking = tracking_info(workspace)
+    branch = current_branch(workspace)
     return {
         "is_repo": True,
-        "branch": current_branch(workspace),
+        "branch": branch,
+        "head": current_head(workspace, short=True),
         "files": files,
         "status": git_status(workspace),
         "branches": list_branches(workspace),
         "ahead": tracking["ahead"],
         "behind": tracking["behind"],
+        "unpublished": unpublished_commits(
+            workspace, tracking=tracking, remotes=remotes, branch=branch
+        ),
         "upstream": tracking["upstream"],
         "remote": origin["name"] if origin else "",
         "remote_url": origin["url"] if origin else "",

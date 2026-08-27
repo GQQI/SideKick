@@ -2074,6 +2074,219 @@ html[data-theme="dark"] .diff-ln {
   font-size: 0.75rem;
 }
 
+.git-flow-hint,
+.git-changes-hint {
+  margin: 0 0 8px;
+  font-size: 0.78rem;
+  line-height: 1.45;
+}
+
+.git-steps {
+  list-style: none;
+  display: grid;
+  grid-template-columns: 1fr 1fr 1fr;
+  gap: 6px;
+  margin: 0 0 10px;
+  padding: 0;
+}
+
+.git-step-tab {
+  width: 100%;
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: var(--surface-2, var(--surface));
+  color: var(--ink);
+  padding: 8px 6px;
+  cursor: pointer;
+  text-align: left;
+  font: inherit;
+}
+
+.git-step-tab.active {
+  border-color: color-mix(in srgb, var(--accent, #3b82f6) 55%, var(--line));
+  background: color-mix(in srgb, var(--accent, #3b82f6) 12%, var(--surface));
+}
+
+.git-step-tab.done {
+  border-color: color-mix(in srgb, #2f9e62 40%, var(--line));
+}
+
+.git-step-tab.locked {
+  opacity: 0.55;
+}
+
+.git-step-num {
+  flex: none;
+  width: 1.4em;
+  height: 1.4em;
+  border-radius: 999px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  font-size: 0.75rem;
+  font-weight: 700;
+  background: var(--surface);
+  border: 1px solid var(--line);
+}
+
+.git-step-tab.active .git-step-num {
+  background: var(--accent, #3b82f6);
+  color: #fff;
+  border-color: transparent;
+}
+
+.git-step-label {
+  font-size: 0.72rem;
+  line-height: 1.25;
+}
+
+.git-step-card {
+  border: 1px solid var(--line);
+  border-radius: 10px;
+  padding: 10px;
+  margin-bottom: 10px;
+  background: var(--surface);
+}
+
+.git-step-actions {
+  display: flex;
+  gap: 8px;
+  justify-content: flex-end;
+  flex-wrap: wrap;
+  margin-top: 10px;
+}
+
+.git-more {
+  margin-top: 8px;
+  font-size: 0.8rem;
+}
+
+.git-more summary {
+  cursor: pointer;
+  color: var(--muted);
+  margin-bottom: 8px;
+}
+
+.git-notice {
+  margin: 0 0 10px;
+  padding: 8px 10px;
+  border-radius: 8px;
+  font-size: 0.8rem;
+  line-height: 1.4;
+  border: 1px solid var(--line);
+}
+
+.git-notice strong {
+  display: block;
+}
+
+.git-notice pre {
+  margin: 6px 0 0;
+  white-space: pre-wrap;
+  word-break: break-word;
+  font-size: 0.72rem;
+  font-family: var(--mono, ui-monospace, Menlo, Consolas, monospace);
+  color: inherit;
+  opacity: 0.9;
+}
+
+.git-notice.ok {
+  background: color-mix(in srgb, #2f9e62 14%, var(--surface));
+  border-color: color-mix(in srgb, #2f9e62 40%, var(--line));
+  color: #1f7a4a;
+}
+
+.git-notice.warn {
+  background: color-mix(in srgb, #b67a1e 14%, var(--surface));
+  border-color: color-mix(in srgb, #b67a1e 40%, var(--line));
+  color: #8a5a10;
+}
+
+.git-notice.err {
+  background: color-mix(in srgb, var(--danger, #c23) 12%, var(--surface));
+  border-color: color-mix(in srgb, var(--danger, #c23) 40%, var(--line));
+  color: var(--danger, #a33);
+}
+
+.git-staged-warn {
+  font-size: 0.75rem;
+  color: #8a5a10;
+}
+
+.git-busy {
+  margin-bottom: 8px;
+}
+
+.git-dir-group {
+  list-style: none;
+  margin: 0 0 8px;
+  padding: 0;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  overflow: hidden;
+  background: var(--surface-2, var(--surface));
+}
+
+.git-dir-row {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 6px 8px;
+  background: var(--surface);
+}
+
+.git-dir-toggle {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  flex: 1;
+  min-width: 0;
+  border: 0;
+  background: transparent;
+  color: inherit;
+  cursor: pointer;
+  text-align: left;
+  padding: 0;
+  font: inherit;
+}
+
+.git-dir-toggle strong {
+  font-size: 0.8rem;
+}
+
+.git-dir-toggle svg.rot-180 {
+  transform: rotate(180deg);
+}
+
+.git-dir-files {
+  list-style: none;
+  margin: 0;
+  padding: 4px 6px 6px;
+  display: grid;
+  gap: 2px;
+}
+
+.git-chip {
+  font-size: 0.68rem;
+  padding: 1px 5px;
+  border-radius: 4px;
+  white-space: nowrap;
+  background: var(--surface);
+  color: var(--muted);
+}
+
+.git-kind-deleted.git-chip {
+  color: var(--danger);
+}
+
+.git-kind-added.git-chip,
+.git-kind-untracked.git-chip {
+  color: #2f9e62;
+}
+
 .git-select-bar {
   font-size: 0.78rem;
 }
@@ -2095,7 +2308,7 @@ html[data-theme="dark"] .diff-ln {
 
 .git-file {
   display: grid;
-  grid-template-columns: auto auto minmax(0, 1fr) auto auto auto;
+  grid-template-columns: auto auto minmax(0, 1fr) auto;
   gap: 6px;
   align-items: center;
   font-size: 0.8rem;
