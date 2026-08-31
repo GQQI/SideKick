@@ -17,9 +17,33 @@ import {
 import type { PlanConfirmState, ShapeContract } from "../../types/plan";
 import { formatToolSummary } from "../../utils/toolSummary";
 import { isFileMutatingTool } from "../../utils/diffPreview";
-import { findSubNode, softParseToolArgs, uid } from "../../utils/chatHelpers";
+import { declaredDelegateSlotCount, findSubNode, isEphemeralCanvasId, sameSubagentSlot, softParseToolArgs, uid } from "../../utils/chatHelpers";
+import { canvasGoalsMatch } from "../../utils/canvasSlots";
 import type { MsgKey } from "../../i18n";
 import { upsertToolDelta, upsertToolEnd, upsertToolStart, type ToolUpsertCtx } from "./toolUpserts";
+import { applyCanvasTree } from "./canvasSync";
+
+function argsLookEmpty(args: unknown): boolean {
+  if (args == null) return true;
+  if (typeof args !== "object" || Array.isArray(args)) return false;
+  const rec = args as Record<string, unknown>;
+  return Object.keys(rec).every((k) => k.startsWith("_"));
+}
+
+function sealStreamingTools(transcript: SubTranscriptItem[]): SubTranscriptItem[] {
+  return transcript.map((item) => {
+    if (item.kind !== "tool") return item;
+    const st = item.tool.status;
+    if (st !== "streaming" && st !== "running" && st !== "pending") return item;
+    return {
+      ...item,
+      tool: {
+        ...item.tool,
+        status: argsLookEmpty(item.tool.args) && !item.tool.result ? "error" : "done",
+      },
+    };
+  });
+}
 
 export type RuntimeEventHandlerCtx = ToolUpsertCtx & {
   t: (key: MsgKey, ...args: string[]) => string;
@@ -64,7 +88,101 @@ export type RuntimeEventHandlerCtx = ToolUpsertCtx & {
   setFsRefresh: React.Dispatch<React.SetStateAction<number>>;
   setSubs: React.Dispatch<React.SetStateAction<SubNode[]>>;
   appendMsg: (msg: ChatMsg) => void;
+  commit: (next: ChatMsg[]) => void;
+  bumpStage: () => void;
 };
+
+function clipGoal(goal: string) {
+  const text = (goal || "").replace(/\s+/g, " ").trim();
+  return text.length > 24 ? `${text.slice(0, 23)}…` : text;
+}
+
+function pickPendingCanvasHost(messages: ChatMsg[], goal: string): ChatMsg | undefined {
+  const pending = messages.filter(
+    (m) => m.role === "subagent" && m.subagent && isEphemeralCanvasId(m.subagent.id),
+  );
+  if (!pending.length) return undefined;
+  return (
+    pending.find((m) => canvasGoalsMatch(m.subagent?.goal, goal)) || pending[0]
+  );
+}
+
+function appendTopLevelSubagent(
+  ctx: RuntimeEventHandlerCtx,
+  node: SubNode,
+  replay: boolean,
+) {
+  const existing = ctx.transcriptRef.current.find(
+    (m) =>
+      m.role === "subagent" &&
+      m.subagent &&
+      (m.subagent.id === node.id || sameSubagentSlot(m.subagent, node)),
+  );
+  if (existing?.subagent) {
+    ctx.patchSubagent(existing.subagent.id, (s) => ({
+      ...s,
+      ...node,
+      id: s.id,
+      children: s.children,
+      transcript:
+        s.transcript?.length && !node.transcript.length ? s.transcript : node.transcript,
+    }));
+    return;
+  }
+  const isHelper = node.kind === "task" || (!node.kind && node.role === "leaf");
+  if (isHelper) {
+    const parties = ctx.transcriptRef.current.filter(
+      (m) =>
+        m.role === "subagent" &&
+        m.subagent &&
+        (m.subagent.kind === "party" || m.subagent.kind === "talk"),
+    );
+    if (parties.length >= 2) {
+      const host =
+        parties.find((m) => {
+          const p = m.subagent!;
+          const label = (p.role || "").trim();
+          return Boolean(label) && (node.goal || "").includes(label);
+        }) || parties[parties.length - 1];
+      if (host.subagent) {
+        ctx.patchSubagent(host.subagent.id, (s) => ({
+          ...s,
+          children: [...(s.children || []), { ...node, parent_id: s.id }],
+        }));
+        return;
+      }
+    }
+  }
+  const stage = ctx.stageRef.current;
+  const declared = declaredDelegateSlotCount(ctx.transcriptRef.current, stage);
+  const current = ctx.transcriptRef.current.filter(
+    (m) => m.role === "subagent" && (m.stage ?? 0) === stage && m.subagent,
+  );
+  if (declared > 0 && current.length >= declared) {
+    const host = pickPendingCanvasHost(ctx.transcriptRef.current, node.goal);
+    if (host?.subagent) {
+      ctx.patchSubagent(host.subagent.id, (s) => ({
+        ...s,
+        ...node,
+        children: s.children,
+        transcript:
+          s.transcript?.length && !node.transcript.length ? s.transcript : node.transcript,
+      }));
+    }
+    return;
+  }
+  ctx.setSubs((prev) => (prev.some((s) => s.id === node.id) ? prev : [...prev, node]));
+  ctx.appendMsg({
+    id: uid(),
+    role: "subagent",
+    content: node.goal,
+    subagent: node,
+    agent_id: node.id,
+  });
+  if (!replay && node.kind !== "party" && node.kind !== "talk") {
+    ctx.setDetail({ type: "subagent", subagent: node });
+  }
+}
 
 function parsePlanTasks(raw: unknown): PlanTask[] {
   if (typeof raw === "string") {
@@ -297,6 +415,7 @@ export function handleRuntimeEvent(ev: RuntimeEvent, ctx: RuntimeEventHandlerCtx
     "plan_done",
     "subagent_start",
     "subagent_end",
+    "canvas_sync",
     "cancelled",
     "error",
     "final",
@@ -328,6 +447,7 @@ export function handleRuntimeEvent(ev: RuntimeEvent, ctx: RuntimeEventHandlerCtx
               ...last,
               text: last.text + chunk,
               streaming: true,
+              turnAt: last.turnAt ?? Date.now(),
             };
           }
         } else if (chunk || reset) {
@@ -337,9 +457,14 @@ export function handleRuntimeEvent(ev: RuntimeEvent, ctx: RuntimeEventHandlerCtx
             kind: "assistant",
             text: chunk,
             streaming: true,
+            turnAt: Date.now(),
           });
         }
-        return { ...s, transcript: tr, activity: "生成中…" };
+        return {
+          ...s,
+          transcript: tr,
+          activity: chunk.trim() ? "正在生成…" : ctx.t("thinkingActivity"),
+        };
       });
     } else if (childId && type === "assistant_reasoning_delta") {
       const chunk = String(ev.data.chunk ?? "");
@@ -361,10 +486,18 @@ export function handleRuntimeEvent(ev: RuntimeEvent, ctx: RuntimeEventHandlerCtx
             reasoning: chunk,
             streaming: true,
             reasoningStreaming: true,
+            turnAt: Date.now(),
           });
         }
         return { ...s, transcript: tr, activity: ctx.t("thinkingActivity") };
       });
+    } else if (childId && type === "assistant_status") {
+      const text = String(ev.data.text || "");
+      ctx.patchSubagent(childId, (s) => ({
+        ...s,
+        transcript: ctx.sealSubassistant(s.transcript || []),
+        activity: text || s.activity,
+      }));
     } else if (childId && type === "tool_call_delta") {
       const callId = String(ev.data.id || `stream_${ev.data.index ?? 0}`);
       const name = String(ev.data.name || "");
@@ -373,12 +506,15 @@ export function handleRuntimeEvent(ev: RuntimeEvent, ctx: RuntimeEventHandlerCtx
       const summary = formatToolSummary(name, args);
       ctx.patchSubagent(childId, (s) => {
         let tr = [...(s.transcript || [])];
-        const idx = tr.findIndex(
-          (x) =>
-            x.kind === "tool" &&
-            (x.tool.callId === callId ||
-              (x.tool.status === "streaming" && x.tool.name === name)),
-        );
+        const idx = tr.findIndex((x) => {
+          if (x.kind !== "tool") return false;
+          const live =
+            x.tool.status === "streaming" ||
+            x.tool.status === "running" ||
+            x.tool.status === "pending";
+          if (x.tool.callId === callId && live) return true;
+          return live && x.tool.status === "streaming" && x.tool.name === name;
+        });
         // Seal assistant only when the first tool delta of this call arrives
         if (idx < 0) tr = ctx.sealSubassistant(tr);
         const tool: SubTool = {
@@ -391,7 +527,7 @@ export function handleRuntimeEvent(ev: RuntimeEvent, ctx: RuntimeEventHandlerCtx
         };
         if (idx >= 0) tr[idx] = { id: tool.id, kind: "tool", tool };
         else tr.push({ id: tool.id, kind: "tool", tool });
-        return { ...s, transcript: tr, activity: summary };
+        return { ...s, transcript: tr, activity: summary ? `正在 ${summary}` : ctx.t("agentCanvasWorking") };
       });
     } else if (childId && type === "tool_start") {
       const callId = String(ev.data.call_id || uid());
@@ -401,13 +537,18 @@ export function handleRuntimeEvent(ev: RuntimeEvent, ctx: RuntimeEventHandlerCtx
         formatToolSummary(name, ev.data.args);
       ctx.patchSubagent(childId, (s) => {
         let tr = ctx.sealSubassistant(s.transcript || []);
-        const idx = tr.findIndex(
-          (x) =>
-            x.kind === "tool" &&
-            (x.tool.callId === callId ||
-              (x.tool.status === "streaming" &&
-                (x.tool.name === name || !x.tool.name))),
-        );
+        const idx = tr.findIndex((x) => {
+          if (x.kind !== "tool") return false;
+          const live =
+            x.tool.status === "streaming" ||
+            x.tool.status === "running" ||
+            x.tool.status === "pending";
+          if (x.tool.callId === callId && live) return true;
+          return (
+            x.tool.status === "streaming" &&
+            (x.tool.name === name || !x.tool.name)
+          );
+        });
         const tool: SubTool = {
           id: idx >= 0 && tr[idx].kind === "tool" ? tr[idx].tool.id : uid(),
           callId,
@@ -418,7 +559,7 @@ export function handleRuntimeEvent(ev: RuntimeEvent, ctx: RuntimeEventHandlerCtx
         };
         if (idx >= 0) tr[idx] = { id: tool.id, kind: "tool", tool };
         else tr.push({ id: tool.id, kind: "tool", tool });
-        return { ...s, transcript: tr, activity: summary };
+        return { ...s, transcript: tr, activity: summary ? `正在 ${summary}` : ctx.t("agentCanvasWorking") };
       });
     } else if (childId && type === "tool_end") {
       const callId = String(ev.data.call_id || "");
@@ -430,24 +571,44 @@ export function handleRuntimeEvent(ev: RuntimeEvent, ctx: RuntimeEventHandlerCtx
         formatToolSummary(name, ev.data.args);
       ctx.patchSubagent(childId, (s) => {
         const tr = [...(s.transcript || [])];
-        const idx = tr.findIndex(
-          (x) =>
-            x.kind === "tool" &&
-            (x.tool.callId === callId ||
-              (x.tool.name === name &&
-                (x.tool.status === "running" || x.tool.status === "streaming"))),
-        );
+        const idx = tr.findIndex((x) => {
+          if (x.kind !== "tool") return false;
+          if (x.tool.callId === callId) {
+            return (
+              x.tool.status === "running" ||
+              x.tool.status === "streaming" ||
+              x.tool.status === "pending"
+            );
+          }
+          return (
+            x.tool.name === name &&
+            (x.tool.status === "running" || x.tool.status === "streaming")
+          );
+        });
+        const prevArgs =
+          idx >= 0 && tr[idx].kind === "tool" ? tr[idx].tool.args : undefined;
+        const nextArgs = argsLookEmpty(ev.data.args) ? prevArgs : ev.data.args;
         const tool: SubTool = {
           id: idx >= 0 && tr[idx].kind === "tool" ? tr[idx].tool.id : uid(),
           callId: callId || uid(),
           name,
           summary,
           status: ok ? "done" : "error",
-          args: ev.data.args,
+          args: nextArgs,
           result,
         };
         if (idx >= 0) tr[idx] = { id: tool.id, kind: "tool", tool };
         else tr.push({ id: tool.id, kind: "tool", tool });
+        for (let i = 0; i < tr.length; i++) {
+          const row = tr[i];
+          if (row.kind !== "tool" || row.tool.id === tool.id) continue;
+          if (row.tool.name !== name) continue;
+          if (row.tool.status !== "streaming" && row.tool.status !== "running") continue;
+          tr[i] = {
+            ...row,
+            tool: { ...row.tool, status: ok ? "done" : "error", result: row.tool.result || result },
+          };
+        }
         return {
           ...s,
           transcript: tr,
@@ -533,6 +694,10 @@ export function handleRuntimeEvent(ev: RuntimeEvent, ctx: RuntimeEventHandlerCtx
     ctx.appendReasoningChunk(chunk, false);
   }
 
+  if (type === "assistant_status" && ev.data.stalled) {
+    ctx.sealStreamBubble();
+  }
+
   if (type === "tool_call_delta") {
     upsertToolDelta(ev, ctx);
   }
@@ -583,6 +748,8 @@ export function handleRuntimeEvent(ev: RuntimeEvent, ctx: RuntimeEventHandlerCtx
   }
 
   if (type === "ask_request") {
+    ctx.sealStreamBubble();
+    if (!ev.parent_id) ctx.bumpStage();
     const rawOpts = Array.isArray(ev.data.options) ? ev.data.options : [];
     const options: AskOption[] = rawOpts
       .map((o) => {
@@ -638,10 +805,11 @@ export function handleRuntimeEvent(ev: RuntimeEvent, ctx: RuntimeEventHandlerCtx
   }
 
   if (type === "subagent_start") {
+    ctx.sealStreamBubble();
     const party = String(ev.data.party || "");
     const label = String(ev.data.label || party || "").trim();
+    const goal = String(ev.data.goal || label).trim();
     const replay = Boolean(ev.data.replay);
-    const goal = label || String(ev.data.goal || "");
     const replayItems = Array.isArray(ev.data.transcript)
       ? (ev.data.transcript as Array<Record<string, unknown>>)
       : [];
@@ -665,106 +833,120 @@ export function handleRuntimeEvent(ev: RuntimeEvent, ctx: RuntimeEventHandlerCtx
         ];
       }
       const text = String(item.text || item.content || "").trim();
-      return text ? [{ id: uid(), kind: "assistant" as const, text }] : [];
+      const reasoning = String(item.reasoning || "").trim();
+      if (!text && !reasoning) return [];
+      return [
+        {
+          id: uid(),
+          kind: "assistant" as const,
+          text,
+          reasoning: reasoning || undefined,
+        },
+      ];
     });
     const node: SubNode = {
       id: String(ev.data.child_id),
       goal,
       status: "running",
       role: party || String(ev.data.role || "leaf"),
-      activity: String(ev.data.activity || "启动中…"),
+      kind:
+        ev.data.kind === "party" || ev.data.kind === "talk" || ev.data.kind === "task"
+          ? ev.data.kind
+          : party
+            ? "party"
+            : "task",
+      parent_id: String(ev.parent_id || ev.data.parent_id || ""),
+      activity: String(ev.data.activity || ctx.t("thinkingActivity")),
       transcript,
     };
     const spawnerId = String(ev.agent_id || "");
-    const nestedParent =
-      ev.parent_id && spawnerId
-        ? ctx.transcriptRef.current.find(
-            (m) =>
-              m.role === "subagent" &&
-              m.subagent &&
-              findSubNode(m.subagent, spawnerId),
-          )
-        : undefined;
-    if (nestedParent?.subagent) {
-      ctx.patchSubagent(spawnerId, (s) => {
-        const kids = [...(s.children || [])];
-        const idx = kids.findIndex((k) => k.id === node.id);
-        if (idx >= 0) {
-          const prev = kids[idx];
-          kids[idx] = {
-            ...prev,
-            ...node,
-            children: prev.children,
-            transcript:
-              prev.transcript?.length && !node.transcript.length
-                ? prev.transcript
-                : node.transcript.length
-                  ? node.transcript
-                  : prev.transcript,
-          };
-        } else {
-          kids.push(node);
-        }
-        return {
-          ...s,
-          children: kids,
-          activity: s.status === "running" ? `子任务 · ${node.goal}` : s.activity,
-        };
-      });
-    } else {
-    const keys = [party, label, node.goal, String(ev.data.goal || "")].filter(Boolean);
-    const existing = ctx.transcriptRef.current.find((m) => {
-      if (m.role !== "subagent" || !m.subagent) return false;
-      const s = m.subagent;
-      if (s.id === node.id) return true;
-      return keys.some(
-        (k) =>
-          s.role === k ||
-          s.goal === k ||
-          s.goal.startsWith(`${k} —`) ||
-          s.goal.startsWith(`You are ${k}`) ||
-          String(ev.data.goal || "").startsWith(`You are ${s.role}`),
-      );
-    });
-    if (existing?.subagent) {
-      const merged: SubNode = {
-        ...existing.subagent,
+    const already = ctx.transcriptRef.current.find(
+      (m) => m.role === "subagent" && m.subagent && findSubNode(m.subagent, node.id),
+    );
+    const pendingHost = !already
+      ? pickPendingCanvasHost(ctx.transcriptRef.current, goal)
+      : undefined;
+    if (already?.subagent) {
+      ctx.patchSubagent(node.id, (s) => ({
+        ...s,
         ...node,
-        id: node.id,
-        children: existing.subagent.children,
+        children: s.children,
         transcript:
-          existing.subagent.transcript?.length && !transcript.length
-            ? existing.subagent.transcript
+          s.transcript?.length && !transcript.length
+            ? s.transcript
             : transcript.length
               ? transcript
-              : existing.subagent.transcript,
-      };
-      ctx.updateMsg(existing.id, {
-        subagent: merged,
-        content: merged.summary || merged.goal,
-      });
-      ctx.setSubs((prev) => {
-        const without = prev.filter((s) => s.id !== existing.subagent?.id && s.id !== merged.id);
-        return [...without, merged];
-      });
-      ctx.setDetail((d) =>
-        d?.type === "subagent" &&
-        (d.subagent.id === existing.subagent?.id || d.subagent.id === merged.id)
-          ? { type: "subagent", subagent: merged }
-          : d,
-      );
+              : s.transcript,
+      }));
+    } else if (pendingHost?.subagent) {
+      ctx.patchSubagent(pendingHost.subagent.id, (s) => ({
+        ...s,
+        ...node,
+        children: s.children,
+        transcript:
+          s.transcript?.length && !transcript.length
+            ? s.transcript
+            : transcript.length
+              ? transcript
+              : s.transcript,
+      }));
+    } else if (ev.parent_id && spawnerId) {
+      const host =
+        ctx.transcriptRef.current.find(
+          (m) =>
+            m.role === "subagent" &&
+            m.subagent &&
+            findSubNode(m.subagent, spawnerId),
+        ) ||
+        ctx.transcriptRef.current.find(
+          (m) =>
+            m.role === "subagent" &&
+            m.subagent &&
+            findSubNode(m.subagent, String(ev.parent_id)),
+        );
+      const attachId = host?.subagent
+        ? findSubNode(host.subagent, spawnerId)
+          ? spawnerId
+          : String(ev.parent_id)
+        : "";
+      if (host?.subagent && attachId) {
+        ctx.patchSubagent(attachId, (s) => {
+          const kids = [...(s.children || [])];
+          const idx = kids.findIndex((k) => k.id === node.id);
+          if (idx >= 0) {
+            const prev = kids[idx];
+            kids[idx] = {
+              ...prev,
+              ...node,
+              children: prev.children,
+              transcript:
+                prev.transcript?.length && !node.transcript.length
+                  ? prev.transcript
+                  : node.transcript.length
+                    ? node.transcript
+                    : prev.transcript,
+            };
+          } else {
+            kids.push(node);
+          }
+          return {
+            ...s,
+            children: kids,
+            activity: s.status === "running" ? `正在调度 · ${clipGoal(node.goal)}` : s.activity,
+          };
+        });
+      } else {
+        appendTopLevelSubagent(ctx, node, replay);
+      }
     } else {
-      ctx.setSubs((prev) => (prev.some((s) => s.id === node.id) ? prev : [...prev, node]));
-      ctx.appendMsg({
-        id: uid(),
-        role: "subagent",
-        content: node.goal,
-        subagent: node,
-      });
-      if (!replay) ctx.setDetail({ type: "subagent", subagent: node });
-    }
+      appendTopLevelSubagent(ctx, node, replay);
     }
   }
+  if (type === "canvas_sync") {
+    applyCanvasTree(ctx, ev.data.tree);
+    return;
+  }
+
   if (type === "subagent_end") {
     const childId = String(ev.data.child_id);
     const summary = String(ev.data.summary || "");
@@ -775,7 +957,7 @@ export function handleRuntimeEvent(ev: RuntimeEvent, ctx: RuntimeEventHandlerCtx
       status: ok ? "done" : "error",
       summary: cancelled ? summary || "（已停止）" : summary,
       activity: undefined,
-      transcript: ctx.sealSubassistant(s.transcript || []),
+      transcript: ctx.sealSubassistant(sealStreamingTools(s.transcript || [])),
     }));
   }
 

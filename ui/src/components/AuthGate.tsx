@@ -23,7 +23,7 @@ export function AuthGate({ mode, busy, error, onSetup, onLogin }: Props) {
   const hint =
     mode === "setup"
       ? "本机多用户：用邮箱创建首个管理员后，会话 / 模型 / MCP 配置按账号隔离。"
-      : "使用邮箱登录。数据仅保存在本机。";
+      : "使用邮箱登录。数据仅保存在本机。新账号由已登录用户添加。";
 
   const submit = async () => {
     setLocalError(null);

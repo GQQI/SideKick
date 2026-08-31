@@ -5,7 +5,10 @@ from __future__ import annotations
 import threading
 import time
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Any
+
+from ..core.pathutil import path_outside_workspace
 
 
 @dataclass
@@ -14,14 +17,16 @@ class ApprovalRequest:
     tool: str
     args: dict[str, Any]
     summary: str
+    scope: str = ""
     created_at: float = field(default_factory=time.time)
 
 
 class ApprovalGate:
     """Blocks worker threads until the UI decides approve/reject.
 
-    ``_allowed_tools`` holds tool names pre-approved for the current agent turn
-    (cleared via ``begin_turn``).
+    ``_allowed_tools`` holds remember-keys for the current agent turn
+    (cleared via ``begin_turn``). File ops outside the workspace share
+    ``outside_workspace`` so a single 「本轮记住」covers later out-of-tree reads/writes.
     """
 
     def __init__(self, timeout_sec: float = 300.0) -> None:
@@ -54,14 +59,29 @@ class ApprovalGate:
         with self._lock:
             self._allowed_tools.add(name)
 
-    def request(self, approval_id: str, tool: str, args: dict[str, Any], summary: str) -> bool:
+    def request(
+        self,
+        approval_id: str,
+        tool: str,
+        args: dict[str, Any],
+        summary: str,
+        *,
+        scope: str | None = None,
+    ) -> bool:
+        remember_key = (scope or tool or "").strip() or (tool or "")
         with self._lock:
-            if tool in self._allowed_tools:
+            if remember_key in self._allowed_tools:
                 return True
             if approval_id in self._early:
                 return bool(self._early.pop(approval_id))
         ev = threading.Event()
-        req = ApprovalRequest(id=approval_id, tool=tool, args=args, summary=summary)
+        req = ApprovalRequest(
+            id=approval_id,
+            tool=tool,
+            args=args,
+            summary=summary,
+            scope=remember_key,
+        )
         with self._lock:
             if approval_id in self._early:
                 return bool(self._early.pop(approval_id))
@@ -96,8 +116,9 @@ class ApprovalGate:
                 return True
             if approved and remember:
                 req = self._pending.get(approval_id)
-                if req and req.tool:
-                    self._allowed_tools.add(req.tool)
+                key = ((req.scope if req else "") or (req.tool if req else "")).strip()
+                if key:
+                    self._allowed_tools.add(key)
             self._decisions[approval_id] = bool(approved)
             ev.set()
             return True
@@ -141,6 +162,39 @@ APPROVAL_TOOLS = {
     "browser_type",
 }
 
+# File tools that take a path and may escape the workspace.
+FILE_PATH_TOOLS = frozenset(
+    {
+        "read_file",
+        "write_file",
+        "str_replace",
+        "delete_file",
+        "list_dir",
+        "search_text",
+    }
+)
+OUTSIDE_WORKSPACE_SCOPE = "outside_workspace"
+
+
+def _tool_path_arg(args: dict[str, Any] | None) -> str:
+    rec = args if isinstance(args, dict) else {}
+    return str(rec.get("path") or rec.get("dir") or "").strip()
+
+
+def approval_scope(
+    name: str,
+    args: dict[str, Any] | None = None,
+    workspace: Path | str | None = None,
+) -> str:
+    """Remember-key for this call. Outside-workspace file ops share one scope."""
+    tool_name = (name or "").strip()
+    root = str(workspace or "").strip()
+    if tool_name in FILE_PATH_TOOLS and root:
+        raw = _tool_path_arg(args)
+        if raw and path_outside_workspace(raw, root):
+            return OUTSIDE_WORKSPACE_SCOPE
+    return tool_name
+
 
 def tool_needs_approval(name: str) -> bool:
     if name in APPROVAL_TOOLS:
@@ -151,8 +205,16 @@ def tool_needs_approval(name: str) -> bool:
     return False
 
 
-def approval_required(name: str, tool: Any | None = None) -> bool:
-    """Single gate: Tool.requires_approval or the APPROVAL_TOOLS / mcp_ table."""
+def approval_required(
+    name: str,
+    tool: Any | None = None,
+    *,
+    args: dict[str, Any] | None = None,
+    workspace: Path | str | None = None,
+) -> bool:
+    """Single gate: outside-workspace file ops, Tool.requires_approval, or table."""
+    if approval_scope(name, args, workspace) == OUTSIDE_WORKSPACE_SCOPE:
+        return True
     if tool is not None and bool(getattr(tool, "requires_approval", False)):
         return True
     return tool_needs_approval(name)
@@ -165,7 +227,7 @@ def _short(text: str, n: int = 80) -> str:
     return t[: n - 1] + "…"
 
 
-def summarize_tool_call(name: str, args: dict[str, Any]) -> str:
+def _tool_summary_body(name: str, args: dict[str, Any]) -> str:
     if name == "write_file":
         path = str(args.get("path") or "")
         content = str(args.get("content") or "")
@@ -240,3 +302,14 @@ def summarize_tool_call(name: str, args: dict[str, Any]) -> str:
         if key in args and args[key]:
             return f"{name}: {_short(str(args[key]), 80)}"
     return name
+
+
+def summarize_tool_call(
+    name: str,
+    args: dict[str, Any],
+    workspace: Path | str | None = None,
+) -> str:
+    body = _tool_summary_body(name, args)
+    if approval_scope(name, args, workspace) == OUTSIDE_WORKSPACE_SCOPE:
+        return f"工作区外 · {body}"
+    return body

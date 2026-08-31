@@ -70,8 +70,7 @@ class AgentGroundingMixin:
             for e in entries[:40]:
                 if e.name.startswith(".") and e.name not in {
                     ".sidekick",
-                    ".yutianlang",
-                    ".cursor",
+                    ".sidekick",
                 }:
                     continue
                 shown.append(f"{'dir' if e.is_dir() else 'file'}:{e.name}")

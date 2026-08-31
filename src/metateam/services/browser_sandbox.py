@@ -72,6 +72,62 @@ def sanitize_browser_url(raw: str) -> str:
         return ""
 
 
+def resolve_browser_target(raw: str) -> str:
+    """http(s) URL, or local workspace HTML served as http://127.0.0.1/..."""
+    http = sanitize_browser_url(raw)
+    if http:
+        return http
+    from .browser_preview import preview_http_url, resolve_local_html_file
+    from .workspace_store import get_active_workspace
+
+    ws = get_active_workspace()
+    root_s = str(ws.get("path") or "").strip() if ws.get("configured") else ""
+    root = Path(root_s) if root_s else None
+    local = resolve_local_html_file(raw, workspace=root)
+    if local is None or root is None:
+        return ""
+    return preview_http_url(local, root)
+
+
+def loopback_url_candidates(url: str) -> list[str]:
+    """Try IPv4 and IPv6 loopback — Vite on Windows often binds only one family."""
+    text = (url or "").strip()
+    if not text or text == "about:blank":
+        return [text] if text else []
+    try:
+        parsed = urlparse(text)
+    except Exception:
+        return [text]
+    host = (parsed.hostname or "").lower()
+    if host not in {"127.0.0.1", "localhost", "0.0.0.0", "::1"}:
+        return [text]
+    port = parsed.port
+    out: list[str] = []
+    seen: set[str] = set()
+
+    def add(hostname: str) -> None:
+        hostpart = f"[{hostname}]" if ":" in hostname else hostname
+        netloc = f"{hostpart}:{port}" if port else hostpart
+        cand = urlunparse(parsed._replace(netloc=netloc))
+        if cand not in seen:
+            seen.add(cand)
+            out.append(cand)
+
+    add("127.0.0.1" if host == "0.0.0.0" else host)
+    for h in ("127.0.0.1", "localhost", "::1"):
+        add(h)
+    return out or [text]
+
+
+def _is_connection_refused(exc: BaseException) -> bool:
+    s = str(exc).lower()
+    return (
+        "err_connection_refused" in s
+        or "econnrefused" in s
+        or "connection refused" in s
+    )
+
+
 _SELECT_BOOTSTRAP = r"""
 (() => {
   if (window.__sidekickSelectBooted) return true;
@@ -424,7 +480,7 @@ class BrowserSandbox:
         if not ok:
             raise RuntimeError(err)
         uid = user_id or get_user_id()
-        target = sanitize_browser_url(url) if (url or "").strip() else ""
+        target = resolve_browser_target(url) if (url or "").strip() else ""
 
         async def _op() -> dict[str, Any]:
             with self._lock:
@@ -467,9 +523,13 @@ class BrowserSandbox:
 
     def navigate(self, url: str, *, user_id: Optional[str] = None) -> dict[str, Any]:
         uid = user_id or get_user_id()
-        target = sanitize_browser_url(url)
+        target = resolve_browser_target(url)
         if not target:
-            raise ValueError(f"invalid url: {url!r}")
+            raise ValueError(
+                f"invalid url: {url!r} — browser_navigate opens http(s) links only. "
+                "For a local HTML file, pass a workspace-relative path (e.g. report.html), "
+                "not file://. Dev servers: http://127.0.0.1:PORT"
+            )
 
         async def _op() -> dict[str, Any]:
             with self._lock:
@@ -504,6 +564,41 @@ class BrowserSandbox:
             return await page.screenshot(full_page=full_page, type="png")
 
         return _WORKER.call(_op, timeout=60.0)
+
+    def page_content(
+        self,
+        *,
+        user_id: Optional[str] = None,
+        max_chars: int = 12000,
+        include_html: bool = False,
+    ) -> dict[str, Any]:
+        """Return a compact, agent-friendly snapshot of the current page.
+
+        This intentionally exposes rendered text by default.  Full markup is
+        optional and bounded so a single browser inspection cannot consume an
+        entire agent context window.
+        """
+        uid = user_id or get_user_id()
+        limit = max(500, min(int(max_chars or 12000), 50000))
+
+        async def _op() -> dict[str, Any]:
+            with self._lock:
+                page = self._page_unlocked(uid)
+            title = await page.title()
+            text = await page.locator("body").inner_text(timeout=15000)
+            payload: dict[str, Any] = {
+                "url": page.url,
+                "title": title,
+                "text": (text or "").strip()[:limit],
+                "truncated": len((text or "").strip()) > limit,
+            }
+            if include_html:
+                html = await page.content()
+                payload["html"] = html[:limit]
+                payload["html_truncated"] = len(html) > limit
+            return payload
+
+        return _WORKER.call(_op, timeout=30.0)
 
     def console_logs(
         self,
@@ -675,7 +770,7 @@ class BrowserSandbox:
         page.on("console", lambda msg: self._on_console(uid, msg))
         go = url or "about:blank"
         if go != "about:blank":
-            await page.goto(go, wait_until="domcontentloaded", timeout=60000)
+            await self._goto_page(page, go)
         sess = {
             "user_id": uid,
             "browser": browser,
@@ -711,16 +806,33 @@ class BrowserSandbox:
             )
         return page
 
+    async def _goto_page(self, page: Any, url: str) -> None:
+        last_exc: Optional[BaseException] = None
+        for cand in loopback_url_candidates(url):
+            try:
+                await page.goto(cand, wait_until="domcontentloaded", timeout=60000)
+                return
+            except Exception as exc:
+                last_exc = exc
+                if self._is_target_closed(exc):
+                    raise
+                if _is_connection_refused(exc):
+                    continue
+                try:
+                    await page.goto(cand, wait_until="commit", timeout=60000)
+                    return
+                except Exception as exc2:
+                    last_exc = exc2
+                    if self._is_target_closed(exc2) or not _is_connection_refused(exc2):
+                        raise
+        if last_exc:
+            raise last_exc
+
     async def _navigate_unlocked(self, sess: dict[str, Any], url: str) -> None:
         page = sess["page"]
         if not self._page_alive(page):
             raise RuntimeError("Target page, context or browser has been closed")
-        try:
-            await page.goto(url, wait_until="domcontentloaded", timeout=60000)
-        except Exception as exc:
-            if self._is_target_closed(exc):
-                raise
-            await page.goto(url, wait_until="commit", timeout=60000)
+        await self._goto_page(page, url)
         try:
             await page.wait_for_load_state("networkidle", timeout=8000)
         except Exception:

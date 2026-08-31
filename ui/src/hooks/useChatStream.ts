@@ -34,6 +34,7 @@ import { ThinkTagSplitter, splitThinkTags } from "../utils/thinkTags";
 import { mapSessionMessages, uid, findSubNode, mapSubNode } from "../utils/chatHelpers";
 import type { MsgKey } from "../i18n";
 import { handleRuntimeEvent } from "./chat/handleRuntimeEvent";
+import { replaceStageSubagents } from "./chat/canvasSync";
 import {
   upsertToolDelta,
   upsertToolEnd,
@@ -137,6 +138,7 @@ export function useChatStream(deps: ChatStreamDeps) {
   };
 
   const transcriptRef = useRef<ChatMsg[]>([]);
+  const stageRef = useRef(0);
   const streamIdRef = useRef<string | null>(null);
   const streamTextRef = useRef("");
   const streamReasoningRef = useRef("");
@@ -170,6 +172,8 @@ export function useChatStream(deps: ChatStreamDeps) {
     setRunningSessionIds((prev) => {
       const next = prev.filter((id) => {
         const started = runningSinceRef.current[id] || 0;
+        // Explicit idle clears the timestamp; do not revive via the start grace.
+        if (!started) return false;
         const hit = items.find((s) => s.id === id);
         if (hit?.busy) return true;
         return now - started < 8000;
@@ -180,12 +184,26 @@ export function useChatStream(deps: ChatStreamDeps) {
   }
 
   function commit(next: ChatMsg[]) {
-  transcriptRef.current = next;
-  setMessages(next);
-}
+    transcriptRef.current = next;
+    setMessages(next);
+  }
+
+  function loadTranscript(next: ChatMsg[]) {
+    const maxStage = next.reduce((acc, m) => Math.max(acc, m.stage ?? 0), 0);
+    stageRef.current = next.length ? maxStage : 0;
+    commit(next);
+  }
 
 function appendMsg(msg: ChatMsg) {
-  commit([...transcriptRef.current, msg]);
+  commit([...transcriptRef.current, { ...msg, stage: msg.stage ?? stageRef.current }]);
+}
+
+function removeMsg(id: string) {
+  commit(transcriptRef.current.filter((m) => m.id !== id));
+}
+
+function bumpStage() {
+  stageRef.current += 1;
 }
 
 function updateMsg(id: string, patch: Partial<ChatMsg>) {
@@ -227,7 +245,10 @@ function findToolMsg(opts: {
   for (let i = list.length - 1; i >= 0; i--) {
     const m = list[i];
     if (m.role !== "tool" || !m.tool) continue;
-    if (callId && m.tool.callId === callId) return m;
+    if (callId && m.tool.callId === callId) {
+      if (!statuses || statuses.includes(m.tool.status)) return m;
+      continue;
+    }
     if (
       name &&
       m.tool.name === name &&
@@ -285,28 +306,8 @@ function patchSubagent(
     (m) => m.role === "subagent" && m.subagent && findSubNode(m.subagent, childId),
   );
   if (!hitMsg?.subagent) {
-    const stub: SubNode = {
-      id: childId,
-      goal: "",
-      status: "running",
-      transcript: [],
-      activity: "运行中…",
-    };
-    appendMsg({ id: uid(), role: "subagent", content: "", subagent: stub });
-    setSubs((prev) => (prev.some((s) => s.id === childId) ? prev : [...prev, stub]));
-    const created = transcriptRef.current.find(
-      (m) => m.role === "subagent" && m.subagent?.id === childId,
-    );
-    if (!created?.subagent) return;
-    const subagent = fn(created.subagent);
-    updateMsg(created.id, {
-      subagent,
-      content: subagent.summary || subagent.goal,
-    });
-    setSubs((prev) => prev.map((s) => (s.id === childId ? { ...s, ...subagent } : s)));
-    setDetail((d) =>
-      d?.type === "subagent" && d.subagent.id === childId ? { type: "subagent", subagent } : d,
-    );
+    // Do not invent a nameless robot for a tool/step event that arrived
+    // before subagent_start — those stubs looked like extra agents.
     return;
   }
   const mappedRoot =
@@ -333,12 +334,42 @@ function patchSubagent(
 }
 
 function sealSubassistant(transcript: SubTranscriptItem[]): SubTranscriptItem[] {
-  const tr = [...transcript];
-  const last = tr[tr.length - 1];
-  if (last?.kind === "assistant" && last.streaming) {
-    tr[tr.length - 1] = { ...last, streaming: false };
-  }
-  return tr;
+  return transcript.map((item) =>
+    item.kind === "assistant" && (item.streaming || item.reasoningStreaming)
+      ? { ...item, streaming: false, reasoningStreaming: false }
+      : item,
+  );
+}
+
+function sealStoppedSubtree(node: SubNode): SubNode {
+  const stopped = node.status === "running";
+  return {
+    ...node,
+    status: stopped ? "error" : node.status,
+    summary: stopped ? node.summary || "（已停止）" : node.summary,
+    activity: undefined,
+    transcript: sealSubassistant((node.transcript || []).map((item) =>
+      item.kind === "tool" && ["streaming", "running", "pending"].includes(item.tool.status)
+        ? { ...item, tool: { ...item.tool, status: "error", result: item.tool.result || "ERROR: cancelled" } }
+        : item,
+    )),
+    children: (node.children || []).map(sealStoppedSubtree),
+  };
+}
+
+function sealStoppedTurn() {
+  const next = transcriptRef.current.map((message) => {
+    if (message.role === "subagent" && message.subagent) {
+      const subagent = sealStoppedSubtree(message.subagent);
+      return { ...message, subagent, content: subagent.summary || message.content };
+    }
+    if (message.role === "tool" && message.tool && ["streaming", "running", "pending"].includes(message.tool.status)) {
+      return { ...message, tool: { ...message.tool, status: "error", result: message.tool.result || "ERROR: cancelled" } };
+    }
+    return message;
+  });
+  commit(next);
+  setSubs(next.filter((m) => m.role === "subagent" && m.subagent).map((m) => m.subagent!));
 }
 
 function looksLikeOptionList(text: string): boolean {
@@ -411,43 +442,46 @@ function sealStreamBubble() {
 
 function ensureStreamBubble(reset: boolean) {
   if (reset) sealStreamBubble();
-  if (!streamIdRef.current) {
-    // Reopen only when continuing the *same* LLM stream after tool_call_delta
-    // sealed the bubble (reset=false). Explicit reset must always start a new
-    // bubble — otherwise post-ask_user output appends to the first bubble.
-    if (!reset) {
-      for (let i = transcriptRef.current.length - 1; i >= 0; i--) {
-        const m = transcriptRef.current[i];
-        if (m.role === "tool" || m.role === "subagent") continue;
-        if (m.role === "assistant") {
-          streamIdRef.current = m.id;
-          streamTextRef.current = m.content || "";
-          streamReasoningRef.current = m.reasoning || "";
-          updateMsg(m.id, {
-            streaming: true,
-            reasoningStreaming:
-              Boolean(m.reasoning) && !(m.content || "").trim(),
-          });
-          return;
-        }
-        break;
+  if (streamIdRef.current) return;
+  // Continue the same LLM turn only when tool chips sit after the assistant
+  // (content interleaved with tool_call_delta). Never skip subagent cards —
+  // that reopened a sealed thinking bubble and glued the next step into it.
+  if (!reset) {
+    for (let i = transcriptRef.current.length - 1; i >= 0; i--) {
+      const m = transcriptRef.current[i];
+      if (m.role === "tool") continue;
+      if (m.role === "assistant") {
+        const toolsAfter = transcriptRef.current
+          .slice(i + 1)
+          .some((x) => x.role === "tool");
+        if (!m.streaming && !toolsAfter) break;
+        streamIdRef.current = m.id;
+        streamTextRef.current = m.content || "";
+        streamReasoningRef.current = m.reasoning || "";
+        nativeReasoningRef.current = Boolean(m.reasoning);
+        updateMsg(m.id, {
+          streaming: true,
+          reasoningStreaming: Boolean(m.reasoning) && !(m.content || "").trim(),
+        });
+        return;
       }
+      break;
     }
-    const id = uid();
-    streamIdRef.current = id;
-    streamTextRef.current = "";
-    streamReasoningRef.current = "";
-    nativeReasoningRef.current = false;
-    thinkSplitRef.current.reset();
-    appendMsg({
-      id,
-      role: "assistant",
-      content: "",
-      reasoning: "",
-      streaming: true,
-      reasoningStreaming: false,
-    });
   }
+  const id = uid();
+  streamIdRef.current = id;
+  streamTextRef.current = "";
+  streamReasoningRef.current = "";
+  nativeReasoningRef.current = false;
+  thinkSplitRef.current.reset();
+  appendMsg({
+    id,
+    role: "assistant",
+    content: "",
+    reasoning: "",
+    streaming: true,
+    reasoningStreaming: false,
+  });
 }
 
 function syncStreamBubble() {
@@ -561,7 +595,10 @@ function isLiveListener(gen: number) {
 
 function detachListener() {
   listenerGenRef.current += 1;
-  abortRef.current?.abort();
+  const activeAbort = abortRef.current;
+  abortRef.current = null;
+  activeAbort?.abort();
+  sealStoppedTurn();
   abortRef.current = null;
   stoppingRef.current = false;
   setBusyState(false);
@@ -626,17 +663,32 @@ async function stopChat() {
 
   stoppingRef.current = true;
   setToast("正在停止…");
-  const sid = sessionId;
+  const sid = sessionIdRef.current || sessionId;
+  // Detach the UI first. A provider can take time to unwind a stream after the
+  // server accepts cancellation, but one press must immediately end the local
+  // loading state and make history safe to open.
+  abortRef.current?.abort();
+  if (sid) markSessionIdle(sid);
+  setBusyState(false);
+  void refreshSessionsRef.current();
   // Server cancel also rejects pending approvals — do not double-call decide here
   if (sid) {
-    try {
-      await stopSession(sid);
-    } catch {
-      /* ignore */
-    }
+    void stopSession(sid).catch(() => {});
   }
-  if (sid) markSessionIdle(sid);
-  abortRef.current?.abort();
+}
+
+function alignCanvasFromSession(sid: string) {
+  if (!sid) return;
+  void fetchSession(sid)
+    .then((d) => {
+      const mapped = mapSessionMessages(d.messages, d.agent_tree);
+      const latest = Math.max(0, ...mapped.map((m) => m.stage ?? 0));
+      const nodes = mapped
+        .filter((m) => m.role === "subagent" && m.subagent && (m.stage ?? 0) === latest)
+        .map((m) => m.subagent!);
+      if (nodes.length) replaceStageSubagents(toolUpsertCtx, nodes, latest);
+    })
+    .catch(() => {});
 }
 
 const toolUpsertCtx: ToolUpsertCtx = {
@@ -645,8 +697,12 @@ const toolUpsertCtx: ToolUpsertCtx = {
   updateMsg,
   syncToolPanel,
   appendMsg,
+  removeMsg,
+  commit,
+  setSubs,
   setDetail,
   transcriptRef,
+  stageRef,
 };
 
 async function drainQueueSoon() {
@@ -695,6 +751,7 @@ async function sendChat(
   streamReasoningRef.current = "";
   nativeReasoningRef.current = false;
   thinkSplitRef.current.reset();
+  bumpStage();
   if (showUser) {
     const displayText =
       opts?.userDisplay !== undefined ? opts.userDisplay : msg;
@@ -740,6 +797,8 @@ async function sendChat(
     setFsRefresh,
     setSubs,
     appendMsg,
+    commit,
+    bumpStage,
   };
 
   try {
@@ -774,6 +833,7 @@ async function sendChat(
             iters: Number(meta.iterations || 0),
           });
           if (meta.session_id) setSessionId(String(meta.session_id));
+          alignCanvasFromSession(String(meta.session_id || sessionId || ""));
           void fetchSkills().then(setSkills);
           void fetchMemory().then(setMemory);
           setFsRefresh((n) => n + 1);
@@ -787,6 +847,7 @@ async function sendChat(
         },
         onAbort: () => {
           if (!isLiveListener(gen)) return;
+          markSessionIdle(sessionIdRef.current || sessionId);
           const had = streamTextRef.current.trim();
           finalizeAssistant(had, { stopped: true });
           setToast(had ? t("stoppedKeep") : t("stopped"));
@@ -796,9 +857,11 @@ async function sendChat(
       runMode,
       displayForApi,
     );
-    if (isLiveListener(gen) && sid) {
-      setSessionId(sid);
-      markSessionRunning(sid);
+    if (isLiveListener(gen) && sid) setSessionId(sid);
+    // streamChat resolves after the turn ends (final / abort / error).
+    // Re-marking running here would leave the history spinner stuck.
+    if (isLiveListener(gen)) {
+      markSessionIdle(sid || sessionIdRef.current || sessionId);
     }
   } catch (e) {
     if (!(e instanceof DOMException && e.name === "AbortError")) {
@@ -811,6 +874,7 @@ async function sendChat(
     }
   } finally {
     if (!isLiveListener(gen)) return;
+    markSessionIdle(sessionIdRef.current || sessionId);
     abortRef.current = null;
     stoppingRef.current = false;
     setBusyState(false);
@@ -871,13 +935,16 @@ async function attachLive(sid: string) {
             setFsRefresh,
             setSubs,
             appendMsg,
+            commit,
+            bumpStage,
           });
         },
         onFinal: (textOut, meta) => {
           if (meta.replay) {
+            markSessionIdle(sid);
             if (!isLiveListener(gen)) return;
             void fetchSession(sid)
-              .then((d) => commit(mapSessionMessages(d.messages)))
+              .then((d) => loadTranscript(mapSessionMessages(d.messages, d.agent_tree)))
               .catch(() => {});
             return;
           }
@@ -886,6 +953,7 @@ async function attachLive(sid: string) {
           if (!isLiveListener(gen)) return;
           const stopped = Boolean(meta.cancelled);
           finalizeAssistant(textOut, { stopped });
+          alignCanvasFromSession(sid);
           setStats({
             tokens: Number(meta.tokens || 0),
             iters: Number(meta.iterations || 0),
@@ -895,6 +963,7 @@ async function attachLive(sid: string) {
           setFsRefresh((n) => n + 1);
         },
         onError: (err) => {
+          markSessionIdle(sid);
           if (!isLiveListener(gen)) return;
           sealStreamBubble();
           appendMsg({ id: uid(), role: "assistant", content: `错误：${err}` });
@@ -907,10 +976,12 @@ async function attachLive(sid: string) {
     );
   } catch (e) {
     if (!(e instanceof DOMException && e.name === "AbortError")) {
+      markSessionIdle(sid);
       setToast(e instanceof Error ? e.message : String(e));
     }
   } finally {
     if (!isLiveListener(gen)) return;
+    markSessionIdle(sid);
     if (abortRef.current === ac) abortRef.current = null;
     stoppingRef.current = false;
     setBusyState(false);
@@ -980,7 +1051,7 @@ function resumeFromSnapshot(detail: SessionDetail) {
     turnDoneRef,
     queuedRef,
     busyRef,
-    commit,
+    commit: loadTranscript,
     appendMsg,
     updateMsg,
     syncToolPanel,

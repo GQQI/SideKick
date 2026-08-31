@@ -1,80 +1,26 @@
 import type { RefObject } from "react";
+import { AgentCanvas } from "./AgentCanvas";
+import { AskDialog } from "./AskDialog";
 import { FileTypeIcon, fileCardMeta } from "./FileTypeIcon";
 import { IconCheck, IconCube, IconUser } from "./icons";
 import { IconRobotCube } from "./IconRobotCube";
 import { MarkdownView } from "./MarkdownView";
 import { ThinkingBlock } from "./ThinkingBlock";
 import { readFileContent } from "../api";
-import type { ChatMsg, DetailView, SubNode } from "../types/chat";
+import type { AskPrompt, ChatMsg, DetailView } from "../types/chat";
+import { ASK_CUSTOM_KEY } from "../types/chat";
 import {
   buildSuggestions,
   fileToDetail,
   greetingKey,
   isSkillInjectMessage,
   writeFilePreview,
+  streamPhaseSuffix,
+  canvasRootsForStage,
+  stripToolCallMarkup,
 } from "../utils/chatHelpers";
 import { formatToolSummary } from "../utils/toolSummary";
-import { roleIcon } from "../utils/roleIcon";
 import type { MsgKey } from "../i18n";
-
-function SubAgentCard({
-  node,
-  t,
-  detail,
-  onSetDetail,
-}: {
-  node: SubNode;
-  t: (key: MsgKey, ...args: string[]) => string;
-  detail: DetailView;
-  onSetDetail: (d: DetailView) => void;
-}) {
-  const s = node;
-  const active = detail?.type === "subagent" && detail.subagent.id === s.id;
-  return (
-    <div className={`subagent-card-wrap ${s.status}`}>
-      <button
-        type="button"
-        className={`subagent-card ${s.status}${active ? " active" : ""}`}
-        onClick={() => onSetDetail({ type: "subagent", subagent: s })}
-      >
-        <div className="subagent-card-head">
-          <span className="subagent-card-badge">
-            <span className="subagent-card-icon">{roleIcon(s.role || "")}</span>
-            {t("subtaskLabel")}
-            {s.role ? ` · ${s.role}` : ""}
-          </span>
-          <span className="subagent-card-status">
-            {s.status === "running"
-              ? t("subtaskRunning")
-              : s.status === "error"
-                ? t("toolStatusError")
-                : t("toolStatusDone")}
-          </span>
-        </div>
-        <div className="subagent-card-goal">{s.goal}</div>
-        {s.status === "running" && s.activity && (
-          <div className="subagent-card-activity">{s.activity}</div>
-        )}
-        {s.summary && s.status !== "running" && (
-          <pre className="subagent-card-summary">{s.summary}</pre>
-        )}
-      </button>
-      {(s.children || []).length > 0 ? (
-        <div className="subagent-children">
-          {s.children!.map((child) => (
-            <SubAgentCard
-              key={child.id}
-              node={child}
-              t={t}
-              detail={detail}
-              onSetDetail={onSetDetail}
-            />
-          ))}
-        </div>
-      ) : null}
-    </div>
-  );
-}
 
 export type ChatThreadProps = {
   t: (key: MsgKey, ...args: string[]) => string;
@@ -107,6 +53,13 @@ export type ChatThreadProps = {
   onRequestSubmitEdit: (msgId: string) => void;
   onToast: (msg: string) => void;
   onCtrlClickUrl?: (url: string, clientX: number, clientY: number) => void;
+  askPrompt?: AskPrompt | null;
+  askChoice?: string;
+  askOtherText?: string;
+  askSubmitting?: boolean;
+  onResolveAsk?: (choice: string, otherText?: string) => void;
+  onAskChoice?: (key: string) => void;
+  onAskOtherText?: (text: string) => void;
 };
 
 export function ChatThread({
@@ -133,6 +86,13 @@ export function ChatThread({
   onRequestSubmitEdit,
   onToast,
   onCtrlClickUrl,
+  askPrompt,
+  askChoice = "",
+  askOtherText = "",
+  askSubmitting = false,
+  onResolveAsk,
+  onAskChoice,
+  onAskOtherText,
 }: ChatThreadProps) {
   return (
     <>
@@ -188,29 +148,41 @@ export function ChatThread({
             </div>
           </div>
         )}
-        {messages.map((m) => {
+        {messages.map((m, idx) => {
           if (m.role === "tool" && m.tool) {
             const tool = m.tool;
             const active = detail?.type === "tool" && detail.tool.callId === tool.callId;
             const writePrev =
               tool.name === "write_file" ? writeFilePreview(tool.args) : null;
+            const readPath =
+              tool.name === "read_file" &&
+              tool.args &&
+              typeof tool.args === "object" &&
+              typeof (tool.args as { path?: unknown }).path === "string"
+                ? String((tool.args as { path: string }).path)
+                : "";
+            const filePath = writePrev?.path || readPath;
             if (
-              writePrev?.path &&
+              filePath &&
               (tool.status === "done" || tool.status === "running" || tool.status === "streaming")
             ) {
-              const meta = fileCardMeta(writePrev.path);
+              const meta = fileCardMeta(filePath);
               return (
                 <button
                   key={m.id}
                   type="button"
                   className={`file-ref-card${active ? " active" : ""}${tool.status !== "done" ? " pending" : ""}`}
                   onClick={() => onSetDetail({ type: "tool", tool })}
-                  title={writePrev.path}
+                  title={tool.summary || filePath}
                 >
                   <FileTypeIcon name={meta.name} />
                   <span className="file-ref-body">
                     <strong>{meta.name}</strong>
-                    <span>{meta.dir || writePrev.path}</span>
+                    <span>
+                      {tool.name === "read_file"
+                        ? tool.summary || meta.dir || filePath
+                        : meta.dir || filePath}
+                    </span>
                   </span>
                   {tool.status === "done" ? (
                     <span className="file-ref-status ok">
@@ -243,8 +215,8 @@ export function ChatThread({
                       : tool.status === "running"
                         ? "…"
                         : tool.status === "error"
-                          ? "!"
-                          : "…"}
+                      ? "!"
+                      : "✓"}
                 </span>
                 <span className="tool-chip-body">
                   <span className="tool-chip-name">{tool.name || "tool"}</span>
@@ -256,10 +228,19 @@ export function ChatThread({
             );
           }
           if (m.role === "subagent" && m.subagent) {
+            const stage = m.stage ?? 0;
+            const alreadyShown = messages.slice(0, idx).some(
+              (prev) =>
+                prev.role === "subagent" &&
+                prev.subagent &&
+                (prev.stage ?? 0) === stage,
+            );
+            if (alreadyShown) return null;
+            const group = canvasRootsForStage(messages, stage);
             return (
-              <SubAgentCard
-                key={m.id}
-                node={m.subagent}
+              <AgentCanvas
+                key={`canvas-${stage}-${m.id}`}
+                nodes={group}
                 t={t}
                 detail={detail}
                 onSetDetail={onSetDetail}
@@ -299,9 +280,11 @@ export function ChatThread({
                           ? t("command")
                           : t("assistant")}
                     {m.streaming
-                      ? m.reasoningStreaming
-                        ? ` · ${t("thinking")}`
-                        : ` · ${t("outputting")}`
+                      ? streamPhaseSuffix(true, {
+                          reasoningStreaming: m.reasoningStreaming,
+                          text: m.content,
+                          reasoning: m.reasoning,
+                        }, t)
                       : ""}
                   </span>
                 </div>
@@ -376,7 +359,7 @@ export function ChatThread({
                 (m.role === "user" && isSkillInjectMessage(m.content)) ? (
                 m.content ? (
                   <MarkdownView
-                    content={m.content}
+                    content={m.role === "assistant" ? stripToolCallMarkup(m.content) : m.content}
                     streaming={m.streaming && !m.reasoningStreaming}
                     onCtrlClickUrl={onCtrlClickUrl}
                   />
@@ -417,6 +400,33 @@ export function ChatThread({
             </article>
           );
         })}
+        {askPrompt && onResolveAsk ? (
+          <div className="thread-ask">
+            <AskDialog
+              question={askPrompt.question}
+              options={askPrompt.options}
+              allowCustom={askPrompt.allowCustom}
+              customLabel={askPrompt.customLabel}
+              choice={askChoice}
+              otherText={askOtherText}
+              submitting={askSubmitting}
+              titleLabel={t("askNeeded")}
+              dialogLabel={t("askDialog")}
+              submitLabel={t("askSubmit")}
+              otherPlaceholder={t("askOtherPlaceholder")}
+              onPick={(key) => {
+                onAskChoice?.(key);
+                void onResolveAsk(key);
+              }}
+              onOtherChange={(text) => {
+                onAskChoice?.(ASK_CUSTOM_KEY);
+                onAskOtherText?.(text);
+              }}
+              onOtherFocus={() => onAskChoice?.(ASK_CUSTOM_KEY)}
+              onSubmitCustom={() => void onResolveAsk(ASK_CUSTOM_KEY, askOtherText)}
+            />
+          </div>
+        ) : null}
         {busy && !messages.some((m) => m.streaming) && (
           <div className="typing-row">
             <span className="typing">

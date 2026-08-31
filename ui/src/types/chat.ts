@@ -50,6 +50,8 @@ export type SubTranscriptItem =
       streaming?: boolean;
       reasoning?: string;
       reasoningStreaming?: boolean;
+      /** Order key so a shared stage can replay who spoke after whom. */
+      turnAt?: number;
     }
   | { id: string; kind: "tool"; tool: SubTool };
 
@@ -60,6 +62,10 @@ export type SubNode = {
   summary?: string;
   role?: string;
   activity?: string;
+  /** party / talk = dialogue cast; task = parallel workers. */
+  kind?: "party" | "talk" | "task";
+  /** Parent agent id so nested helpers never become a new peer. */
+  parent_id?: string;
   transcript: SubTranscriptItem[];
   children?: SubNode[];
 };
@@ -79,6 +85,10 @@ export type ChatMsg = {
   reasoningStreaming?: boolean;
   tool?: ToolCard;
   subagent?: SubNode;
+  /** Wave id so ask_user / next spawn is a new canvas, not the previous one. */
+  stage?: number;
+  /** Which agent produced this row — never mix two agents into one bubble. */
+  agent_id?: string;
   /** Uploaded files shown as chips in the bubble (not the full model payload). */
   attachments?: MsgAttachment[];
 };

@@ -21,7 +21,7 @@ from ...services.model_config import load_model_config, select_model_role, updat
 from ...services.local_auth import get_token
 from ...services.skills import load_skills
 from ...services.store import STORE
-from ...services.user_auth import auth_status
+from ...services.user_auth import auth_status, needs_setup
 from ...services.workspace_store import get_active_workspace
 from ..http import require_loopback
 from ..schemas import MemoryLibraryUpdate, McpTestBody, McpUpdateBody, MemoryUpdate, ModelSelect, ModelUpdate
@@ -55,6 +55,7 @@ def health() -> dict[str, Any]:
         "allow_shell": bool(getattr(s, "allow_shell", False)),
         "shell_sandbox": bool(getattr(s, "shell_sandbox", True)),
         "mcp_enabled": bool(getattr(s, "mcp_enabled", True)),
+        "auth_register": bool(needs_setup()),
     }
 
 
@@ -84,7 +85,10 @@ def api_mcp_get() -> dict[str, Any]:
 
 @router.put("/api/mcp")
 def api_mcp_put(body: McpUpdateBody) -> dict[str, Any]:
-    setup = update_mcp_config(body.model_dump())
+    try:
+        setup = update_mcp_config(body.model_dump())
+    except ValueError as exc:
+        raise HTTPException(400, str(exc)) from exc
     return {"status": "ok", **setup.public_dict()}
 
 

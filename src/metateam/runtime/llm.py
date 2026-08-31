@@ -4,7 +4,9 @@ from __future__ import annotations
 
 import json
 import re
-from typing import Any, Iterator, Optional
+import threading
+import time
+from typing import Any, Callable, Iterator, Optional
 
 from openai import OpenAI
 
@@ -48,6 +50,69 @@ def _retry_kwargs_for_exc(kwargs: dict[str, Any], exc: BaseException) -> dict[st
     return retry if changed else None
 
 
+def _stream_timeouts(settings: Any) -> tuple[float, float]:
+    idle = float(getattr(settings, "llm_idle_timeout", 0) or 0)
+    total = float(getattr(settings, "llm_stream_timeout", 0) or 0)
+    return max(0.0, idle), max(0.0, total)
+
+
+class StreamWatchdog:
+    """Close a hung provider stream when idle or over a hard duration."""
+
+    def __init__(
+        self,
+        close_fn: Callable[[], None],
+        *,
+        idle_sec: float,
+        max_sec: float,
+    ) -> None:
+        self._close = close_fn
+        self.idle_sec = max(0.0, float(idle_sec or 0))
+        self.max_sec = max(0.0, float(max_sec or 0))
+        now = time.monotonic()
+        self._last = now
+        self._start = now
+        self._stop = threading.Event()
+        self.reason = ""
+        self._thread: threading.Thread | None = None
+
+    def start(self) -> None:
+        if self.idle_sec <= 0 and self.max_sec <= 0:
+            return
+        self._thread = threading.Thread(
+            target=self._run, name="llm-stall-watch", daemon=True
+        )
+        self._thread.start()
+
+    def bump(self) -> None:
+        self._last = time.monotonic()
+
+    def stop(self) -> None:
+        self._stop.set()
+        t = self._thread
+        if t is not None and t.is_alive() and threading.current_thread() is not t:
+            t.join(timeout=1.0)
+
+    def _fire(self, reason: str) -> None:
+        if self.reason or self._stop.is_set():
+            return
+        self.reason = reason
+        try:
+            self._close()
+        except Exception:
+            pass
+
+    def _run(self) -> None:
+        while not self._stop.wait(0.4):
+            now = time.monotonic()
+            if self.idle_sec > 0 and now - self._last >= self.idle_sec:
+                self._fire("idle")
+                return
+            if self.max_sec > 0 and now - self._start >= self.max_sec:
+                self._fire("max")
+                return
+
+
 class LLM:
     def __init__(
         self,
@@ -56,9 +121,13 @@ class LLM:
         *,
         api_key: Optional[str] = None,
         base_url: Optional[str] = None,
+        max_tokens: Optional[int] = None,
     ):
         self.settings = settings
         self.model = model or settings.model
+        self.max_tokens = int(
+            max_tokens if max_tokens is not None else getattr(settings, "max_tokens", 0) or 0
+        )
         key = (api_key if api_key is not None else settings.api_key) or ""
         url = (base_url if base_url is not None else settings.base_url) or settings.base_url
         self.demo = settings.demo_mode and not key.strip()
@@ -107,6 +176,10 @@ class LLM:
             # Do not send tool_choice="auto": vLLM 400s unless the server was
             # started with --enable-auto-tool-choice --tool-call-parser.
 
+        mt = int(getattr(self, "max_tokens", 0) or getattr(self.settings, "max_tokens", 0) or 0)
+        if mt > 0:
+            kwargs["max_tokens"] = mt
+
         # DeepSeek / reasoning models
         effort = getattr(self.settings, "reasoning_effort", None)
         if effort:
@@ -122,6 +195,9 @@ class LLM:
     def _create(self, kwargs: dict[str, Any]) -> Any:
         assert self.client is not None
         pending = dict(kwargs)
+        _, stream_cap = _stream_timeouts(self.settings)
+        if stream_cap > 0 and "timeout" not in pending:
+            pending["timeout"] = stream_cap
         last: BaseException | None = None
         for _ in range(4):
             try:
@@ -130,6 +206,7 @@ class LLM:
                 last = exc
                 pending.pop("reasoning_effort", None)
                 pending.pop("stream_options", None)
+                pending.pop("timeout", None)
                 continue
             except Exception as exc:
                 last = exc
@@ -215,9 +292,15 @@ class LLM:
         xml_tools = XmlToolStream()
         # Stateful splitter for <think>…</think> embedded in content stream
         tag_split = ThinkTagSplitter()
+        idle_sec, max_sec = _stream_timeouts(self.settings)
+        watch = StreamWatchdog(
+            self.close_active_stream, idle_sec=idle_sec, max_sec=max_sec
+        )
+        watch.start()
 
         try:
             for chunk in stream:
+                watch.bump()
                 if callable(cancel_check) and cancel_check():
                     cancelled = True
                     break
@@ -284,7 +367,14 @@ class LLM:
                                 "arguments": slot.get("arguments") or "",
                             },
                         )
+        except Exception:
+            if not watch.reason and not cancelled and not (
+                callable(cancel_check) and cancel_check()
+            ):
+                watch.stop()
+                raise
         finally:
+            watch.stop()
             if self._active_stream is stream:
                 self._active_stream = None
             for closer in (
@@ -332,7 +422,16 @@ class LLM:
                 for i in sorted(tool_acc)
                 if tool_acc[i].get("name")
             ]
-        yield ("done", merge_text_tool_calls(out))
+        if watch.reason and not cancelled:
+            yield (
+                "stalled",
+                {
+                    "reason": watch.reason,
+                    "idle_sec": idle_sec,
+                    "max_sec": max_sec,
+                },
+            )
+        yield ("done", merge_text_tool_calls(out, id_prefix=xml_tools.prefix))
 
     def stream_text(
         self,
@@ -443,6 +542,72 @@ def extract_message_text(msg: Any) -> str:
     return ""
 
 
+_PARTIAL_ARG_KEYS = (
+    "goal",
+    "task",
+    "context",
+    "role",
+    "topic",
+    "query",
+    "prompt",
+    "description",
+    "path",
+    "command",
+    "content",
+    "old_string",
+    "new_string",
+    "offset",
+    "limit",
+    "pattern",
+)
+
+
+def _unescape_json_fragment(text: str) -> str:
+    return (
+        (text or "")
+        .replace("\\n", "\n")
+        .replace("\\t", "\t")
+        .replace('\\"', '"')
+        .replace("\\\\", "\\")
+    )
+
+
+def _loads_partial_object(raw: str) -> dict[str, Any] | None:
+    text = (raw or "").strip()
+    if not text:
+        return None
+    if not text.startswith("{"):
+        found = re.search(r"\{.*", text, re.DOTALL)
+        text = found.group(0) if found else text
+    for extra in ("", "}", '"}', '"]}', '"]} }', '"}]}'):
+        try:
+            data = json.loads(text + extra)
+            if isinstance(data, dict):
+                return data
+        except json.JSONDecodeError:
+            continue
+    return None
+
+
+def _salvage_tool_args(raw: str) -> dict[str, Any]:
+    repaired = _loads_partial_object(raw)
+    if repaired:
+        return repaired
+    out: dict[str, Any] = {}
+    for key in _PARTIAL_ARG_KEYS:
+        closed = re.search(
+            rf'"{key}"\s*:\s*"((?:\\.|[^"\\])*)"',
+            raw or "",
+        )
+        if closed:
+            out[key] = _unescape_json_fragment(closed.group(1))
+            continue
+        opened = re.search(rf'"{key}"\s*:\s*"(.*)$', raw or "", re.DOTALL)
+        if opened:
+            out[key] = _unescape_json_fragment(opened.group(1).rstrip('"'))
+    return out if out else {"_raw": raw}
+
+
 def parse_tool_args(raw: str) -> dict[str, Any]:
     try:
         data = json.loads(raw or "{}")
@@ -456,7 +621,7 @@ def parse_tool_args(raw: str) -> dict[str, Any]:
                     return data
             except json.JSONDecodeError:
                 pass
-        return {"_raw": raw}
+        return _salvage_tool_args(raw or "")
 
 
 def _strip_for_api(messages: list[dict[str, Any]]) -> list[dict[str, Any]]:

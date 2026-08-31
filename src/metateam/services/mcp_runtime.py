@@ -62,6 +62,15 @@ async def _open_session(server: McpServerConfig) -> AsyncIterator[Any]:
     from mcp import ClientSession
 
     transport = server.normalized_transport()
+    if transport in ("http", "sse"):
+        from ..core.netguard import blocked_http_reason
+
+        reason = blocked_http_reason(server.url, allow_loopback=False)
+        if reason:
+            raise ValueError(
+                f"MCP remote URL blocked ({reason}); use stdio for local servers"
+            )
+
     if transport == "stdio":
         from mcp import StdioServerParameters
         from mcp.client.stdio import stdio_client

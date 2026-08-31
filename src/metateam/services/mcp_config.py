@@ -1,6 +1,6 @@
 """Per-tenant MCP server configuration (stdio + remote http/sse).
 
-mcp.json shapes:
+MCP server JSON shapes:
 - Local:  { command, args, env }
 - Remote: { type: http|sse, url, headers }
 """
@@ -13,6 +13,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Optional
 
+from ..core.netguard import blocked_http_reason
 from .tenant_context import tenant_mcp_path
 
 _ID_RE = re.compile(r"[^a-zA-Z0-9_-]+")
@@ -182,6 +183,17 @@ def _merge_secret_map(
     return {k: v for k, v in merged.items() if k in keep or k not in previous}
 
 
+def _reject_private_remote(server: McpServerConfig) -> None:
+    if server.normalized_transport() not in ("http", "sse"):
+        return
+    reason = blocked_http_reason(server.url, allow_loopback=False)
+    if reason:
+        raise ValueError(
+            f"MCP server {server.id or server.name}: remote URL blocked ({reason}). "
+            "Use stdio for local servers."
+        )
+
+
 def update_mcp_config(payload: dict[str, Any], user_id: Optional[str] = None) -> McpSetup:
     setup = _parse(payload if isinstance(payload, dict) else {})
     prev = {s.id: s for s in load_mcp_config(user_id).servers}
@@ -191,5 +203,7 @@ def update_mcp_config(payload: dict[str, Any], user_id: Optional[str] = None) ->
             continue
         s.env = _merge_secret_map(s.env, old.env)
         s.headers = _merge_secret_map(s.headers, old.headers)
+    for s in setup.servers:
+        _reject_private_remote(s)
     save_mcp_config(setup, user_id)
     return setup

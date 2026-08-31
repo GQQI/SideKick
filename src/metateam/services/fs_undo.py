@@ -25,6 +25,21 @@ _ctx_session_id: contextvars.ContextVar[Optional[str]] = contextvars.ContextVar(
 _ctx_user_turn: contextvars.ContextVar[Optional[int]] = contextvars.ContextVar(
     "fs_undo_user_turn", default=None
 )
+_ctx_actor: contextvars.ContextVar[Optional[str]] = contextvars.ContextVar(
+    "fs_undo_actor", default=None
+)
+_ctx_actor_label: contextvars.ContextVar[Optional[str]] = contextvars.ContextVar(
+    "fs_undo_actor_label", default=None
+)
+_ctx_why: contextvars.ContextVar[Optional[str]] = contextvars.ContextVar(
+    "fs_undo_why", default=None
+)
+_ctx_tool: contextvars.ContextVar[Optional[str]] = contextvars.ContextVar(
+    "fs_undo_tool", default=None
+)
+_ctx_call_id: contextvars.ContextVar[Optional[str]] = contextvars.ContextVar(
+    "fs_undo_call_id", default=None
+)
 
 
 def set_turn_context(session_id: Optional[str], user_turn: Optional[int]) -> None:
@@ -32,9 +47,30 @@ def set_turn_context(session_id: Optional[str], user_turn: Optional[int]) -> Non
     _ctx_user_turn.set(user_turn)
 
 
+def set_mutation_meta(
+    *,
+    actor: Optional[str] = None,
+    actor_label: Optional[str] = None,
+    why: Optional[str] = None,
+    tool: Optional[str] = None,
+    call_id: Optional[str] = None,
+) -> None:
+    """Who/why for the next FS mutation (main vs sub-agent tool call)."""
+    _ctx_actor.set(actor)
+    _ctx_actor_label.set(actor_label)
+    _ctx_why.set(why)
+    _ctx_tool.set(tool)
+    _ctx_call_id.set(call_id)
+
+
+def clear_mutation_meta() -> None:
+    set_mutation_meta()
+
+
 def clear_turn_context() -> None:
     _ctx_session_id.set(None)
     _ctx_user_turn.set(None)
+    clear_mutation_meta()
 
 
 def _stamp_turn(record: dict[str, Any]) -> dict[str, Any]:
@@ -46,6 +82,17 @@ def _stamp_turn(record: dict[str, Any]) -> dict[str, Any]:
         turn = _ctx_user_turn.get()
         if turn is not None:
             record["user_turn"] = turn
+    for key, var in (
+        ("actor", _ctx_actor),
+        ("actor_label", _ctx_actor_label),
+        ("why", _ctx_why),
+        ("tool", _ctx_tool),
+        ("call_id", _ctx_call_id),
+    ):
+        if not record.get(key):
+            val = var.get()
+            if val:
+                record[key] = val
     return record
 
 
@@ -717,7 +764,50 @@ def _status_item(rec: dict[str, Any]) -> dict[str, Any]:
         "user_turn": rec.get("user_turn"),
         "user_text": rec.get("user_text") or "",
         "files": [],
+        "file_entries": [],
+        "actors": [],
     }
+
+
+def _record_paths(rec: dict[str, Any]) -> set[str]:
+    out: set[str] = set()
+    for key in ("path", "from", "to"):
+        path = str(rec.get(key) or "").replace("\\", "/").strip()
+        if path:
+            out.add(path)
+    return out
+
+
+def _file_entry(rec: dict[str, Any], fallback: str = "") -> dict[str, Any]:
+    path = str(rec.get("path") or rec.get("to") or rec.get("from") or fallback or "")
+    path = path.replace("\\", "/").strip()
+    return {
+        "path": path,
+        "op": rec.get("op"),
+        "id": rec.get("id"),
+        "actor": rec.get("actor") or "",
+        "actor_label": rec.get("actor_label") or "",
+        "why": rec.get("why") or rec.get("label") or "",
+        "tool": rec.get("tool") or "",
+        "call_id": rec.get("call_id") or "",
+        "label": rec.get("label") or "",
+    }
+
+
+def _attach_file(item: dict[str, Any], rec: dict[str, Any], fallback: str = "") -> None:
+    entry = _file_entry(rec, fallback)
+    if not entry["path"] and fallback:
+        entry["path"] = fallback
+    item.setdefault("file_entries", []).append(entry)
+    path = entry["path"]
+    files = item.setdefault("files", [])
+    if path and path not in files:
+        files.append(path)
+    actor = str(entry.get("actor") or "").strip()
+    if actor:
+        actors = item.setdefault("actors", [])
+        if actor not in actors:
+            actors.append(actor)
 
 
 def status(
@@ -740,15 +830,63 @@ def status(
         ).strip()
         label = str(rec.get("label") or rec.get("op") or path)
         if open_idx is not None:
-            files = grouped[open_idx].setdefault("files", [])
-            files.append(path or label)
+            _attach_file(grouped[open_idx], rec, path or label)
             continue
         item = _status_item(rec)
-        if path:
-            item["files"] = [path]
+        _attach_file(item, rec, path or label)
         grouped.append(item)
     items = list(reversed(grouped))
     return {"count": len(items), "items": items[:MAX_UNDO]}
+
+
+def turn_user_text(
+    session_id: str,
+    user_turn: int,
+    workspace: Optional[Path] = None,
+) -> str:
+    """Prompt text stored on this session's checkpoint for ``user_turn``."""
+    with _lock:
+        stack = _load_stack(workspace)
+    recs = _session_records(stack, session_id)
+    for rec in recs:
+        if (
+            rec.get("op") == "checkpoint"
+            and rec.get("session_id") == session_id
+            and rec.get("user_turn") == user_turn
+        ):
+            return str(rec.get("user_text") or "")
+    return ""
+
+
+def undo_file(
+    path: str,
+    *,
+    session_id: Optional[str] = None,
+    user_turn: Optional[int] = None,
+    workspace: Optional[Path] = None,
+) -> dict[str, Any]:
+    """Revert one path in this conversation (this turn and any later writes)."""
+    target = str(path or "").replace("\\", "/").strip().lstrip("/")
+    if not target:
+        raise ValueError("missing path")
+    with _lock:
+        stack = _load_stack(workspace)
+    recs = _session_records(stack, session_id) if session_id else list(stack)
+    ids: list[str] = []
+    for rec in reversed(recs):
+        if rec.get("op") == "checkpoint":
+            continue
+        if target not in _record_paths(rec):
+            continue
+        turn = rec.get("user_turn")
+        if user_turn is not None and turn is not None and int(turn) < int(user_turn):
+            continue
+        rid = str(rec.get("id") or "")
+        if rid:
+            ids.append(rid)
+    if not ids:
+        raise ValueError(f"no undo records for {target}")
+    return _undo_ids(ids, workspace)
 
 
 def undo_to_turn(

@@ -38,6 +38,7 @@ export type ActivitySidebarProps = {
   onPickDomElement: (el: DomElementPayload) => void;
   browserOpenRequest?: BrowserOpenRequest | null;
   onWorkspaceMutated?: () => void;
+  onReplayTurn?: (userTurn: number, userText: string) => void;
   mainView?: "chat" | "memory";
   onOpenMemory?: () => void;
   onOpenChat?: () => void;
@@ -69,6 +70,7 @@ export function ActivitySidebar({
   onPickDomElement,
   browserOpenRequest,
   onWorkspaceMutated,
+  onReplayTurn,
   mainView = "chat",
   onOpenMemory,
   onOpenChat,
@@ -250,6 +252,7 @@ export function ActivitySidebar({
                 refreshKey={fsRefresh}
                 sessionId={sessionId}
                 onRestored={onWorkspaceMutated}
+                onReplay={onReplayTurn}
               />
             </div>
           ) : (

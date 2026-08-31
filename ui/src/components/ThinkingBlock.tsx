@@ -1,4 +1,4 @@
-import { useState } from "react";
+import { useEffect, useState } from "react";
 import { usePrefs } from "../prefs";
 import { MarkdownView } from "./MarkdownView";
 
@@ -7,10 +7,13 @@ type Props = {
   streaming?: boolean;
 };
 
-/** Collapsed-by-default thinking / reasoning block. */
+/** Thinking / reasoning block — open while streaming so it is visible immediately. */
 export function ThinkingBlock({ content, streaming }: Props) {
   const { t } = usePrefs();
-  const [open, setOpen] = useState(false);
+  const [open, setOpen] = useState(Boolean(streaming));
+  useEffect(() => {
+    if (streaming) setOpen(true);
+  }, [streaming]);
   if (!content && !streaming) return null;
   return (
     <div className={`thinking-block${streaming ? " streaming" : ""}${open ? " open" : ""}`}>

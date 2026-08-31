@@ -64,3 +64,32 @@ def test_memory_roundtrip_tenant_scoped(client: TestClient) -> None:
         client.put("/api/memory", json={"content": before or "# MEMORY\n"})
     finally:
         reset_user()
+
+
+def test_register_forbidden_after_setup(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr("metateam.api.middleware.peer_is_loopback", lambda host: True)
+    monkeypatch.setattr("metateam.api.routes.auth.needs_setup", lambda: False)
+    client = TestClient(app)
+    r = client.post(
+        "/api/auth/register",
+        json={"username": "newuser", "email": "new@example.com", "password": "secret1"},
+    )
+    assert r.status_code == 403
+
+
+def test_create_user_requires_header_token(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr("metateam.api.middleware.peer_is_loopback", lambda host: True)
+    monkeypatch.setattr(
+        "metateam.api.middleware.resolve_token",
+        lambda token: ("default", "test") if token else None,
+    )
+    client = TestClient(app)
+    r = client.post(
+        "/api/auth/users",
+        json={"username": "newuser", "email": "new@example.com", "password": "secret1"},
+    )
+    assert r.status_code == 401
+    denied = client.get("/api/sessions?token=leaked")
+    assert denied.status_code == 401
+    ok = client.get("/api/sessions", headers={"X-Sidekick-Token": "ok"})
+    assert ok.status_code == 200

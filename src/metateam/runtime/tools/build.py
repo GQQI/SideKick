@@ -15,6 +15,7 @@ from .files import register_file_tools
 from .git import register_git_tools
 from .memory import register_memory_tools
 from .shell import register_shell_tools
+from .web import register_web_tools
 from .skills import register_skill_tools
 
 
@@ -27,6 +28,7 @@ def build_registry(
     ask_user_fn: Optional[Callable[..., str]] = None,
     talk_only: bool = False,
     end_party_session: Optional[Callable[[], None]] = None,
+    note_canvas_tasks: Optional[Callable[..., None]] = None,
 ) -> ToolRegistry:
     reg = ToolRegistry()
     if talk_only:
@@ -37,6 +39,7 @@ def build_registry(
         run_child=run_child if allow_delegate else None,
         ask_user_fn=ask_user_fn,
         end_party_session=end_party_session,
+        note_canvas_tasks=note_canvas_tasks,
     )
     register_file_tools(reg, ctx)
     register_codebase_tools(reg, ctx)
@@ -46,6 +49,7 @@ def build_registry(
     register_memory_tools(reg, ctx)
     register_ask_and_delegate(reg, ctx)
     register_browser_tools(reg, ctx)
+    register_web_tools(reg)
 
     if getattr(settings, "mcp_enabled", True):
         try:

@@ -191,6 +191,11 @@ def register_shell_tools(reg: ToolRegistry, ctx: ToolContext) -> None:
                 "New-Item -ItemType Directory -Force; curl.exe or Invoke-WebRequest; "
                 "use ';' or separate calls instead of bash '&&' / 'mkdir -p'."
             )
+        else:
+            _shell_desc += (
+                " On Linux / 麒麟 use POSIX/bash (mkdir -p, curl, python3). "
+                "Do not use PowerShell or Windows drive letters."
+            )
         reg.register(
             Tool(
                 "run_shell",

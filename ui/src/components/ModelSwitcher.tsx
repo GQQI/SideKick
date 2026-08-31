@@ -11,6 +11,7 @@ type Props = {
   onSelect: (role: ModelRole, providerId: string, modelId: string) => void;
   onOpenSettings: () => void;
   t: (key: MsgKey, ...args: string[]) => string;
+  saving?: boolean;
 };
 
 export function ModelSwitcher({
@@ -21,6 +22,7 @@ export function ModelSwitcher({
   onSelect,
   onOpenSettings,
   t,
+  saving = false,
 }: Props) {
   const [open, setOpen] = useState(false);
   const rootRef = useRef<HTMLDivElement>(null);
@@ -97,6 +99,7 @@ export function ModelSwitcher({
                       type="button"
                       role="menuitem"
                       className={`model-switcher-item${activeKey === o.key ? " active" : ""}`}
+                      disabled={saving}
                       onClick={() => {
                         onSelect(role, o.provider_id, o.model_id);
                         setOpen(false);

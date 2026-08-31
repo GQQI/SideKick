@@ -46,6 +46,13 @@ if not os.getenv("PLAYWRIGHT_BROWSERS_PATH"):
     _bundled_pw = REPO_ROOT / "ms-playwright"
     if _bundled_pw.is_dir():
         os.environ["PLAYWRIGHT_BROWSERS_PATH"] = str(_bundled_pw)
+# Default China-friendly Chromium CDN (official azureedge often hangs with no logs).
+if not os.getenv("PLAYWRIGHT_DOWNLOAD_HOST"):
+    os.environ["PLAYWRIGHT_DOWNLOAD_HOST"] = "https://npmmirror.com/mirrors/playwright"
+if not os.getenv("PIP_INDEX_URL"):
+    os.environ["PIP_INDEX_URL"] = "https://pypi.tuna.tsinghua.edu.cn/simple"
+if not os.getenv("PIP_TRUSTED_HOST"):
+    os.environ["PIP_TRUSTED_HOST"] = "pypi.tuna.tsinghua.edu.cn"
 
 
 def infer_context_limit(model: str) -> int:
@@ -60,6 +67,8 @@ def infer_context_limit(model: str) -> int:
         ("claude", 200_000),
         ("gemini-2", 1_048_576),
         ("gemini-1.5", 1_048_576),
+        ("minimax-m3", 1_000_000),
+        ("minimax", 204_800),
         ("deepseek", 64_000),
         ("qwen-plus", 131_072),
         ("qwen-max", 32_768),
@@ -121,10 +130,20 @@ class Settings:
     compress_trigger_ratio: float = float(os.getenv("META_COMPRESS_RATIO", "0.72"))
     max_compress_attempts: int = int(os.getenv("META_COMPRESS_ATTEMPTS", "3"))
 
+    # 0 = 40% of main context_limit, capped. Each child uses this budget, not the parent's.
+    subagent_context_limit: int = int(os.getenv("META_SUB_CONTEXT_LIMIT", "0") or "0")
+
     max_iterations: int = int(os.getenv("META_MAX_ITERS", "48"))
     subagent_max_iterations: int = int(os.getenv("META_SUB_MAX_ITERS", "28"))
     max_concurrent_children: int = int(os.getenv("META_MAX_CHILDREN", "3"))
     max_spawn_depth: int = int(os.getenv("META_MAX_SPAWN_DEPTH", "2"))
+    # No stream token for this many seconds → interrupt this LLM call and continue.
+    llm_idle_timeout: int = int(os.getenv("META_LLM_IDLE_TIMEOUT", "75"))
+    # Hard cap for one streamed completion (endless thinking).
+    llm_stream_timeout: int = int(os.getenv("META_LLM_STREAM_TIMEOUT", "180"))
+    # 0 disables the wall-clock cut-off; a child should return its own result
+    # instead of being discarded while it is still reasoning.
+    subagent_timeout: int = int(os.getenv("META_SUBAGENT_TIMEOUT", "0"))
 
     same_call_fail_limit: int = int(os.getenv("META_SAME_CALL_FAIL", "4"))
     tool_result_cap: int = int(os.getenv("META_TOOL_RESULT_CAP", "18000"))
@@ -151,10 +170,15 @@ class Settings:
     host: str = field(default_factory=lambda: os.getenv("META_HOST", "127.0.0.1"))
     port: int = int(os.getenv("META_PORT", "8787"))
 
-    provider: str = "deepseek"
+    provider: str = ""
     reasoning_effort: str = "medium"
     thinking_enabled: bool = True
     temperature: float = 0.2
+    max_tokens: int = 0
+    # Larger budget so delegate_task/subagent tool args & final summaries don't
+    # get cut mid-JSON (was 0 → provider default, too small for structured calls).
+    subagent_max_tokens: int = int(os.getenv("META_SUB_MAX_TOKENS", "8192") or "8192")
+    compress_max_tokens: int = 0
     main_endpoint: Any = None
     subagent_endpoint: Any = None
     compress_endpoint: Any = None

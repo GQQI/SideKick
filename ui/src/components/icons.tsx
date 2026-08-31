@@ -210,6 +210,16 @@ export function IconUndo(p: IconProps) {
   );
 }
 
+export function IconReplay(p: IconProps) {
+  return (
+    <svg {...base(p)}>
+      <path d="M3 12a9 9 0 1 0 3-6.7" {...stroke} />
+      <path d="M3 4v5h5" {...stroke} />
+      <path d="M10 8.5v7l6-3.5-6-3.5Z" {...stroke} />
+    </svg>
+  );
+}
+
 export function IconExternal(p: IconProps) {
   return (
     <svg {...base(p)}>

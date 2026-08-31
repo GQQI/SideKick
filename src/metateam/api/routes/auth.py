@@ -14,6 +14,7 @@ from ...services.user_auth import (
     list_users,
     login as user_login,
     multi_user_enabled,
+    needs_setup,
     revoke_token,
     setup_admin,
 )
@@ -38,6 +39,25 @@ def api_auth_status(request: Request) -> dict[str, Any]:
 @router.post("/setup")
 def api_auth_setup(body: AuthSetupBody, request: Request) -> dict[str, Any]:
     require_loopback(request)
+    try:
+        user, token = setup_admin(body.username, body.password, email=body.email)
+    except ValueError as exc:
+        raise HTTPException(400, str(exc)) from exc
+    STORE.refresh_settings(rebind_llm=True, rebind_workspace=True)
+    return {
+        "status": "ok",
+        "token": token,
+        "token_header": "X-Sidekick-Token",
+        "user": user.public(),
+    }
+
+
+@router.post("/register")
+def api_auth_register(body: AuthSetupBody, request: Request) -> dict[str, Any]:
+    """Create the first admin if none exist yet. Closed after setup."""
+    require_loopback(request)
+    if not needs_setup():
+        raise HTTPException(403, "registration closed; ask an existing user to add accounts")
     try:
         user, token = setup_admin(body.username, body.password, email=body.email)
     except ValueError as exc:

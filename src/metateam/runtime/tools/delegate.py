@@ -7,6 +7,7 @@ import json
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import Any, Optional
 
+from ...core.events import new_id
 from ..ask import normalize_option_labels
 from ..tool_registry import Tool, ToolRegistry
 from .context import ToolContext
@@ -81,39 +82,86 @@ def register_ask_and_delegate(reg: ToolRegistry, ctx: ToolContext) -> None:
             goal: str = "",
             context: str = "",
             role: str = "leaf",
-            tasks: Optional[list[dict[str, Any]]] = None,
+            tasks: Optional[list[Any]] = None,
+            task: str = "",
+            query: str = "",
+            prompt: str = "",
+            description: str = "",
         ) -> str:
             items: list[dict[str, Any]]
+            goal_s = str(goal or task or query or prompt or description or "").strip()
+            if isinstance(tasks, str) and tasks.strip():
+                tasks = [{"goal": tasks.strip()}]
             if tasks:
-                items = tasks
-            elif goal:
-                items = [{"goal": goal, "context": context, "role": role}]
+                items = []
+                for raw in tasks:
+                    if isinstance(raw, str) and raw.strip():
+                        items.append({"goal": raw.strip(), "context": context, "role": role})
+                        continue
+                    if not isinstance(raw, dict):
+                        continue
+                    g = str(
+                        raw.get("goal")
+                        or raw.get("task")
+                        or raw.get("query")
+                        or raw.get("prompt")
+                        or raw.get("description")
+                        or ""
+                    ).strip()
+                    if not g:
+                        continue
+                    items.append(
+                        {
+                            "goal": g,
+                            "context": str(raw.get("context") or context or "").strip(),
+                            "role": str(raw.get("role") or role or "leaf"),
+                        }
+                    )
+            elif goal_s:
+                items = [{"goal": goal_s, "context": context, "role": role}]
             else:
                 return "ERROR: provide goal or tasks[]"
+            if not items:
+                return "ERROR: provide goal or tasks[]"
 
-            if len(items) > settings.max_concurrent_children:
-                return (
-                    f"ERROR: max {settings.max_concurrent_children} children; got {len(items)}"
-                )
+            # No hard reject on task count — extra workers queue on the
+            # thread pool (max_concurrent_children is concurrency, not a cap).
+            workers = max(1, int(settings.max_concurrent_children or 3))
+            planned: list[dict[str, Any]] = []
+            for it in items:
+                row = dict(it)
+                row["child_id"] = str(row.get("child_id") or "").strip() or new_id("agent")
+                planned.append(row)
+            note = ctx.note_canvas_tasks
+            if note is not None:
+                try:
+                    note(planned)
+                except Exception:
+                    pass
 
-            results: list[str | None] = [None] * len(items)
+            results: list[str | None] = [None] * len(planned)
 
             def _one(idx: int, item: dict[str, Any]) -> tuple[int, str]:
                 g = str(item.get("goal") or "").strip()
-                ctx = str(item.get("context") or "").strip()
+                child_ctx = str(item.get("context") or "").strip()
                 r = str(item.get("role") or role or "leaf")
                 if not g:
                     return idx, "ERROR: empty goal"
                 try:
-                    summary = run_child(goal=g, context=ctx, role=r)
+                    summary = run_child(
+                        goal=g,
+                        context=child_ctx,
+                        role=r,
+                        child_id=str(item.get("child_id") or ""),
+                    )
                 except Exception as exc:  # noqa: BLE001
                     summary = f"ERROR: child failed: {exc}"
                 return idx, summary
 
-            with ThreadPoolExecutor(max_workers=settings.max_concurrent_children) as pool:
+            with ThreadPoolExecutor(max_workers=workers) as pool:
                 futs = [
                     pool.submit(contextvars.copy_context().run, _one, i, it)
-                    for i, it in enumerate(items)
+                    for i, it in enumerate(planned)
                 ]
                 for fut in as_completed(futs):
                     i, summary = fut.result()
@@ -122,10 +170,10 @@ def register_ask_and_delegate(reg: ToolRegistry, ctx: ToolContext) -> None:
             payload = [
                 {
                     "index": i,
-                    "goal": items[i].get("goal"),
+                    "goal": planned[i].get("goal"),
                     "summary": results[i],
                 }
-                for i in range(len(items))
+                for i in range(len(planned))
             ]
             return json.dumps(payload, ensure_ascii=False, indent=2)
 
@@ -197,7 +245,13 @@ def register_ask_and_delegate(reg: ToolRegistry, ctx: ToolContext) -> None:
                     "required": [],
                 },
                 delegate_task,
-                parallel_safe=False,
+                # Safe to run multiple delegate_task calls concurrently: each
+                # spawns an isolated child agent, and shared parent bookkeeping
+                # (children list / canvas index) is protected by Agent._child_lock.
+                # This matters because some models emit N separate delegate_task
+                # calls (one per worker) instead of a single tasks=[...] call —
+                # without this, those N calls would run strictly one-at-a-time.
+                parallel_safe=True,
             )
         )
         reg.register(

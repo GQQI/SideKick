@@ -5,6 +5,8 @@ from __future__ import annotations
 import json
 import threading
 import time
+from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import TimeoutError as FuturesTimeout
 from dataclasses import dataclass, field
 from typing import Any, Callable, Optional
 
@@ -41,6 +43,7 @@ from .plan import (
     format_plan_markdown,
     generate_plan,
     goal_ready_to_plan,
+    is_multi_agent_request,
     needs_plan,
     snapshot_plan_tasks,
 )
@@ -53,7 +56,12 @@ from .tools import ToolRegistry, build_registry
 PrintFn = Callable[[str], None]
 
 
-def _subagent_snapshot_item(child: Agent, party: str = "") -> dict[str, Any]:
+def _subagent_snapshot_item(
+    child: Agent,
+    party: str = "",
+    *,
+    turn: int = 0,
+) -> dict[str, Any]:
     kind = "party" if child.full_agent else ("talk" if child.talk_only else "task")
     label = party or (child.goal or "").strip().split("\n")[0][:80]
     transcript: list[dict[str, Any]] = []
@@ -61,8 +69,24 @@ def _subagent_snapshot_item(child: Agent, party: str = "") -> dict[str, Any]:
         role = m.get("role")
         if role == "assistant":
             text = str(m.get("content") or "").strip()
-            if text:
-                transcript.append({"kind": "assistant", "text": text})
+            reasoning = str(m.get("reasoning") or "").strip()
+            try:
+                from .text_tool_calls import extract_text_tool_calls
+
+                text, xml_calls = extract_text_tool_calls(text)
+            except Exception:
+                xml_calls = []
+            if text or reasoning:
+                item: dict[str, Any] = {"kind": "assistant", "text": text}
+                if reasoning:
+                    item["reasoning"] = reasoning
+                transcript.append(item)
+            if not m.get("tool_calls"):
+                for tc in xml_calls:
+                    fn = tc.get("function") if isinstance(tc.get("function"), dict) else {}
+                    name = str((fn or {}).get("name") or "").strip()
+                    if name:
+                        transcript.append({"kind": "tool", "name": name, "result": ""})
         elif role == "tool":
             transcript.append(
                 {
@@ -79,8 +103,10 @@ def _subagent_snapshot_item(child: Agent, party: str = "") -> dict[str, Any]:
         "party": party,
         "label": label,
         "parent_id": child.parent_id,
+        "turn": turn,
         "replay": True,
         "transcript": transcript[-30:],
+        "status": "running",
         "activity": "运行中…",
         "message": f"resume {child.role}: {label}",
     }
@@ -95,6 +121,13 @@ class AgentResult:
     agent_id: str = ""
     review: dict[str, Any] = field(default_factory=dict)
     cancelled: bool = False
+
+
+_STALL_NUDGE = (
+    "Your previous generation stalled (no progress). "
+    "Continue the task now: call a tool or give a concise answer. "
+    "Do not restart a long silent thinking pass."
+)
 
 
 class Agent(AgentHistoryMixin, AgentExecuteMixin, AgentGroundingMixin):
@@ -121,6 +154,8 @@ class Agent(AgentHistoryMixin, AgentExecuteMixin, AgentGroundingMixin):
     ):
         self.settings = (settings or get_settings()).clone()
         self.is_subagent = is_subagent
+        if is_subagent:
+            self._apply_subagent_context_budget()
         self.talk_only = bool(talk_only)
         self.full_agent = bool(full_agent) and not self.talk_only
         self.role = role if role in ("leaf", "orchestrator") else "leaf"
@@ -134,24 +169,33 @@ class Agent(AgentHistoryMixin, AgentExecuteMixin, AgentGroundingMixin):
         self.on_event = on_event
         self.turn_counter = turn_counter
         self.guard = Guardrails(same_call_fail_limit=self.settings.same_call_fail_limit)
+        if is_subagent:
+            # Research / paper-reading children legitimately open many files.
+            self.guard.max_explore_streak = max(self.guard.max_explore_streak, 64)
         self._cancel = threading.Event()
+        self._abandoned = False
         self.approval = approval or ApprovalGate()
         self.ask = ask or AskGate()
         self.plan_gate = plan_gate or PlanGate()
         self._children: list[Agent] = []
         self._party_agents: dict[str, Agent] = {}
+        self._canvas_index: dict[str, dict[str, Any]] = {}
+        self._canvas_turn = 0
+        self._child_lock = threading.Lock()
         self._allow_mutating_tools = not self.talk_only
 
         self.skills: list[Skill] = [] if self.talk_only else load_skills(self.settings.skills_dir)
+        llm_cap = int(getattr(self.settings, "max_tokens", 0) or 0) or None
         if is_subagent:
             self.llm = LLM(
                 self.settings,
                 model=self.settings.subagent_model,
                 api_key=getattr(self.settings, "subagent_api_key", None) or self.settings.api_key,
                 base_url=getattr(self.settings, "subagent_base_url", None) or self.settings.base_url,
+                max_tokens=llm_cap,
             )
         else:
-            self.llm = LLM(self.settings, model=self.settings.model)
+            self.llm = LLM(self.settings, model=self.settings.model, max_tokens=llm_cap)
         self.compress_llm = LLM(
             self.settings,
             model=self.settings.compress_model,
@@ -159,17 +203,18 @@ class Agent(AgentHistoryMixin, AgentExecuteMixin, AgentGroundingMixin):
             base_url=getattr(self.settings, "compress_base_url", None) or self.settings.base_url,
         )
 
-        can_delegate = (not self.talk_only) and (
-            (not is_subagent) or (depth < self.settings.max_spawn_depth)
-        )
+        # Teams are intentionally one level deep: workers execute scoped work
+        # and report to the lead; they never create invisible grandchild teams.
+        can_delegate = (not self.talk_only) and not is_subagent
         self.registry: ToolRegistry = build_registry(
             self.settings,
             skills=self.skills,
             allow_delegate=can_delegate,
             run_child=self._run_child if can_delegate else None,
-            ask_user_fn=None if self.talk_only else self._ask_user,
+            ask_user_fn=None if self.talk_only or (is_subagent and not self.full_agent) else self._ask_user,
             talk_only=self.talk_only,
             end_party_session=self._end_party_session if can_delegate else None,
+            note_canvas_tasks=self._note_canvas_tasks if can_delegate else None,
         )
         # Sticky facts from tools (list_dir / codebase_*) so later turns don't invent paths.
         self.workspace_facts: list[str] = []
@@ -197,23 +242,53 @@ class Agent(AgentHistoryMixin, AgentExecuteMixin, AgentGroundingMixin):
         if (not is_subagent) or self.full_agent:
             self._refresh_workspace_grounding()
 
-    def request_cancel(self) -> None:
+    def _apply_subagent_context_budget(self) -> None:
+        """Each child gets its own smaller window so a long debate cannot exhaust max_tokens."""
+        s = self.settings
+        parent_limit = max(4000, int(s.context_limit or 48000))
+        explicit = int(getattr(s, "subagent_context_limit", 0) or 0)
+        child_limit = explicit if explicit > 0 else int(parent_limit * 0.4)
+        child_limit = max(8000, min(child_limit, 24000, parent_limit))
+        s.context_limit = child_limit
+        keep = int(s.keep_recent_tokens or 12000)
+        s.keep_recent_tokens = min(keep, max(3000, child_limit // 3))
+        ratio = float(s.compress_trigger_ratio or 0.72)
+        s.compress_trigger_ratio = min(ratio, 0.55)
+        cap = int(getattr(s, "tool_result_cap", 18000) or 18000)
+        s.tool_result_cap = min(cap, 12000)
+        parent_out = int(getattr(s, "max_tokens", 0) or 0)
+        explicit = int(getattr(s, "subagent_max_tokens", 0) or 0)
+        # 2048 used to cut tool JSON mid-stream → empty {} / truncated summaries.
+        if explicit > 0:
+            out_cap = explicit
+        elif parent_out > 0:
+            out_cap = parent_out
+        else:
+            out_cap = 8192
+        if hasattr(s, "max_tokens"):
+            s.max_tokens = out_cap
+        if hasattr(s, "subagent_max_tokens"):
+            s.subagent_max_tokens = out_cap
+
+    def stop_generation(self) -> None:
+        """Stop this agent tree's LLM streams without aborting parent asks/approvals."""
         self._cancel.set()
-        # Close in-flight provider stream ASAP (do not wait for next chunk)
         try:
             self.llm.close_active_stream()
         except Exception as exc:
             from ..core.logutil import get_logger, log_exception
 
             log_exception(get_logger("metateam.agent"), "close_active_stream failed", exc)
-        # Propagate to nested subagents
         for child in list(self._children):
             try:
-                child.request_cancel()
+                child.stop_generation()
             except Exception as exc:
                 from ..core.logutil import get_logger, log_exception
 
                 log_exception(get_logger("metateam.agent"), "child cancel failed", exc)
+
+    def request_cancel(self) -> None:
+        self.stop_generation()
         # Unblock any waiting approvals / asks / plan confirms as rejected
         self.approval.cancel_all()
         self.ask.cancel_all()
@@ -230,9 +305,47 @@ class Agent(AgentHistoryMixin, AgentExecuteMixin, AgentGroundingMixin):
             self.on_event(msg)
 
     def _emit(self, type_: str, data: Optional[dict[str, Any]] = None) -> None:
+        if self._abandoned:
+            return
         emit(self.bus, type_, data, agent_id=self.agent_id, parent_id=self.parent_id)
         if data and "message" in (data or {}):
             self._log(str(data["message"]))
+
+    def _wait_child_run(self, child: "Agent", user_text: str) -> AgentResult:
+        timeout = float(getattr(self.settings, "subagent_timeout", 0) or 0)
+        if timeout <= 0:
+            return child.run(user_text, do_review=False)
+        pool = ThreadPoolExecutor(max_workers=1)
+        fut = pool.submit(lambda: child.run(user_text, do_review=False))
+        try:
+            return fut.result(timeout=timeout)
+        except FuturesTimeout:
+            child.stop_generation()
+            try:
+                result = fut.result(timeout=12)
+                text = (result.text or "").strip() or (
+                    f"ERROR: subagent timed out after {int(timeout)}s "
+                    "(stuck thinking). Parent should continue with other results."
+                )
+                return AgentResult(
+                    text=text,
+                    messages=result.messages,
+                    iterations=result.iterations,
+                    cancelled=False,
+                    agent_id=child.agent_id,
+                )
+            except FuturesTimeout:
+                child._abandoned = True
+                return AgentResult(
+                    text=(
+                        f"ERROR: subagent timed out after {int(timeout)}s "
+                        "(stuck thinking). Parent should continue with other results."
+                    ),
+                    cancelled=False,
+                    agent_id=child.agent_id,
+                )
+        finally:
+            pool.shutdown(wait=False, cancel_futures=True)
 
     def _run_child(
         self,
@@ -242,6 +355,7 @@ class Agent(AgentHistoryMixin, AgentExecuteMixin, AgentGroundingMixin):
         role: str = "leaf",
         kind: str = "task",
         persist_key: str = "",
+        child_id: str = "",
     ) -> str:
         child_role = role if role in ("leaf", "orchestrator") else "leaf"
         next_depth = self.depth + 1
@@ -252,12 +366,13 @@ class Agent(AgentHistoryMixin, AgentExecuteMixin, AgentGroundingMixin):
         full_agent = kind_s in ("party", "full")
         key = (persist_key or "").strip()
         resumed = bool(key and key in self._party_agents)
+        preset_id = (child_id or "").strip()
 
         if resumed:
             child = self._party_agents[key]
             child_id = child.agent_id
         else:
-            child_id = new_id("agent")
+            child_id = preset_id or new_id("agent")
 
         event_kind = "party" if full_agent else ("talk" if talk_only else "task")
         label = key or (goal or context or "").strip().split("\n")[0][:80]
@@ -293,9 +408,13 @@ class Agent(AgentHistoryMixin, AgentExecuteMixin, AgentGroundingMixin):
                 talk_only=talk_only,
                 full_agent=full_agent,
             )
-            self._children.append(child)
-            if key:
-                self._party_agents[key] = child
+            with self._child_lock:
+                self._children.append(child)
+                if key:
+                    self._party_agents[key] = child
+        with self._child_lock:
+            self._remember_canvas_child(child, party=key)
+        self._emit_canvas_sync()
         if self.cancelled():
             child.request_cancel()
         if resumed or full_agent:
@@ -311,7 +430,7 @@ class Agent(AgentHistoryMixin, AgentExecuteMixin, AgentGroundingMixin):
         iterations = 0
         cancelled = False
         try:
-            result = child.run(user_text, do_review=False)
+            result = self._wait_child_run(child, user_text)
             result_text = result.text or "(empty summary)"
             iterations = result.iterations
             cancelled = bool(result.cancelled)
@@ -322,14 +441,21 @@ class Agent(AgentHistoryMixin, AgentExecuteMixin, AgentGroundingMixin):
             result_text = f"ERROR: child failed: {exc}"
             cancelled = True
         finally:
-            if not key:
-                self._children = [c for c in self._children if c is not child]
+            with self._child_lock:
+                self._ingest_canvas_subtree(
+                    child,
+                    party=key,
+                    status="error" if cancelled or str(result_text).startswith("ERROR") else "done",
+                )
+                if not key:
+                    self._children = [c for c in self._children if c is not child]
+            self._emit_canvas_sync()
             self._emit(
                 "subagent_end",
                 {
                     "child_id": child_id,
                     "goal": goal,
-                    "summary": (result_text or "")[:2000],
+                    "summary": (result_text or "")[:12000],
                     "iterations": iterations,
                     "cancelled": cancelled,
                     "message": f"done: {(goal or context)[:60]}",
@@ -338,9 +464,116 @@ class Agent(AgentHistoryMixin, AgentExecuteMixin, AgentGroundingMixin):
         return result_text
 
     def _end_party_session(self) -> None:
+        for name, child in list(self._party_agents.items()):
+            self._ingest_canvas_subtree(child, party=name)
         for child in list(self._party_agents.values()):
             self._children = [c for c in self._children if c is not child]
         self._party_agents.clear()
+        self._emit_canvas_sync()
+
+    def _note_canvas_tasks(self, items: list[Any] | None) -> None:
+        """Reserve a canvas slot for every queued worker, including those waiting on the pool."""
+        turn = int(getattr(self, "_canvas_turn", 0) or 0)
+        rows = items if isinstance(items, list) else []
+        with self._child_lock:
+            for raw in rows:
+                if not isinstance(raw, dict):
+                    continue
+                cid = str(raw.get("child_id") or "").strip()
+                goal = str(raw.get("goal") or "").strip()
+                if not cid or not goal:
+                    continue
+                prev = self._canvas_index.get(cid)
+                if isinstance(prev, dict) and str(prev.get("status") or "") in ("done", "error"):
+                    continue
+                label = goal.split("\n")[0][:80]
+                self._canvas_index[cid] = {
+                    "child_id": cid,
+                    "parent_id": self.agent_id,
+                    "goal": goal,
+                    "role": str(raw.get("role") or "leaf"),
+                    "kind": "task",
+                    "party": "",
+                    "label": label,
+                    "turn": turn,
+                    "replay": True,
+                    "transcript": list(prev.get("transcript") or []) if isinstance(prev, dict) else [],
+                    "status": "running",
+                    "activity": "排队中…",
+                    "message": f"queue leaf: {label}",
+                    "children": [],
+                }
+        self._emit_canvas_sync()
+
+    def _remember_canvas_child(self, child: Agent, party: str = "", *, status: str = "running") -> None:
+        item = _subagent_snapshot_item(
+            child,
+            party,
+            turn=int(getattr(self, "_canvas_turn", 0) or 0),
+        )
+        item["status"] = "error" if status == "error" else ("running" if status == "running" else "done")
+        item["activity"] = "运行中…" if item["status"] == "running" else ""
+        self._canvas_index[child.agent_id] = item
+
+    def _ingest_canvas_subtree(self, child: Agent, party: str = "", *, status: str = "done") -> None:
+        finished = "error" if str(status).startswith("error") else "done"
+        self._remember_canvas_child(child, party, status=finished)
+        kids = getattr(child, "_children", None)
+        if isinstance(kids, list):
+            for grand in list(kids):
+                self._ingest_canvas_subtree(grand, status=finished)
+        parties = getattr(child, "_party_agents", None)
+        if isinstance(parties, dict):
+            for name, grand in list(parties.items()):
+                self._ingest_canvas_subtree(grand, party=str(name), status=finished)
+
+    def _emit_canvas_sync(self) -> None:
+        """Push the full spawn forest so the live canvas matches persisted history."""
+        emit = getattr(self, "_emit", None)
+        if not callable(emit):
+            return
+        # Nested leaves update the parent index via ingest; only the lead
+        # (or a full party) owns the forest the UI should paint.
+        if bool(getattr(self, "is_subagent", False)) and not bool(
+            getattr(self, "full_agent", False)
+        ):
+            return
+        try:
+            emit(
+                "canvas_sync",
+                {
+                    "tree": self.canvas_tree(),
+                    "turn": int(getattr(self, "_canvas_turn", 0) or 0),
+                },
+            )
+        except Exception:
+            return
+
+    def canvas_tree(self) -> list[dict[str, Any]]:
+        """Durable forest of spawned agents (including finished nested helpers)."""
+        by_id: dict[str, dict[str, Any]] = {}
+        for item in self._canvas_index.values():
+            if not isinstance(item, dict):
+                continue
+            cid = str(item.get("child_id") or "").strip()
+            if not cid:
+                continue
+            by_id[cid] = {**item, "children": []}
+        for item in self.live_subagent_snapshot():
+            cid = str(item.get("child_id") or "").strip()
+            if cid:
+                prev = by_id.get(cid) or {}
+                kids = prev.get("children") or []
+                by_id[cid] = {**prev, **item, "children": kids}
+        roots: list[dict[str, Any]] = []
+        for item in by_id.values():
+            pid = str(item.get("parent_id") or "").strip()
+            parent = by_id.get(pid)
+            if parent is not None:
+                parent.setdefault("children", []).append(item)
+            else:
+                roots.append(item)
+        return roots
 
     def live_subagent_snapshot(self) -> list[dict[str, Any]]:
         """Running children (including nested) so a reattached UI can restore cards."""
@@ -367,7 +600,13 @@ class Agent(AgentHistoryMixin, AgentExecuteMixin, AgentGroundingMixin):
                 if child.agent_id in seen:
                     continue
                 seen.add(child.agent_id)
-                out.append(_subagent_snapshot_item(child, party))
+                out.append(
+                    _subagent_snapshot_item(
+                        child,
+                        party,
+                        turn=int(getattr(self, "_canvas_turn", 0) or 0),
+                    )
+                )
                 walk(child)
 
         walk(self)
@@ -488,8 +727,12 @@ class Agent(AgentHistoryMixin, AgentExecuteMixin, AgentGroundingMixin):
                 },
             )
 
-        # Reserve room for tools[] so compressed messages still fit with schemas
-        msg_limit = max(4000, limit - schemas_tokens(schemas) - 256)
+        # Reserve tools[] plus this agent's completion budget so prompt+output
+        # cannot exceed the provider max_tokens / context window.
+        gen_reserve = int(getattr(self.settings, "max_tokens", 0) or 0)
+        if self.is_subagent and gen_reserve <= 0:
+            gen_reserve = 2048
+        msg_limit = max(4000, limit - schemas_tokens(schemas) - 256 - gen_reserve)
         self.messages, meta = ensure_fit(
             self.messages,
             context_limit=msg_limit,
@@ -806,6 +1049,8 @@ class Agent(AgentHistoryMixin, AgentExecuteMixin, AgentGroundingMixin):
         final = ""
         turned = 0
         was_cancelled = False
+        stall_nudges = 0
+        delegate_nudges = 0
 
         for i in range(1, max_iters + 1):
             if self.cancelled():
@@ -816,6 +1061,17 @@ class Agent(AgentHistoryMixin, AgentExecuteMixin, AgentGroundingMixin):
             if getattr(self, "_last_compressed", False):
                 compressed = True
             schemas = tools if tools is not None else self.registry.schemas()
+            if (
+                getattr(self, "_requires_initial_delegation", False)
+                and not getattr(self, "_delegation_started", False)
+                and tools is None
+            ):
+                schemas = [
+                    schema
+                    for schema in schemas
+                    if str((schema.get("function") or {}).get("name") or "")
+                    in {"delegate_task", "delegate_dialogue"}
+                ]
             self._emit(
                 "llm_start",
                 {
@@ -829,6 +1085,7 @@ class Agent(AgentHistoryMixin, AgentExecuteMixin, AgentGroundingMixin):
             )
             assistant: Optional[dict[str, Any]] = None
             streamed_buf = ""
+            stalled = False
             if emit_assistant_text:
                 self._emit("assistant_delta", {"chunk": "", "reset": True})
             try:
@@ -840,7 +1097,20 @@ class Agent(AgentHistoryMixin, AgentExecuteMixin, AgentGroundingMixin):
                     if self.cancelled():
                         was_cancelled = True
                         break
-                    if kind == "delta":
+                    if kind == "stalled":
+                        stalled = True
+                        reason = ""
+                        if isinstance(payload, dict):
+                            reason = str(payload.get("reason") or "")
+                        self._emit(
+                            "assistant_status",
+                            {
+                                "text": "思考卡住，已自动中断并继续",
+                                "stalled": True,
+                                "reason": reason,
+                            },
+                        )
+                    elif kind == "delta":
                         streamed_buf += str(payload)
                         if emit_assistant_text:
                             self._emit("assistant_delta", {"chunk": str(payload)})
@@ -860,13 +1130,14 @@ class Agent(AgentHistoryMixin, AgentExecuteMixin, AgentGroundingMixin):
                         final = streamed_buf.strip()
                         self.messages.append({"role": "assistant", "content": final})
                     break
-                if self.cancelled():
-                    was_cancelled = True
-                    break
-                assistant = self.llm.chat(self.messages, tools=schemas)
-                preamble_fb = (assistant.get("content") or "").strip()
-                if preamble_fb and emit_assistant_text:
-                    self._stream_text_to_ui(preamble_fb)
+                if stalled:
+                    if assistant is None and streamed_buf.strip():
+                        assistant = {"role": "assistant", "content": streamed_buf.strip()}
+                else:
+                    assistant = self.llm.chat(self.messages, tools=schemas)
+                    preamble_fb = (assistant.get("content") or "").strip()
+                    if preamble_fb and emit_assistant_text:
+                        self._stream_text_to_ui(preamble_fb)
 
             if was_cancelled:
                 if not final:
@@ -880,6 +1151,16 @@ class Agent(AgentHistoryMixin, AgentExecuteMixin, AgentGroundingMixin):
                         self.messages.append({"role": "assistant", "content": final})
                 break
             if assistant is None:
+                if stalled and not self.cancelled():
+                    stall_nudges += 1
+                    self.messages.append(
+                        {"role": "assistant", "content": streamed_buf.strip()}
+                    )
+                    if stall_nudges <= 2:
+                        self.messages.append({"role": "user", "content": _STALL_NUDGE})
+                        continue
+                    final = streamed_buf.strip() or "（思考超时，已停止本轮）"
+                    break
                 was_cancelled = True
                 if streamed_buf.strip() and not final:
                     final = streamed_buf.strip()
@@ -891,7 +1172,28 @@ class Agent(AgentHistoryMixin, AgentExecuteMixin, AgentGroundingMixin):
             preamble = (assistant.get("content") or "").strip()
 
             if not tool_calls:
-                parsed_ask = try_parse_inline_ask(preamble)
+                if (
+                    getattr(self, "_requires_initial_delegation", False)
+                    and not getattr(self, "_delegation_started", False)
+                    and delegate_nudges < 2
+                ):
+                    delegate_nudges += 1
+                    self.messages.append(
+                        {
+                            "role": "user",
+                            "sidekick_internal": True,
+                            "content": (
+                                "Use a native delegation tool now. Create exactly one batch call "
+                                "for the requested workers; do not merely describe the call."
+                            ),
+                        }
+                    )
+                    continue
+                parsed_ask = (
+                    None
+                    if self.is_subagent and not self.full_agent
+                    else try_parse_inline_ask(preamble)
+                )
                 if parsed_ask:
                     self.messages.pop()
                     self._emit("assistant_delta", {"chunk": "", "reset": True, "discard": True})
@@ -902,6 +1204,19 @@ class Agent(AgentHistoryMixin, AgentExecuteMixin, AgentGroundingMixin):
                     )
                     self.messages.append({"role": "user", "content": answer})
                     continue
+
+                if stalled:
+                    stall_nudges += 1
+                    if stall_nudges <= 2:
+                        self.messages.append({"role": "user", "content": _STALL_NUDGE})
+                        continue
+                    final = preamble or "（思考超时，已停止本轮）"
+                    if not preamble:
+                        self.messages[-1]["content"] = final
+                    if emit_assistant_text:
+                        self._emit("assistant_delta", {"chunk": "", "reset": True})
+                        self._emit("assistant_delta", {"chunk": final})
+                    break
 
                 final = preamble
                 if not final:
@@ -921,6 +1236,8 @@ class Agent(AgentHistoryMixin, AgentExecuteMixin, AgentGroundingMixin):
                 break
 
             names = [(tc.get("function") or {}).get("name", "?") for tc in tool_calls]
+            if any(name in ("delegate_task", "delegate_dialogue") for name in names):
+                self._delegation_started = True
             self._emit(
                 "assistant_status",
                 {"text": f"调用工具：{', '.join(names)}", "tools": names},
@@ -977,6 +1294,10 @@ class Agent(AgentHistoryMixin, AgentExecuteMixin, AgentGroundingMixin):
         do_review: bool = True,
         display: str = "",
     ) -> AgentResult:
+        self._delegation_started = False
+        self._requires_initial_delegation = bool(
+            not self.is_subagent and is_multi_agent_request(user_text)
+        )
         # Top-level turns reset cancel; subagents keep a cancel already set by parent.
         if not self.is_subagent:
             self.clear_cancel()
@@ -995,6 +1316,10 @@ class Agent(AgentHistoryMixin, AgentExecuteMixin, AgentGroundingMixin):
             self._turn_mutated = False
             self._turn_verified = False
         user_turn = sum(1 for m in self.messages if m.get("role") == "user")
+        if not self.is_subagent:
+            # Persisted agent scenes belong to one user turn. History can then
+            # restore the matching team rather than every team ever spawned.
+            self._canvas_turn = user_turn + 1
         user_msg: dict[str, Any] = {"role": "user", "content": user_text}
         disp = (display or "").strip()
         if disp and disp != user_text:
@@ -1040,7 +1365,13 @@ class Agent(AgentHistoryMixin, AgentExecuteMixin, AgentGroundingMixin):
 
         try:
             plan_goal = extract_plan_goal(user_text) or user_text
-            if not self.is_subagent and mode_n == "plan":
+            if not self.is_subagent and is_multi_agent_request(user_text):
+                # Spawn / dialogue first. Plan confirm waits until this turn
+                # is an implementation job, not a live multi-agent session.
+                final, turned, was_cancelled, compressed = self._run_agent_loop(
+                    max_iters
+                )
+            elif not self.is_subagent and mode_n == "plan":
                 final, turned, was_cancelled, compressed = self._run_plan_only(plan_goal)
             elif not self.is_subagent and mode_n == "agent":
                 self._emit(

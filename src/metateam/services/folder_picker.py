@@ -17,14 +17,26 @@ def pick_folder(*, title: str = "选择工作区文件夹") -> Optional[str]:
 
 
 def _pick_windows(title: str) -> Optional[str]:
-    # WinForms dialog via PowerShell STA apartment (works from FastAPI worker threads)
+    # WinForms dialog via PowerShell STA. A hidden TopMost owner keeps the
+    # picker above the browser/Electron window when not using the desktop IPC.
     safe = title.replace("'", "''")
     script = (
         "Add-Type -AssemblyName System.Windows.Forms; "
+        "Add-Type -AssemblyName System.Drawing; "
+        "$form = New-Object System.Windows.Forms.Form; "
+        "$form.TopMost = $true; "
+        "$form.ShowInTaskbar = $false; "
+        "$form.Opacity = 0; "
+        "$form.Width = 1; $form.Height = 1; "
+        "$form.StartPosition = 'Manual'; "
+        "$form.Location = New-Object System.Drawing.Point(-32000, -32000); "
+        "$form.Show(); $form.Activate(); "
         "$d = New-Object System.Windows.Forms.FolderBrowserDialog; "
         f"$d.Description = '{safe}'; "
         "$d.ShowNewFolderButton = $true; "
-        "if ($d.ShowDialog() -eq [System.Windows.Forms.DialogResult]::OK) { "
+        "$ok = $d.ShowDialog($form); "
+        "$form.Close(); $form.Dispose(); "
+        "if ($ok -eq [System.Windows.Forms.DialogResult]::OK) { "
         "  [Console]::OutputEncoding = [System.Text.Encoding]::UTF8; "
         "  Write-Output $d.SelectedPath "
         "}"

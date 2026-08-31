@@ -1,4 +1,4 @@
-"""Path-allowlist shell sandbox: real disk, not a copy filesystem.
+"""Claude Code–style shell sandbox: real disk, path allowlist (not a copy FS).
 
 Bash/cmd still runs with cwd=workspace on the host. We only restrict which
 paths the command may touch (heuristic scan + cwd fence) and scrub the env.
@@ -204,6 +204,15 @@ def sandbox_env(base: Optional[dict[str, str]] = None) -> dict[str, str]:
     # Always force UTF-8 for Python / console child output (avoid Windows GBK crashes)
     src["PYTHONIOENCODING"] = "utf-8"
     src["PYTHONUTF8"] = "1"
+    src["PYTHONUNBUFFERED"] = "1"
+    src.setdefault("PIP_PROGRESS_BAR", "off")
+    src.setdefault("PIP_DISABLE_PIP_VERSION_CHECK", "1")
+    if not src.get("PLAYWRIGHT_DOWNLOAD_HOST"):
+        src["PLAYWRIGHT_DOWNLOAD_HOST"] = "https://npmmirror.com/mirrors/playwright"
+    if not src.get("PIP_INDEX_URL"):
+        src["PIP_INDEX_URL"] = "https://pypi.tuna.tsinghua.edu.cn/simple"
+    if not src.get("PIP_TRUSTED_HOST"):
+        src["PIP_TRUSTED_HOST"] = "pypi.tuna.tsinghua.edu.cn"
     if os.name == "nt":
         # Hint many CLIs / PowerShell toward UTF-8 instead of OEM/GBK
         src.setdefault("LANG", "en_US.UTF-8")

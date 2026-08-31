@@ -7,7 +7,7 @@ from typing import Any
 from fastapi import APIRouter, HTTPException
 from fastapi.responses import Response
 
-from ...services.browser_sandbox import SANDBOX
+from ...services.browser_sandbox import SANDBOX, resolve_browser_target
 from ..schemas import BrowserNavigateBody, BrowserPickBody, BrowserStartBody
 
 router = APIRouter(prefix="/api/browser", tags=["browser"])
@@ -38,6 +38,18 @@ def api_browser_navigate(body: BrowserNavigateBody) -> dict[str, Any]:
         return SANDBOX.navigate(body.url)
     except Exception as exc:
         raise HTTPException(400, str(exc)) from exc
+
+
+@router.post("/preview-local")
+def api_browser_preview_local(body: BrowserNavigateBody) -> dict[str, str]:
+    """Turn a workspace HTML path / file:// into an http://127.0.0.1 preview link."""
+    target = resolve_browser_target(body.url)
+    if not target:
+        raise HTTPException(
+            400,
+            "not a local workspace HTML file — use a relative path like report.html",
+        )
+    return {"url": target}
 
 
 @router.get("/screenshot")

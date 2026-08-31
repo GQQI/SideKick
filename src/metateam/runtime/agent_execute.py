@@ -8,20 +8,38 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import Any
 
 from ..core.events import new_id
-from .approval import approval_required, summarize_tool_call
+from .approval import approval_required, approval_scope, summarize_tool_call
 from .llm import parse_tool_args
-from .tools import bind_tool_args, plan_parallel_batches
+from .tools import plan_parallel_batches, prepare_tool_args
+
+_TOOL_ALIASES = {
+    "search": "web_search",
+    "search_web": "web_search",
+    "google_search": "web_search",
+    "bing_search": "web_search",
+    "internet_search": "web_search",
+    "browser_snapshot": "browser_screenshot",
+    "browser_get_page_content": "browser_get_page_content",
+}
+
+
+def _alias_tool_name(name: str) -> str:
+    raw = (name or "").strip()
+    return _TOOL_ALIASES.get(raw, raw)
 
 
 class AgentExecuteMixin:
     def _execute_one(self, tc: dict[str, Any]) -> dict[str, Any]:
         fn = tc.get("function") or {}
-        name = fn.get("name") or ""
+        raw_name = fn.get("name") or ""
+        name = _alias_tool_name(raw_name)
         args = parse_tool_args(fn.get("arguments") or "{}")
         tool = self.registry.get(name)
         call_id = str(tc.get("id") or new_id("call"))
-        needs_ok = approval_required(name, tool)
-        summary = summarize_tool_call(name, args)
+        workspace = getattr(getattr(self, "settings", None), "workspace", None)
+        scope = approval_scope(name, args, workspace)
+        needs_ok = approval_required(name, tool, args=args, workspace=workspace)
+        summary = summarize_tool_call(name, args, workspace=workspace)
         mutating = bool(needs_ok) or name in ("delegate_task", "delegate_dialogue")
         if mutating and not getattr(self, "_allow_mutating_tools", True):
             content = (
@@ -58,7 +76,7 @@ class AgentExecuteMixin:
                 "name": name,
                 "content": content,
             }
-        preapproved = bool(needs_ok and self.approval.is_preapproved(name))
+        preapproved = bool(needs_ok and self.approval.is_preapproved(scope))
         self._emit(
             "tool_start",
             {
@@ -117,7 +135,9 @@ class AgentExecuteMixin:
                             "message": f"等待确认：{summary}",
                         },
                     )
-                    approved = self.approval.request(approval_id, name, args, summary)
+                    approved = self.approval.request(
+                        approval_id, name, args, summary, scope=scope
+                    )
                     self._emit(
                         "approval_resolved",
                         {
@@ -165,14 +185,48 @@ class AgentExecuteMixin:
         if blocked:
             content = blocked
         elif not tool:
-            content = f"ERROR: unknown tool {name}"
+            known = ", ".join(self.registry.names()[:18])
+            from ..core.hostinfo import network_available
+
+            net_hint = (
+                "Use web_search(query=...) for the public internet, "
+                "search_text for workspace grep, or browser_navigate for a URL. "
+                if network_available()
+                else (
+                    "This host is offline — do not call web_search. "
+                    "Use search_text for workspace grep or read_file/list_dir. "
+                )
+            )
+            content = (
+                f"ERROR: unknown tool {raw_name or name}. "
+                f"{net_hint}"
+                f"Known tools include: {known}."
+            )
         else:
+            from ..services import fs_undo
+
+            actor = "sub" if self.is_subagent else "main"
+            if self.is_subagent:
+                actor_label = (self.goal or "").strip().split("\n")[0][:80] or (
+                    self.role or "sub"
+                )
+            else:
+                actor_label = "main"
+            fs_undo.set_mutation_meta(
+                actor=actor,
+                actor_label=actor_label,
+                why=summary,
+                tool=name,
+                call_id=call_id,
+            )
             try:
-                content = tool.handler(**bind_tool_args(tool.handler, args))
+                content = tool.handler(**prepare_tool_args(name, tool.handler, args))
             except TypeError as exc:
                 content = f"ERROR: bad arguments for {name}: {exc}"
             except Exception as exc:  # noqa: BLE001
                 content = f"ERROR: {name} failed: {exc}"
+            finally:
+                fs_undo.clear_mutation_meta()
 
         if not blocked:
             self.guard.after(name, args, content)
@@ -191,7 +245,6 @@ class AgentExecuteMixin:
                 self._turn_mutated = True
             if name == "verify_run":
                 self._turn_verified = True
-
         from ..core.textutil import safe_clip
 
         self._emit(

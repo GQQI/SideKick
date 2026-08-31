@@ -1,3 +1,4 @@
+import { useEffect, useState } from "react";
 import { FileHighlightView, FileTextEditor, countTextLines } from "./FileHighlightView";
 import { DiffReview } from "./DiffReview";
 import { ReviewPanel } from "./ChangesBar";
@@ -6,8 +7,9 @@ import { MarkdownView } from "./MarkdownView";
 import { ThinkingBlock } from "./ThinkingBlock";
 import { IconX } from "./icons";
 import { isFileMutatingTool, type FileDiffPreview } from "../utils/diffPreview";
-import { formatArgs, formatBytes, writeFilePreview } from "../utils/chatHelpers";
+import { formatArgs, formatBytes, writeFilePreview, subagentDisplayName, streamPhaseSuffix, stripToolCallMarkup } from "../utils/chatHelpers";
 import { sanitizeBrowserUrl } from "../browser/urlDetect";
+import { downloadAuthedFile, fetchAuthedBlob } from "../api";
 import type { DetailView } from "../types/chat";
 import type { Locale, MsgKey } from "../i18n";
 
@@ -63,7 +65,7 @@ export function DetailPanel({
     detail.type === "tool"
       ? `${t("detailTool")} · ${detail.tool.name}`
       : detail.type === "subagent"
-        ? `${t("detailSubagent")} · ${detail.subagent.role || "leaf"}`
+        ? `${t("detailSubagent")} · ${subagentDisplayName(detail.subagent)}`
         : detail.type === "changes"
           ? t("gitReviewList")
           : detail.path;
@@ -98,9 +100,15 @@ export function DetailPanel({
               </button>
             )}
             {detail.type === "file" && detail.rawUrl && detail.kind !== "text" && (
-              <a className="mini linkish" href={detail.rawUrl} target="_blank" rel="noreferrer">
+              <button
+                type="button"
+                className="mini linkish"
+                onClick={() => {
+                  void downloadAuthedFile(detail.rawUrl || "", detail.path).catch(() => undefined);
+                }}
+              >
                 {locale === "en" ? "Open / Download" : "打开/下载"}
-              </a>
+              </button>
             )}
             <button
               type="button"
@@ -274,7 +282,11 @@ function SubagentDetail({
       ) : null}
       <div className="subagent-detail-thread">
         {(detail.subagent.transcript || []).length === 0 && (
-          <p className="hint">{t("subagentWaiting")}</p>
+          <p className="hint">
+            {detail.subagent.status === "running"
+              ? t("thinkingActivity")
+              : t("subagentWaiting")}
+          </p>
         )}
         {(detail.subagent.transcript || []).map((item) => {
           if (item.kind === "assistant") {
@@ -284,12 +296,12 @@ function SubagentDetail({
                 className={`bubble assistant${item.streaming ? " streaming" : ""}`}
               >
                 <div className="role">
-                  {t("subagentLabel")}
-                  {item.streaming
-                    ? item.reasoningStreaming
-                      ? ` · ${t("thinking")}`
-                      : ` · ${t("outputting")}`
-                    : ""}
+                  {subagentDisplayName(detail.subagent, t("subagentLabel"))}
+                  {streamPhaseSuffix(Boolean(item.streaming), {
+                    reasoningStreaming: item.reasoningStreaming,
+                    text: item.text,
+                    reasoning: item.reasoning,
+                  }, t)}
                 </div>
                 {(item.reasoning || item.reasoningStreaming) && (
                   <ThinkingBlock
@@ -299,7 +311,7 @@ function SubagentDetail({
                 )}
                 {item.text ? (
                   <MarkdownView
-                    content={item.text}
+                    content={stripToolCallMarkup(item.text)}
                     streaming={item.streaming && !item.reasoningStreaming}
                     onCtrlClickUrl={onPickUrl}
                   />
@@ -344,6 +356,35 @@ function SubagentDetail({
   );
 }
 
+function useAuthedObjectUrl(apiPath: string | undefined, enabled: boolean) {
+  const [objectUrl, setObjectUrl] = useState("");
+  useEffect(() => {
+    if (!enabled || !apiPath) {
+      setObjectUrl("");
+      return;
+    }
+    let cancelled = false;
+    let created = "";
+    void fetchAuthedBlob(apiPath)
+      .then((url) => {
+        if (cancelled) {
+          URL.revokeObjectURL(url);
+          return;
+        }
+        created = url;
+        setObjectUrl(url);
+      })
+      .catch(() => {
+        if (!cancelled) setObjectUrl("");
+      });
+    return () => {
+      cancelled = true;
+      if (created) URL.revokeObjectURL(created);
+    };
+  }, [apiPath, enabled]);
+  return objectUrl;
+}
+
 function FileDetail({
   detail,
   onChange,
@@ -351,6 +392,8 @@ function FileDetail({
   detail: Extract<NonNullable<DetailView>, { type: "file" }>;
   onChange: (next: NonNullable<DetailView>) => void;
 }) {
+  const media = detail.kind === "image" || detail.kind === "pdf" || detail.kind === "audio" || detail.kind === "video";
+  const objectUrl = useAuthedObjectUrl(detail.rawUrl, media);
   return (
     <div className="detail-body file-preview">
       <div className="detail-meta">
@@ -359,19 +402,19 @@ function FileDetail({
         {detail.size != null ? ` · ${formatBytes(detail.size)}` : ""}
         {detail.kind === "text" ? ` · ${countTextLines(detail.content || "")} lines` : ""}
       </div>
-      {detail.kind === "image" && detail.rawUrl && (
+      {detail.kind === "image" && objectUrl && (
         <div className="media-frame">
-          <img src={detail.rawUrl} alt={detail.path} />
+          <img src={objectUrl} alt={detail.path} />
         </div>
       )}
-      {detail.kind === "pdf" && detail.rawUrl && (
-        <iframe className="pdf-frame" title={detail.path} src={detail.rawUrl} />
+      {detail.kind === "pdf" && objectUrl && (
+        <iframe className="pdf-frame" title={detail.path} src={objectUrl} />
       )}
-      {detail.kind === "audio" && detail.rawUrl && (
-        <audio className="media-player" controls src={detail.rawUrl} />
+      {detail.kind === "audio" && objectUrl && (
+        <audio className="media-player" controls src={objectUrl} />
       )}
-      {detail.kind === "video" && detail.rawUrl && (
-        <video className="media-player" controls src={detail.rawUrl} />
+      {detail.kind === "video" && objectUrl && (
+        <video className="media-player" controls src={objectUrl} />
       )}
       {detail.kind === "document" && (
         <div className="office-preview">

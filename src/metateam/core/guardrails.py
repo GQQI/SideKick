@@ -103,7 +103,7 @@ class Guardrails:
     # Kept for backwards-compatible construction in tests.
     max_reads_per_path: int = 0
     max_reads_total: int = 0
-    max_explore_streak: int = 16
+    max_explore_streak: int = 48
     fails: dict[str, int] = field(default_factory=dict)
     ok_counts: dict[str, int] = field(default_factory=dict)
     pending: set[str] = field(default_factory=set)

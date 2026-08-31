@@ -13,11 +13,35 @@ def register_browser_tools(reg: ToolRegistry, ctx: ToolContext) -> None:
 
     # Capability B: agent browser tools on the CDP sandbox session (same host as Select Mode).
     def browser_navigate(url: str = "") -> str:
-        from ...services.browser_sandbox import SANDBOX
+        from ...core.hostinfo import network_available
+        from ...core.netguard import blocked_http_reason
+        from ...services.browser_preview import is_preview_http_url
+        from ...services.browser_sandbox import SANDBOX, resolve_browser_target
 
         target = (url or "").strip()
         if not target:
             return "ERROR: empty url"
+        resolved = resolve_browser_target(target)
+        if not resolved:
+            return (
+                "ERROR: invalid url — browser_navigate opens public http(s) links, "
+                "or a workspace-relative HTML file (e.g. report.html)."
+            )
+        if resolved != "about:blank" and not is_preview_http_url(resolved):
+            reason = blocked_http_reason(resolved, allow_loopback=False)
+            if reason:
+                return (
+                    f"ERROR: navigation blocked ({reason}). "
+                    "Loopback and private networks are not allowed from the agent. "
+                    "Open local apps from the browser panel, or pass a workspace HTML file."
+                )
+            low = resolved.lower()
+            public_http = low.startswith("http://") or low.startswith("https://")
+            if public_http and not network_available():
+                return (
+                    "ERROR: this host is offline; cannot open public URLs. "
+                    "Use a workspace-relative HTML file."
+                )
         try:
             info = SANDBOX.navigate(target)
             return json.dumps(info, ensure_ascii=False)
@@ -49,6 +73,19 @@ def register_browser_tools(reg: ToolRegistry, ctx: ToolContext) -> None:
         except Exception as exc:  # noqa: BLE001
             return f"ERROR: {exc}"
 
+    def browser_get_page_content(max_chars: int = 12000, include_html: bool = False) -> str:
+        from ...services.browser_sandbox import SANDBOX
+
+        try:
+            return json.dumps(
+                SANDBOX.page_content(
+                    max_chars=int(max_chars or 12000), include_html=bool(include_html)
+                ),
+                ensure_ascii=False,
+            )
+        except Exception as exc:  # noqa: BLE001
+            return f"ERROR: {exc}"
+
     def browser_click(selector: str = "") -> str:
         from ...services.browser_sandbox import SANDBOX
 
@@ -68,9 +105,9 @@ def register_browser_tools(reg: ToolRegistry, ctx: ToolContext) -> None:
     reg.register(
         Tool(
             "browser_navigate",
-            "Open a URL in Sidekick's CDP browser sandbox (Playwright Chromium). "
-            "Prefer http://127.0.0.1 or http://localhost for local apps. "
-            "Starts a headed session if needed. Same session as Select Mode.",
+            "Open a public http(s) URL in Sidekick's CDP browser sandbox (Playwright Chromium). "
+            "Loopback and private networks are blocked. For local HTML, pass a "
+            "workspace-relative path (e.g. report.html). Same session as Select Mode.",
             {
                 "type": "object",
                 "properties": {"url": {"type": "string"}},
@@ -95,6 +132,41 @@ def register_browser_tools(reg: ToolRegistry, ctx: ToolContext) -> None:
             },
             browser_screenshot,
             parallel_safe=False,
+        )
+    )
+    # Compatibility names used by earlier prompt packs.  Keep these as real
+    # tools (rather than only executor aliases) so the model sees them in its
+    # advertised capability list and does not receive an unknown-tool error.
+    reg.register(
+        Tool(
+            "browser_snapshot",
+            "Compatibility alias for browser_screenshot. Capture the current browser page to a PNG.",
+            {
+                "type": "object",
+                "properties": {
+                    "full_page": {"type": "boolean", "default": False},
+                    "name": {"type": "string", "description": "Optional filename"},
+                },
+                "required": [],
+            },
+            browser_screenshot,
+            parallel_safe=False,
+        )
+    )
+    reg.register(
+        Tool(
+            "browser_get_page_content",
+            "Read rendered text from the current browser page. Set include_html only when markup is needed.",
+            {
+                "type": "object",
+                "properties": {
+                    "max_chars": {"type": "integer", "default": 12000},
+                    "include_html": {"type": "boolean", "default": False},
+                },
+                "required": [],
+            },
+            browser_get_page_content,
+            parallel_safe=True,
         )
     )
     reg.register(

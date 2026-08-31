@@ -6,10 +6,8 @@ from pathlib import Path
 
 # First existing file wins. Team-shared conventions belong in git, not MEMORY.md.
 CANDIDATES = (
-    ".yutianlang/rules.md",
     ".sidekick/rules.md",
     "AGENTS.md",
-    ".cursorrules",
 )
 
 MAX_CHARS = 8_000

@@ -35,7 +35,17 @@ export function formatToolSummary(name: string, args: unknown, fallback = ""): s
     return `替换 ${path}`;
   }
   if (name === "delete_file") return `删除 ${str("path")}`;
-  if (name === "read_file") return str("path") ? `读取 ${str("path")}` : "读取文件";
+  if (name === "read_file") {
+    const path = str("path");
+    const offset = typeof a.offset === "number" ? a.offset : Number(a.offset || 0);
+    const limit = typeof a.limit === "number" ? a.limit : Number(a.limit || 0);
+    if (!path) return "读取文件";
+    if (offset > 1 || limit > 0) {
+      const start = offset > 0 ? offset : 1;
+      return limit > 0 ? `读取 ${path} · ${start}+${limit} 行` : `读取 ${path} · 自第 ${start} 行`;
+    }
+    return `读取 ${path}`;
+  }
   if (name === "list_dir") return `列出 ${str("path") || "."}`;
   if (name === "search_text") {
     const q = str("query") || str("pattern");
@@ -60,7 +70,13 @@ export function formatToolSummary(name: string, args: unknown, fallback = ""): s
   if (name === "delegate_task") {
     const tasks = Array.isArray(a.tasks) ? a.tasks : [];
     if (tasks.length > 1) return `委派 ${tasks.length} 个智能体`;
-    return `委派: ${short(str("goal") || str("task"), 80)}`;
+    const first =
+      tasks[0] && typeof tasks[0] === "object" && !Array.isArray(tasks[0])
+        ? String((tasks[0] as { goal?: string }).goal || "")
+        : "";
+    const goal = str("goal") || str("task") || str("query") || first;
+    if (!goal) return "委派智能体";
+    return `委派: ${short(goal, 80)}`;
   }
   if (name === "delegate_dialogue") {
     const speakers = Array.isArray(a.speakers) ? a.speakers : [];

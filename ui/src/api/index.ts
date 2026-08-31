@@ -132,6 +132,34 @@ export async function authLogin(payload: { email: string; password: string }) {
   return body;
 }
 
+export async function authRegister(payload: {
+  username: string;
+  email: string;
+  password: string;
+}) {
+  const r = await fetch(`${BASE}/api/auth/register`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(payload),
+  });
+  if (!r.ok) {
+    let detail = `register failed: ${r.status}`;
+    try {
+      const body = (await r.json()) as { detail?: string };
+      if (body.detail) detail = body.detail;
+    } catch {
+      /* ignore */
+    }
+    throw new Error(detail);
+  }
+  const body = (await r.json()) as {
+    token?: string;
+    user?: { id: string; username: string; email?: string };
+  };
+  if (body.token) setApiToken(body.token);
+  return body;
+}
+
 export async function authLogout() {
   try {
     const headers = new Headers();
@@ -233,6 +261,7 @@ export type SessionDetailMessage = {
   args?: unknown;
   result?: string;
   status?: string;
+  agent_id?: string;
 };
 
 export type SessionDetail = {
@@ -243,6 +272,7 @@ export type SessionDetail = {
   limit?: number;
   demo: boolean;
   busy?: boolean;
+  agent_tree?: unknown[];
   pending_approvals?: Array<{
     id: string;
     tool: string;
@@ -499,6 +529,12 @@ export const browserNavigate = (url: string) =>
       body: JSON.stringify({ url }),
     },
   );
+export const browserPreviewLocal = (url: string) =>
+  json<{ url: string }>("/api/browser/preview-local", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ url }),
+  });
 export const browserSelect = (timeout_ms = 60000, with_screenshot = true) =>
   json<{ ok: boolean; element: Record<string, unknown> | null; message?: string }>(
     "/api/browser/select",
@@ -512,9 +548,39 @@ export const browserSelectCancel = () =>
   json<{ status: string }>("/api/browser/select/cancel", { method: "POST" });
 export const browserScreenshotUrl = (bust = Date.now()) => {
   const q = new URLSearchParams({ t: String(bust) });
-  if (_token) q.set("token", _token);
   return `/api/browser/screenshot?${q.toString()}`;
 };
+
+/** Fetch an authenticated API resource as a blob object URL (caller must revoke). */
+export async function fetchAuthedBlob(url: string): Promise<string> {
+  const headers = await authHeaders();
+  let path = url;
+  try {
+    const u = new URL(url, "http://local.invalid");
+    u.searchParams.delete("token");
+    path = `${u.pathname}${u.search}`;
+  } catch {
+    /* keep original */
+  }
+  const r = await fetch(`${BASE}${path}`, { headers });
+  if (!r.ok) {
+    throw new Error(`fetch failed: ${r.status}`);
+  }
+  const blob = await r.blob();
+  return URL.createObjectURL(blob);
+}
+
+export async function downloadAuthedFile(url: string, filename: string): Promise<void> {
+  const objectUrl = await fetchAuthedBlob(url);
+  const a = document.createElement("a");
+  a.href = objectUrl;
+  a.download = filename.split(/[\\/]/).pop() || "download";
+  a.rel = "noreferrer";
+  document.body.appendChild(a);
+  a.click();
+  a.remove();
+  window.setTimeout(() => URL.revokeObjectURL(objectUrl), 30_000);
+}
 
 /** Fetch screenshot as a blob URL (revoker must call URL.revokeObjectURL). */
 export async function browserFetchScreenshot(fullPage = false): Promise<string> {
@@ -553,24 +619,21 @@ export const readFileContent = (path: string) =>
   json<FilePayload>(`/api/files/content?path=${encodeURIComponent(path)}`);
 export const getApiToken = () => _token;
 
-/** Attach local token to /api/... URLs used by <img>/<iframe>/window.open (no custom headers). */
+/** Strip query tokens — media must use fetchAuthedBlob. */
 export function withAuthToken(url: string | undefined | null): string | undefined {
   if (!url) return undefined;
-  if (!url.startsWith("/api/")) return url;
-  const token = _token;
-  if (!token) return url;
   try {
     const u = new URL(url, "http://local.invalid");
-    if (!u.searchParams.has("token")) u.searchParams.set("token", token);
-    return `${u.pathname}${u.search}`;
+    u.searchParams.delete("token");
+    if (url.startsWith("/")) return `${u.pathname}${u.search}`;
+    return url;
   } catch {
-    return url.includes("?") ? `${url}&token=${encodeURIComponent(token)}` : `${url}?token=${encodeURIComponent(token)}`;
+    return url;
   }
 }
 
 export const fileRawUrl = (path: string) => {
   const q = new URLSearchParams({ path });
-  if (_token) q.set("token", _token);
   return `/api/files/raw?${q.toString()}`;
 };
 export const writeFileContent = (path: string, content: string) =>
@@ -968,6 +1031,18 @@ export const gitSetRemote = (url: string, name = "origin") =>
     body: JSON.stringify({ url, name }),
   });
 
+export type UndoFileEntry = {
+  path: string;
+  op?: string;
+  id?: string;
+  actor?: string;
+  actor_label?: string;
+  why?: string;
+  tool?: string;
+  call_id?: string;
+  label?: string;
+};
+
 export type UndoItem = {
   id: string;
   label?: string;
@@ -977,6 +1052,8 @@ export type UndoItem = {
   user_turn?: number;
   user_text?: string;
   files?: string[];
+  file_entries?: UndoFileEntry[];
+  actors?: string[];
 };
 
 export const fetchUndo = (sessionId?: string | null) =>
@@ -985,7 +1062,11 @@ export const fetchUndo = (sessionId?: string | null) =>
       ? `/api/files/undo?session_id=${encodeURIComponent(sessionId)}`
       : "/api/files/undo",
   );
-export const postUndo = (id?: string, sessionId?: string | null) =>
+export const postUndo = (
+  id?: string,
+  sessionId?: string | null,
+  opts?: { path?: string; userTurn?: number },
+) =>
   json<{ status: string; undone_count?: number; remaining?: number; errors?: string[] }>(
     "/api/files/undo",
     {
@@ -994,9 +1075,34 @@ export const postUndo = (id?: string, sessionId?: string | null) =>
       body: JSON.stringify({
         ...(id ? { id } : {}),
         ...(sessionId ? { session_id: sessionId } : {}),
+        ...(opts?.path ? { path: opts.path } : {}),
+        ...(typeof opts?.userTurn === "number" ? { user_turn: opts.userTurn } : {}),
       }),
     },
   );
+
+export const replaySession = (
+  id: string,
+  userTurn: number,
+  opts?: { restoreFiles?: boolean },
+) =>
+  json<{
+    status: string;
+    session_id: string;
+    user_turn: number;
+    keep_user_turns: number;
+    user_text: string;
+    messages: number;
+    restore_files?: boolean;
+    file_undo?: { undone_count?: number; partial?: boolean; errors?: string[] };
+  }>(`/api/sessions/${id}/replay`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({
+      user_turn: userTurn,
+      restore_files: opts?.restoreFiles !== false,
+    }),
+  });
 
 export type McpServer = {
   id: string;

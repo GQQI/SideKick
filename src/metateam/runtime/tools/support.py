@@ -11,6 +11,8 @@ from pathlib import Path
 from typing import Any, Optional
 
 from ...core.config import Settings
+from ...core.hostinfo import get_host_info, unix_shell_argv
+from ...core.pathutil import normalize_user_path
 from ...services.skills import Skill
 from ..shell_policy import (
     is_dangerous_shell as _is_dangerous_shell,
@@ -28,9 +30,16 @@ def _subprocess_text_kwargs() -> dict[str, Any]:
 
 def _shell_host_label() -> str:
     """Short OS + shell dialect for prompts / tool descriptions."""
-    if os.name == "nt":
+    info = get_host_info()
+    if info.os_family == "windows":
         return "Windows / PowerShell"
-    return "Unix / bash"
+    if info.is_kylin:
+        return f"麒麟 / {info.shell}"
+    if info.os_family == "linux":
+        return f"Linux / {info.shell}"
+    if info.os_family == "darwin":
+        return "macOS / bash"
+    return f"{info.os_name} / {info.shell}"
 
 
 def _shell_argv(command: str) -> list[str]:
@@ -52,7 +61,7 @@ def _shell_argv(command: str) -> list[str]:
             "-Command",
             ps,
         ]
-    return ["/bin/bash", "-lc", command]
+    return unix_shell_argv(command)
 
 
 def _shell_policy(settings: Settings, workspace: Path):
@@ -134,9 +143,11 @@ def _run_shell_background(command: str, *, cwd: str, collect_secs: float = 8.0, 
 
 
 def _safe_path(workspace: Path, raw: str, *, write: bool = False) -> Path:
-    """Resolve a path. Relative → workspace; absolute → host (read and write)."""
-    from ...core.pathutil import resolve_path
+    """Resolve a path. Relative → workspace; local absolute → host.
 
+    Foreign drive-letter paths (copied from another PC, or Windows paths on
+    Linux/麒麟) are remapped into the workspace so write_file keeps working.
+    """
     if isinstance(raw, dict):
         raw = raw.get("path") or raw.get("dir") or "."
     text = str(raw or ".").strip()
@@ -148,13 +159,7 @@ def _safe_path(workspace: Path, raw: str, *, write: bool = False) -> Path:
         except Exception:
             pass
     text = text.strip().strip('"').strip("'") or "."
-    p = Path(text).expanduser()
-    ws = resolve_path(workspace)
-    if not p.is_absolute():
-        p = resolve_path(ws / p)
-    else:
-        p = resolve_path(p)
-    return p
+    return normalize_user_path(text, workspace)
 
 
 def _skill_as_tool(skill: Skill) -> Tool:

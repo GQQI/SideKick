@@ -146,6 +146,11 @@ class TruncateBody(BaseModel):
     restore_files: bool = False
 
 
+class ReplayBody(BaseModel):
+    user_turn: int = Field(..., ge=0)
+    restore_files: bool = True
+
+
 class ApprovalDecision(BaseModel):
     approved: bool
     remember: bool = False

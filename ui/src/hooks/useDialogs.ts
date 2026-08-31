@@ -5,7 +5,6 @@ import {
   decideApproval,
   fetchHealth,
   saveModel,
-  selectModel,
   writeFileContent,
 } from "../api";
 import type { PlanTask } from "../components/TaskPlanPanel";
@@ -125,19 +124,32 @@ export function useDialogs(deps: DialogsDeps) {
 
   const switchModelRole = useCallback(
     async (role: ModelRole, providerId: string, modelId: string) => {
+      if (!model) return;
+      const snapshot = model;
+      const ref = { provider_id: providerId, model_id: modelId };
+      const optimistic = {
+        ...model,
+        [role]: ref,
+        ...(role === "subagent" ? { compress: ref } : {}),
+      };
+      setModel(optimistic);
       const seq = ++switchSeq.current;
+      setModelSaving(true);
       try {
-        const res = await selectModel(role, providerId, modelId);
+        const res = await saveModel({ ...optimistic, version: 3 });
         if (seq !== switchSeq.current) return;
         setModel(res.config);
         setHealth(await fetchHealth());
         setToast(res.note);
       } catch (e) {
         if (seq !== switchSeq.current) return;
+        setModel(snapshot);
         setToast(e instanceof Error ? e.message : String(e));
+      } finally {
+        if (seq === switchSeq.current) setModelSaving(false);
       }
     },
-    [setModel, setHealth, setToast],
+    [model, setModel, setModelSaving, setHealth, setToast],
   );
 
   const saveDetailFile = useCallback(async () => {

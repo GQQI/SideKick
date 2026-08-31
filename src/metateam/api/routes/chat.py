@@ -64,6 +64,7 @@ async def chat_sse(req: ChatRequest) -> EventSourceResponse:
                 except Exception as exc:
                     log_exception(_log, f"session title LLM failed for {sess.id}", exc)
             sess.updated_at = time.time()
+            sess.stop_requested = False
             sess.busy = True
             result = sess.agent.run(
                 req.message,
@@ -117,7 +118,7 @@ async def session_events(session_id: str) -> EventSourceResponse:
     unsub = subscribe_bus(sess, q)
     for item in gate_replay_events(sess):
         q.put(item)
-    if not sess.busy:
+    if not sess.busy or sess.stop_requested:
         q.put(
             event_payload(
                 "final",

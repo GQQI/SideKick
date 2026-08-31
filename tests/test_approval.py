@@ -2,11 +2,15 @@ from __future__ import annotations
 
 import threading
 import time
+from pathlib import Path
 
 from metateam.runtime.approval import (
     APPROVAL_TOOLS,
+    OUTSIDE_WORKSPACE_SCOPE,
     ApprovalGate,
     approval_required,
+    approval_scope,
+    summarize_tool_call,
     tool_needs_approval,
 )
 from metateam.runtime.tool_registry import Tool
@@ -90,3 +94,65 @@ def test_patch_merges_into_original_args() -> None:
     assert result.get("ok") is True
     assert args["content"] == "accepted hunk"
     assert args["path"] == "a.txt"
+
+
+def test_inside_read_skips_approval(tmp_path: Path) -> None:
+    assert not approval_required(
+        "read_file",
+        args={"path": "notes.md"},
+        workspace=tmp_path,
+    )
+    assert not approval_required(
+        "list_dir",
+        args={"path": "."},
+        workspace=tmp_path,
+    )
+    assert approval_required(
+        "write_file",
+        args={"path": "notes.md", "content": "x"},
+        workspace=tmp_path,
+    )
+
+
+def test_outside_file_ops_require_approval(tmp_path: Path) -> None:
+    outside = tmp_path.parent / f"secret-{tmp_path.name}.txt"
+    outside.write_text("nope", encoding="utf-8")
+    assert approval_scope("read_file", {"path": str(outside)}, tmp_path) == OUTSIDE_WORKSPACE_SCOPE
+    assert approval_required("read_file", args={"path": str(outside)}, workspace=tmp_path)
+    assert approval_required("write_file", args={"path": str(outside), "content": "x"}, workspace=tmp_path)
+    assert approval_required("list_dir", args={"path": str(outside.parent)}, workspace=tmp_path)
+    summary = summarize_tool_call("read_file", {"path": str(outside)}, workspace=tmp_path)
+    assert summary.startswith("工作区外 ·")
+    inside = summarize_tool_call("read_file", {"path": "a.txt"}, workspace=tmp_path)
+    assert not inside.startswith("工作区外")
+
+
+def test_remember_outside_workspace_does_not_preapprove_inside_writes(tmp_path: Path) -> None:
+    outside = tmp_path.parent / f"out-{tmp_path.name}.txt"
+    outside.write_text("x", encoding="utf-8")
+    gate = ApprovalGate(timeout_sec=5)
+    result: dict[str, bool] = {}
+
+    def worker() -> None:
+        result["ok"] = gate.request(
+            "out1",
+            "read_file",
+            {"path": str(outside)},
+            "工作区外 · 读取",
+            scope=OUTSIDE_WORKSPACE_SCOPE,
+        )
+
+    t = threading.Thread(target=worker)
+    t.start()
+    for _ in range(80):
+        if gate.pending():
+            break
+    assert gate.pending()
+    assert gate.pending()[0]["tool"] == "read_file"
+    gate.decide("out1", True, remember=True)
+    t.join(timeout=2)
+    assert result.get("ok") is True
+    assert gate.is_preapproved(OUTSIDE_WORKSPACE_SCOPE)
+    assert not gate.is_preapproved("write_file")
+    assert not gate.is_preapproved("read_file")
+    assert gate.is_preapproved(approval_scope("write_file", {"path": str(outside)}, tmp_path))

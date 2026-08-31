@@ -272,6 +272,7 @@ def create_user(username: str, password: str, *, email: str) -> AuthUser:
     users.append(user)
     _save_users(users)
     tenant_dir(user.id)
+    tenant_sessions_dir(user.id)
     ensure_tenant_knowledge(user.id)
     return user
 

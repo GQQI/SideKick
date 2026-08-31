@@ -94,7 +94,7 @@ export function useSessionBootstrap(deps: SessionBootstrapDeps) {
     (detail: SessionDetail) => {
       setSessionId(detail.id);
       syncContextFromSession(detail);
-      const mapped = mapSessionMessages(detail.messages);
+      const mapped = mapSessionMessages(detail.messages, detail.agent_tree);
       commit(mapped);
       streamIdRef.current = null;
       streamTextRef.current = "";

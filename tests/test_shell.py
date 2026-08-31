@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 from pathlib import Path
 
 from metateam.runtime.shell_policy import (
@@ -61,7 +62,13 @@ def test_check_command_masks_urls(tmp_path: Path) -> None:
 
 def test_check_command_blocks_outside(tmp_path: Path) -> None:
     policy = ShellSandboxPolicy.for_workspace(tmp_path)
-    err = check_command("type C:\\Windows\\System32\\drivers\\etc\\hosts", cwd=tmp_path, policy=policy)
-    # On non-Windows the token may not parse as a drive path; still must not crash.
-    if err:
-        assert "outside allowlist" in err or "sandbox" in err
+    if os.name == "nt":
+        err = check_command(
+            r"type C:\Windows\System32\drivers\etc\hosts",
+            cwd=tmp_path,
+            policy=policy,
+        )
+    else:
+        err = check_command("cat /etc/passwd", cwd=tmp_path, policy=policy)
+    assert err is not None
+    assert "outside allowlist" in err

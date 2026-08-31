@@ -237,10 +237,24 @@ plan=false for ordinary work — even if it takes a few tool calls:
 - edit / fix / tweak one file (HTML image swaps, CSS, copy, small bugfix)
 - clear single-outcome asks ("改这六个图", "加个按钮", "修报错")
 - questions, explanations, lookups
+- spawning / running multiple agents (智能体, 对抗, 辩论, delegate)
 - anything a competent agent can finish without needing the user to approve a roadmap
 
 When unsure, choose plan=false.
 """
+
+_MULTI_AGENT_RE = re.compile(
+    r"(智能体|子智能体|多智能体|多代理|对抗|辩论|红蓝|谈判|"
+    r"delegate(?:_task|_dialogue)?|multi-?agent|sub-?agents?|"
+    r"启动\s*\d+\s*个|开\s*\d+\s*个智能体|spawn\s+\d+)",
+    re.I,
+)
+
+
+def is_multi_agent_request(user_text: str) -> bool:
+    """True when the user asked to spawn or run multiple agents, not a build plan."""
+    goal = extract_plan_goal(user_text) or (user_text or "")
+    return bool(_MULTI_AGENT_RE.search(goal))
 
 
 def _parse_loose_json_object(raw: str) -> dict[str, Any]:
@@ -397,18 +411,21 @@ def _parse_plan_json(raw: str) -> dict[str, Any]:
 
 def _plan_host_hint() -> str:
     """Brief host shell note so verify_command / shell steps match the machine."""
-    import os
-    import platform
+    from ..core.hostinfo import get_host_info
 
-    if os.name == "nt":
+    info = get_host_info()
+    net = "online" if info.online else "OFFLINE — do not plan web_search"
+    if info.os_family == "windows":
         return (
-            f"Host OS: {platform.system()} — shell is PowerShell. "
+            f"Host OS: {info.label} — shell is PowerShell. Network: {net}. "
             "verify_command must be empty or a SHORT PowerShell one-liner "
             "(no nested quotes, no powershell -Command wrapping)."
         )
+    sh = info.shell or "bash"
     return (
-        f"Host OS: {platform.system()} — shell is bash. "
-        "verify_command must be empty or a short portable command."
+        f"Host OS: {info.label} — shell is {sh}. Network: {net}. "
+        "verify_command must be empty or a short portable POSIX command. "
+        "Do not use Windows drive letters or PowerShell."
     )
 
 
@@ -478,9 +495,12 @@ def needs_plan(llm: "LLM", user_text: str) -> bool:
 
     Biased toward false: only complex work should pause for a plan. Skill-only
     injections with no user task skip the call. On model failure, default False.
+    Multi-agent spawn/dialogue must run first — plan afterwards if still needed.
     """
     goal = extract_plan_goal(user_text).strip()
     if not goal:
+        return False
+    if is_multi_agent_request(user_text):
         return False
     try:
         raw = llm.complete_text(

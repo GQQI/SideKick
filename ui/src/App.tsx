@@ -568,6 +568,7 @@ export function App() {
               }}
               browserOpenRequest={browserOpenRequest}
               onWorkspaceMutated={() => setFsRefresh((n) => n + 1)}
+              onReplayTurn={(userTurn, userText) => void actions.replayTurn(userTurn, userText)}
               mainView={mainView}
               onOpenMemory={() => {
                 setMainView("memory");
@@ -611,6 +612,13 @@ export function App() {
                       setSandboxUrlPrompt({ url: sanitizeBrowserUrl(url) || url, x, y })
                     }
                     onToast={setToast}
+                    askPrompt={askPrompt}
+                    askChoice={askChoice}
+                    askOtherText={askOtherText}
+                    askSubmitting={askSubmitting}
+                    onResolveAsk={dialogs.resolveAsk}
+                    onAskChoice={setAskChoice}
+                    onAskOtherText={setAskOtherText}
                   />
                   <ComposerBar
                     t={t}
@@ -641,16 +649,13 @@ export function App() {
                     approval={approval}
                     approvalDiff={approvalDiff}
                     approvalDiffLoading={approvalDiffLoading}
-                    askPrompt={askPrompt}
-                    askChoice={askChoice}
-                    askOtherText={askOtherText}
-                    askSubmitting={askSubmitting}
                     ctxPct={ctxPct}
                     ctxWarn={ctxWarn}
                     ctx={ctx}
                     model={model}
                     modelSwitchRole={modelSwitchRole}
                     setModelSwitchRole={setModelSwitchRole}
+                    modelSaving={modelSaving}
                     onSend={actions.send}
                     onStopChat={chat.stopChat}
                     onApplySlashItem={actions.applySlashItem}
@@ -660,9 +665,6 @@ export function App() {
                     onRemoveQueued={chat.removeQueued}
                     onResolvePlanConfirm={dialogs.resolvePlanConfirm}
                     onResolveApproval={dialogs.resolveApproval}
-                    onResolveAsk={dialogs.resolveAsk}
-                    setAskChoice={setAskChoice}
-                    setAskOtherText={setAskOtherText}
                     onOpenSettings={dialogs.openSettings}
                     onSwitchModelRole={dialogs.switchModelRole}
                     gitRefreshKey={fsRefresh}

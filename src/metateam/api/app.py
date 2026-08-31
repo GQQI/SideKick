@@ -24,7 +24,28 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*", TOKEN_HEADER, "Content-Type", "Accept"],
 )
-app.add_middleware(LocalAuthMiddleware)
+
+
+def _is_public_path(method: str, path: str) -> bool:
+    p = (path or "/").split("?", 1)[0].rstrip("/") or "/"
+    if method == "OPTIONS" or p == "/":
+        return True
+    if p.startswith("/assets") or p.startswith("/favicon"):
+        return True
+    if p in {
+        "/api/health",
+        "/api/bootstrap",
+        "/api/auth/status",
+        "/api/auth/setup",
+        "/api/auth/login",
+        "/api/auth/register",
+        "/api/auth/logout",
+    }:
+        return True
+    return False
+
+
+app.add_middleware(LocalAuthMiddleware, is_public=_is_public_path)
 
 register_routes(app)
 
@@ -78,9 +99,9 @@ def main() -> None:
             f"Refusing to bind META_HOST={s.host!r} (not loopback). "
             "Use 127.0.0.1 or set META_ALLOW_REMOTE=1 (unsafe)."
         )
-    token = load_or_create_token()
+    load_or_create_token()
     print(f"Sidekick → http://{s.host}:{s.port}  demo={s.demo_mode} model={s.model}")
-    print(f"Local token ready (header X-Sidekick-Token). Preview: {token[:8]}…")
+    print("Local token ready (header X-Sidekick-Token).")
     if not s.allow_shell:
         print("Shell tools disabled (META_ALLOW_SHELL=0). Set META_ALLOW_SHELL=1 to enable.")
     uvicorn.run(

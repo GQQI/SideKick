@@ -9,7 +9,7 @@ from fastapi import APIRouter, HTTPException
 from ...runtime.context import context_budget_tokens, messages_tokens, schemas_tokens
 from ...services.store import STORE
 from ..http import require_session
-from ..schemas import ApprovalDecision, AskAnswer, PlanConfirm, TruncateBody
+from ..schemas import ApprovalDecision, AskAnswer, PlanConfirm, ReplayBody, TruncateBody
 
 router = APIRouter(tags=["sessions"])
 
@@ -31,6 +31,9 @@ def get_session(session_id: str) -> dict[str, Any]:
     schemas = sess.agent.registry.schemas()
     budget = context_budget_tokens(sess.agent.messages, schemas)
     snap = STORE.runtime_snapshot(sess)
+    # The in-memory agent knows about workers already spawned in this turn.
+    # Prefer it over the prior persisted tree while a stopped worker unwinds.
+    live_tree = sess.agent.canvas_tree()
     return {
         "id": sess.id,
         "title": sess.title,
@@ -41,6 +44,7 @@ def get_session(session_id: str) -> dict[str, Any]:
         "limit": sess.agent.settings.context_limit,
         "tools": sess.agent.registry.names(),
         "demo": sess.agent.settings.demo_mode,
+        "agent_tree": live_tree or getattr(sess, "agent_tree", None) or [],
         **snap,
     }
 
@@ -74,6 +78,43 @@ def truncate_session(session_id: str, body: TruncateBody) -> dict[str, Any]:
         "status": "ok",
         "session_id": session_id,
         "keep_user_turns": body.keep_user_turns,
+        "messages": len(sess.agent.messages) if sess else 0,
+        "restore_files": body.restore_files,
+    }
+    if file_undo is not None:
+        out["file_undo"] = file_undo
+    return out
+
+
+@router.post("/api/sessions/{session_id}/replay")
+def replay_session(session_id: str, body: ReplayBody) -> dict[str, Any]:
+    """Restore files to a turn's confirmation point and drop that turn's work.
+
+    The client re-sends ``user_text`` so the agent re-executes the plan.
+    """
+    require_session(session_id)
+    from ...services import fs_undo
+
+    user_text = fs_undo.turn_user_text(session_id, body.user_turn)
+    file_undo: dict[str, Any] | None = None
+    if body.restore_files:
+        try:
+            file_undo = fs_undo.undo_to_turn(session_id, body.user_turn)
+        except Exception as exc:
+            raise HTTPException(500, f"file restore failed: {exc}") from exc
+    try:
+        ok = STORE.truncate_before_user_turn(session_id, body.user_turn)
+    except ValueError as exc:
+        raise HTTPException(400, str(exc)) from exc
+    if not ok:
+        raise HTTPException(404, "session not found")
+    sess = STORE.get(session_id)
+    out: dict[str, Any] = {
+        "status": "ok",
+        "session_id": session_id,
+        "user_turn": body.user_turn,
+        "keep_user_turns": body.user_turn,
+        "user_text": user_text,
         "messages": len(sess.agent.messages) if sess else 0,
         "restore_files": body.restore_files,
     }

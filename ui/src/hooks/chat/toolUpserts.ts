@@ -1,7 +1,8 @@
 import type { RuntimeEvent } from "../../api";
-import type { ChatMsg, DetailView, ToolCard } from "../../types/chat";
+import type { ChatMsg, DetailView, SubNode, ToolCard } from "../../types/chat";
 import { formatToolSummary } from "../../utils/toolSummary";
-import { DELEGATE_TOOL_NAMES, softParseToolArgs, subagentMessagesFromDelegateTool, uid, writeFilePreview } from "../../utils/chatHelpers";
+import { softParseToolArgs, uid, writeFilePreview } from "../../utils/chatHelpers";
+import { seedDelegateCanvas } from "./canvasSync";
 
 export type ToolUpsertCtx = {
   sealStreamBubble: () => void;
@@ -13,9 +14,64 @@ export type ToolUpsertCtx = {
   updateMsg: (id: string, patch: Partial<ChatMsg>) => void;
   syncToolPanel: (tool: ToolCard, prevCallId?: string) => void;
   appendMsg: (msg: ChatMsg) => void;
+  removeMsg: (id: string) => void;
+  commit: (next: ChatMsg[]) => void;
+  setSubs: React.Dispatch<React.SetStateAction<SubNode[]>>;
   setDetail: React.Dispatch<React.SetStateAction<DetailView>>;
   transcriptRef: React.MutableRefObject<ChatMsg[]>;
+  stageRef: React.MutableRefObject<number>;
 };
+
+const LIVE_TOOL: ToolCard["status"][] = ["streaming", "running", "pending"];
+
+function taskIdentity(row: unknown): string {
+  if (typeof row === "string") return row.trim();
+  if (row && typeof row === "object" && !Array.isArray(row)) {
+    const rec = row as Record<string, unknown>;
+    return String(
+      rec.goal || rec.task || rec.query || rec.prompt || rec.description || "",
+    ).trim();
+  }
+  return "";
+}
+
+function isTaskListPrefix(prefix: unknown[], full: unknown[]): boolean {
+  if (prefix.length > full.length) return false;
+  return prefix.every((row, i) => {
+    const left = taskIdentity(row);
+    const right = taskIdentity(full[i]);
+    return !left || !right || left === right;
+  });
+}
+
+function mergeDelegateTaskLists(prior: unknown[], next: unknown[]): unknown[] {
+  if (!next.length) return prior;
+  if (!prior.length) return next;
+  if (next.length >= prior.length && isTaskListPrefix(prior, next)) return next;
+  if (prior.length >= next.length && isTaskListPrefix(next, prior)) return prior;
+  const seen = new Set<string>();
+  const out: unknown[] = [];
+  for (const row of [...prior, ...next]) {
+    const key = taskIdentity(row) || JSON.stringify(row);
+    if (seen.has(key)) continue;
+    seen.add(key);
+    out.push(row);
+  }
+  return out;
+}
+
+function mergeDelegateArgs(current: unknown, incoming: unknown): unknown {
+  const prior = current && typeof current === "object" && !Array.isArray(current)
+    ? current as Record<string, unknown>
+    : {};
+  const next = incoming && typeof incoming === "object" && !Array.isArray(incoming)
+    ? incoming as Record<string, unknown>
+    : {};
+  const priorTasks = Array.isArray(prior.tasks) ? prior.tasks : [];
+  const nextTasks = Array.isArray(next.tasks) ? next.tasks : [];
+  const tasks = mergeDelegateTaskLists(priorTasks, nextTasks);
+  return { ...prior, ...next, ...(tasks.length ? { tasks } : {}) };
+}
 
 /** Auto-open / refresh write_file preview only when it won't steal focus. */
 function revealWriteFileDetail(
@@ -37,29 +93,8 @@ export function upsertToolStart(ev: RuntimeEvent, ctx: ToolUpsertCtx) {
   const callId = String(ev.data.call_id || uid());
   const name = String(ev.data.name || "tool");
   const pending = Boolean(ev.data.needs_approval);
-  if (DELEGATE_TOOL_NAMES.has(name)) {
-    const cards = subagentMessagesFromDelegateTool({
-      name,
-      call_id: callId,
-      args: ev.data.args,
-      status: pending ? "pending" : "running",
-    });
-    for (const msg of cards) {
-      const goal = msg.subagent?.goal || "";
-      const role = msg.subagent?.role || "";
-      const exists = ctx.transcriptRef.current.some(
-        (m) =>
-          m.role === "subagent" &&
-          m.subagent &&
-          ((role && (m.subagent.role === role || m.subagent.goal === role)) ||
-            (goal && m.subagent.goal === goal)),
-      );
-      if (!exists) ctx.appendMsg(msg);
-    }
-    return;
-  }
   const existing =
-    ctx.findToolMsg({ callId }) ||
+    ctx.findToolMsg({ callId, statuses: LIVE_TOOL }) ||
     ctx.findToolMsg({
       name,
       statuses: ["streaming", "pending"],
@@ -82,6 +117,7 @@ export function upsertToolStart(ev: RuntimeEvent, ctx: ToolUpsertCtx) {
       const preview = writeFilePreview(tool.args);
       if (preview) revealWriteFileDetail(ctx.setDetail, tool);
     }
+    if (name === "delegate_task") seedDelegateCanvas(ctx, tool.args, tool.callId, undefined, true);
     return tool;
   }
   const tool: ToolCard = {
@@ -96,6 +132,7 @@ export function upsertToolStart(ev: RuntimeEvent, ctx: ToolUpsertCtx) {
   ctx.appendMsg({ id: tool.id, role: "tool", content: "", tool });
   ctx.syncToolPanel(tool);
   if (name === "write_file") revealWriteFileDetail(ctx.setDetail, tool);
+  if (name === "delegate_task") seedDelegateCanvas(ctx, tool.args, tool.callId, undefined, true);
   return tool;
 }
 
@@ -107,12 +144,11 @@ export function upsertToolDelta(ev: RuntimeEvent, ctx: ToolUpsertCtx) {
   const argsRaw = String(ev.data.arguments || "");
   const args = softParseToolArgs(argsRaw);
   const callId = realId || streamKey;
-  if (DELEGATE_TOOL_NAMES.has(name)) return;
 
   const existing =
-    ctx.findToolMsg({ callId }) ||
-    ctx.findToolMsg({ callId: streamKey }) ||
-    (realId ? ctx.findToolMsg({ callId: realId }) : undefined) ||
+    ctx.findToolMsg({ callId, statuses: LIVE_TOOL }) ||
+    ctx.findToolMsg({ callId: streamKey, statuses: LIVE_TOOL }) ||
+    (realId ? ctx.findToolMsg({ callId: realId, statuses: LIVE_TOOL }) : undefined) ||
     ctx.transcriptRef.current.find(
       (m) =>
         m.role === "tool" &&
@@ -121,29 +157,38 @@ export function upsertToolDelta(ev: RuntimeEvent, ctx: ToolUpsertCtx) {
           (m.tool.args as { _streamIndex?: number } | undefined)?._streamIndex,
         ) === index,
     );
+  const delegateExisting = name === "delegate_task"
+    ? ctx.findToolMsg({ name, statuses: LIVE_TOOL })
+    : undefined;
+  const active = existing || delegateExisting;
 
   // Seal the assistant bubble only once when tool streaming *starts*.
   // Sealing on every tool_call_delta breaks models that interleave content
   // tokens with argument deltas — each content token became its own bubble.
-  if (!existing?.tool) {
+  if (!active?.tool) {
     ctx.sealStreamBubble();
   }
 
-  const summary = formatToolSummary(name || existing?.tool?.name || "", args);
-  if (existing?.tool) {
-    const prevCallId = existing.tool.callId;
+  const summary = formatToolSummary(name || active?.tool?.name || "", args);
+  if (active?.tool) {
+    const prevCallId = active.tool.callId;
     const tool: ToolCard = {
-      ...existing.tool,
-      callId,
-      name: name || existing.tool.name,
-      args: { ...args, _streamIndex: index },
+      ...active.tool,
+      callId: name === "delegate_task" ? active.tool.callId : callId,
+      name: name || active.tool.name,
+      args: name === "delegate_task"
+        ? mergeDelegateArgs(active.tool.args, args)
+        : { ...args, _streamIndex: index },
       argsRaw,
       status: "streaming",
       summary,
     };
-    ctx.updateMsg(existing.id, { tool });
+    ctx.updateMsg(active.id, { tool });
     ctx.syncToolPanel(tool, prevCallId);
     revealWriteFileDetail(ctx.setDetail, tool);
+    if ((name || active.tool.name) === "delegate_task") {
+      seedDelegateCanvas(ctx, tool.args, tool.callId, undefined, true);
+    }
     return;
   }
 
@@ -159,6 +204,9 @@ export function upsertToolDelta(ev: RuntimeEvent, ctx: ToolUpsertCtx) {
   ctx.appendMsg({ id: tool.id, role: "tool", content: "", tool });
   ctx.syncToolPanel(tool);
   revealWriteFileDetail(ctx.setDetail, tool);
+  if ((name || "tool") === "delegate_task") {
+    seedDelegateCanvas(ctx, tool.args, tool.callId, undefined, true);
+  }
 }
 
 export function upsertToolEnd(ev: RuntimeEvent, ctx: ToolUpsertCtx) {
@@ -166,40 +214,6 @@ export function upsertToolEnd(ev: RuntimeEvent, ctx: ToolUpsertCtx) {
   const name = String(ev.data.name || "tool");
   const result = String(ev.data.result ?? ev.data.preview ?? "");
   const ok = ev.data.ok !== false && !result.startsWith("ERROR");
-  if (DELEGATE_TOOL_NAMES.has(name)) {
-    const cards = subagentMessagesFromDelegateTool({
-      name,
-      call_id: callId,
-      args: ev.data.args,
-      result,
-      status: ok ? "done" : "error",
-    });
-    for (const msg of cards) {
-      const node = msg.subagent;
-      if (!node) continue;
-      const hit = ctx.transcriptRef.current.find(
-        (m) =>
-          m.role === "subagent" &&
-          m.subagent &&
-          (m.subagent.goal === node.goal ||
-            (node.role && (m.subagent.role === node.role || m.subagent.goal === node.role))),
-      );
-      if (hit?.subagent && hit.subagent.status === "running") {
-        ctx.updateMsg(hit.id, {
-          subagent: {
-            ...hit.subagent,
-            status: node.status,
-            summary: node.summary || hit.subagent.summary,
-            activity: undefined,
-            transcript:
-              hit.subagent.transcript?.length ? hit.subagent.transcript : node.transcript,
-          },
-          content: node.summary || node.goal,
-        });
-      }
-    }
-    return;
-  }
   const hit =
     ctx.findToolMsg({ callId }) ||
     ctx.findToolMsg({
@@ -218,6 +232,9 @@ export function upsertToolEnd(ev: RuntimeEvent, ctx: ToolUpsertCtx) {
     };
     ctx.updateMsg(hit.id, { tool });
     ctx.syncToolPanel(tool, prevCallId);
+    if (name === "delegate_task") {
+      seedDelegateCanvas(ctx, tool.args, tool.callId, result, false);
+    }
     return;
   }
   const tool: ToolCard = {
@@ -230,4 +247,7 @@ export function upsertToolEnd(ev: RuntimeEvent, ctx: ToolUpsertCtx) {
   };
   ctx.appendMsg({ id: tool.id, role: "tool", content: "", tool });
   ctx.syncToolPanel(tool);
+  if (name === "delegate_task") {
+    seedDelegateCanvas(ctx, tool.args, tool.callId, result, false);
+  }
 }

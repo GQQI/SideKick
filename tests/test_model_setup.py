@@ -45,6 +45,23 @@ def test_find_entry_matches_without_provider_id() -> None:
     assert prov is not None
 
 
+def test_parse_entry_max_tokens() -> None:
+    from metateam.services.model_config import _parse_entry
+
+    entry = _parse_entry(
+        {
+            "id": "m1",
+            "name": "qwen",
+            "base_url": "http://x/v1",
+            "api_key": "sk-1",
+            "max_tokens": 4096,
+        }
+    )
+    assert entry.max_tokens == 4096
+    stored = entry.masked_dict()
+    assert stored["max_tokens"] == 4096
+
+
 def test_llm_omits_auto_tool_choice() -> None:
     from metateam.core.config import Settings
     from metateam.runtime.llm import LLM, _is_tool_choice_error, _retry_kwargs_for_exc
@@ -55,11 +72,12 @@ def test_llm_omits_auto_tool_choice() -> None:
         thinking_enabled=False,
         reasoning_effort="",
     )
-    llm = LLM(settings)
+    llm = LLM(settings, max_tokens=2048)
     tools = [{"type": "function", "function": {"name": "list_dir"}}]
     kwargs = llm._call_kwargs([{"role": "user", "content": "hi"}], tools, 0.2)
     assert "tool_choice" not in kwargs
     assert kwargs["tools"] == tools
+    assert kwargs["max_tokens"] == 2048
 
     err = Exception(
         "Error code: 400 - {'error': {'message': '\"auto\" tool choice requires "

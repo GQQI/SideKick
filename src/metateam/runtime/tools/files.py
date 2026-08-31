@@ -2,11 +2,27 @@
 
 from __future__ import annotations
 
+import re
 from pathlib import Path
 
 from ..tool_registry import Tool, ToolRegistry
 from .context import ToolContext
 from .support import _needs_codebase_align, _safe_path
+
+
+def _as_int(value: object, default: int) -> int:
+    if isinstance(value, bool):
+        return default
+    if isinstance(value, int):
+        return value
+    text = str(value or "").strip()
+    match = re.match(r"-?\d+", text)
+    if not match:
+        return default
+    try:
+        return int(match.group(0))
+    except ValueError:
+        return default
 
 
 def register_file_tools(reg: ToolRegistry, ctx: ToolContext) -> None:
@@ -19,9 +35,9 @@ def register_file_tools(reg: ToolRegistry, ctx: ToolContext) -> None:
         if not fp.exists():
             return f"ERROR: not found: {fp}"
         lines = fp.read_text(encoding="utf-8", errors="replace").splitlines()
-        offset = max(1, int(offset))
+        offset = max(1, _as_int(offset, 1))
         total = len(lines)
-        req_limit = int(limit)
+        req_limit = _as_int(limit, 0)
         # Default / non-positive limit → remainder of file (no artificial ceiling).
         if req_limit <= 0:
             req_limit = max(0, total - (offset - 1))
@@ -266,8 +282,9 @@ def register_file_tools(reg: ToolRegistry, ctx: ToolContext) -> None:
     reg.register(
         Tool(
             "list_dir",
-            "List files in a directory. Relative paths resolve under WORKSPACE; "
-            "absolute paths (e.g. E:/Project/anydoc) may be anywhere on the host.",
+            "List files in a directory. Prefer WORKSPACE-relative paths. "
+            "Absolute paths must exist on THIS host — do not reuse another "
+            "machine's E:/ or C:\\ path.",
             {
                 "type": "object",
                 "properties": {"path": {"type": "string", "default": "."}},

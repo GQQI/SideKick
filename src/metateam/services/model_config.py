@@ -84,6 +84,7 @@ class ModelEntry:
     name: str
     base_url: str = ""
     api_key: str = ""
+    max_tokens: int = 0
 
     def masked_dict(self) -> dict[str, Any]:
         masked, set_ = _mask_key(self.api_key)
@@ -94,6 +95,7 @@ class ModelEntry:
             "api_key": "",
             "api_key_masked": masked,
             "api_key_set": set_,
+            "max_tokens": self.max_tokens or 0,
         }
 
 
@@ -240,11 +242,16 @@ def _parse_ref(raw: Any) -> ModelRef:
 
 def _parse_entry(raw: dict[str, Any]) -> ModelEntry:
     key = str(raw.get("api_key") or "")
+    try:
+        max_tokens = int(raw.get("max_tokens") or 0)
+    except (TypeError, ValueError):
+        max_tokens = 0
     return ModelEntry(
         id=str(raw.get("id") or _uid("mdl")),
         name=str(raw.get("name") or ""),
         base_url=str(raw.get("base_url") or ""),
         api_key=decrypt_secret(key),
+        max_tokens=max_tokens,
     )
 
 

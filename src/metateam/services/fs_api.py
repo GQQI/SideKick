@@ -13,7 +13,7 @@ from urllib.parse import quote
 from xml.etree import ElementTree as ET
 
 from ..core.config import get_settings
-from ..core.pathutil import is_relative_to, relative_to_posix, resolve_path
+from ..core.pathutil import is_relative_to, normalize_user_path, relative_to_posix, resolve_path
 
 _ACTIVE_WORKSPACE: ContextVar[Optional[Path]] = ContextVar(
     "metateam_active_workspace", default=None
@@ -158,8 +158,7 @@ def safe_resolve(rel_or_path: str, *, allow_outside: bool = False) -> Path:
     """Resolve a path. By default stays inside the active workspace."""
     raw = (rel_or_path or ".").strip().strip('"').strip("'") or "."
     ws = workspace_root()
-    p = Path(raw).expanduser()
-    p = resolve_path(p if p.is_absolute() else (ws / p))
+    p = normalize_user_path(raw, ws)
     if not allow_outside and not is_relative_to(p, ws):
         raise ValueError(f"path outside workspace: {p} (workspace is {ws})")
     return p
@@ -560,17 +559,54 @@ def read_text(rel: str, max_chars: int = 200_000) -> dict[str, Any]:
     }
 
 
+def _atomic_write_text(fp: Path, content: str) -> None:
+    """Write UTF-8 text portably (Windows / Linux / 麒麟)."""
+    import os as _os
+
+    text = "" if content is None else str(content)
+    fp.parent.mkdir(parents=True, exist_ok=True)
+    tmp = fp.with_name(f".{fp.name}.{_os.getpid()}.tmp")
+    try:
+        tmp.write_text(text, encoding="utf-8", newline="\n")
+        _os.replace(str(tmp), str(fp))
+    except OSError:
+        if tmp.exists():
+            try:
+                tmp.unlink()
+            except OSError:
+                pass
+        # Some network / 麒麟 filesystems reject replace — write in place.
+        fp.write_text(text, encoding="utf-8", newline="\n")
+    except Exception:
+        if tmp.exists():
+            try:
+                tmp.unlink()
+            except OSError:
+                pass
+        raise
+
+
 def write_text(rel: str, content: str, *, allow_outside: bool = False) -> dict[str, Any]:
     from . import fs_undo
 
-    fp = safe_resolve(rel, allow_outside=allow_outside)
+    text = "" if content is None else str(content)
+    try:
+        fp = safe_resolve(rel, allow_outside=allow_outside)
+    except Exception as exc:
+        raise ValueError(f"invalid path {rel!r}: {exc}") from exc
     if fp.exists() and detect_kind(fp) != "text":
         raise ValueError(f"cannot overwrite non-text file as text: {rel}")
     out = rel_to_workspace(fp)
     fs_undo.push_before_write(out, fp)
-    fp.parent.mkdir(parents=True, exist_ok=True)
-    fp.write_text(content, encoding="utf-8")
-    return {"path": out, "size": len(content)}
+    try:
+        _atomic_write_text(fp, text)
+    except OSError as exc:
+        raise OSError(
+            f"write_file failed for {fp}: {exc}. "
+            "Use a workspace-relative path that exists on THIS computer "
+            "(do not reuse another machine's E:/ or C:\\ path)."
+        ) from exc
+    return {"path": out, "size": len(text)}
 
 
 def write_bytes(rel: str, data: bytes) -> dict[str, Any]:

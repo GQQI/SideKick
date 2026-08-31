@@ -12,7 +12,7 @@ from ..runtime.agent import Agent
 from ..core.config import Settings, get_settings, reload_settings
 from ..core.events import EventBus, new_id
 from ..core.logutil import get_logger, log_exception
-from .session import load_session, save_session, sessions_dir, workspace_matches
+from .session import load_session, load_session_bundle, save_session, sessions_dir, workspace_matches
 
 _log = get_logger("metateam.store")
 
@@ -25,6 +25,8 @@ class ChatSession:
     title: str = "New chat"
     user_id: str = ""
     busy: bool = False
+    stop_requested: bool = False
+    agent_tree: list[Any] = field(default_factory=list)
 
 
 _UNTITLED_TITLES = frozenset({"新会话", "New chat", "Untitled", ""})
@@ -245,7 +247,10 @@ class SessionStore:
                 llm_demo = bool(llm is not None and getattr(llm, "demo", False))
                 if not rebind_llm and not (keyed and llm_demo):
                     continue
-                sess.agent.llm = LLM(sess.agent.settings)
+                sess.agent.llm = LLM(
+                    sess.agent.settings,
+                    max_tokens=getattr(sess.agent.settings, "max_tokens", 0) or None,
+                )
                 sess.agent.compress_llm = LLM(
                     sess.agent.settings,
                     model=sess.agent.settings.compress_model,
@@ -253,6 +258,7 @@ class SessionStore:
                     or sess.agent.settings.api_key,
                     base_url=getattr(sess.agent.settings, "compress_base_url", None)
                     or sess.agent.settings.base_url,
+                    max_tokens=getattr(sess.agent.settings, "compress_max_tokens", 0) or None,
                 )
             except Exception as exc:
                 log_exception(_log, f"refresh_settings failed for session {sess.id}", exc)
@@ -329,7 +335,9 @@ class SessionStore:
     def runtime_snapshot(self, sess: ChatSession) -> dict[str, Any]:
         agent = sess.agent
         return {
-            "busy": bool(sess.busy),
+            # A stop request is terminal from the UI's perspective even while
+            # the worker thread is unwinding a provider stream in the background.
+            "busy": bool(sess.busy and not sess.stop_requested),
             "pending_approvals": agent.approval.pending(),
             "pending_asks": agent.ask.pending(),
             "pending_plans": agent.plan_gate.pending(),
@@ -361,6 +369,8 @@ class SessionStore:
         sess = self.get(session_id) or self._get_live(session_id)
         if not sess:
             return False
+        sess.stop_requested = True
+        sess.updated_at = time.time()
         sess.agent.request_cancel()
         return True
 
@@ -437,7 +447,7 @@ class SessionStore:
         if not path:
             return None
         try:
-            meta, messages = load_session(path)
+            meta, messages, extra = load_session_bundle(path)
         except Exception:
             return None
         if meta.user_id and meta.user_id != uid:
@@ -467,6 +477,7 @@ class SessionStore:
             updated_at=mtime,
             title=title,
             user_id=meta.user_id or uid,
+            agent_tree=list(extra.get("agent_tree") or []) if isinstance(extra.get("agent_tree"), list) else [],
         )
         agent.session_id = sess.id
         with self._lock:
@@ -560,7 +571,7 @@ class SessionStore:
                 "messages": len(s.agent.messages),
                 "user_turns": user_turns,
                 "demo": s.agent.settings.demo_mode,
-                "busy": bool(s.busy),
+                "busy": bool(s.busy and not s.stop_requested),
                 "source": "memory",
             }
 
@@ -644,6 +655,14 @@ class SessionStore:
             return None
         if _user_turn_count(sess.agent.messages) <= 0:
             return None
+        tree: list[Any] = []
+        try:
+            tree = sess.agent.canvas_tree()
+        except Exception as exc:
+            log_exception(_log, f"canvas_tree failed for {session_id}", exc)
+        if not tree:
+            tree = list(sess.agent_tree or [])
+        sess.agent_tree = tree
         path = save_session(
             self.settings.root,
             sess.agent.messages,
@@ -652,6 +671,7 @@ class SessionStore:
             session_id=session_id,
             user_id=sess.user_id or None,
             title=sess.title or "",
+            extra={"agent_tree": tree},
         )
         return str(path)
 
@@ -664,6 +684,7 @@ class SessionStore:
         import json as _json
 
         msgs = sess.agent.messages
+        owner = str(getattr(sess.agent, "agent_id", "") or "main")
         results_by_id: dict[str, dict[str, Any]] = {}
         for m in msgs:
             if m.get("role") != "tool":
@@ -682,16 +703,28 @@ class SessionStore:
                     continue
                 content = _message_display_text(m).strip()
                 if content and not content.startswith("Iteration budget exhausted"):
-                    out.append({"role": "user", "content": content})
+                    out.append({"role": "user", "content": content, "agent_id": owner})
                 continue
 
             if role == "assistant":
                 if _is_internal_message(m):
                     continue
                 content = str(m.get("content") or "").strip()
-                if content:
-                    item: dict[str, Any] = {"role": "assistant", "content": content}
-                    reasoning = str(m.get("reasoning") or "").strip()
+                reasoning = str(m.get("reasoning") or "").strip()
+                try:
+                    from ..runtime.text_tool_calls import extract_text_tool_calls
+
+                    content, _ = extract_text_tool_calls(content)
+                except Exception:
+                    pass
+                # Tool rounds often have empty content + reasoning + tool_calls.
+                # Dropping those rows hid thinking when history was reloaded.
+                if content or reasoning:
+                    item: dict[str, Any] = {
+                        "role": "assistant",
+                        "content": content,
+                        "agent_id": owner,
+                    }
                     if reasoning:
                         item["reasoning"] = reasoning
                     out.append(item)
@@ -727,6 +760,7 @@ class SessionStore:
                         "args": args,
                         "result": result,
                         "status": status,
+                        "agent_id": owner,
                     }
                     out.append(tool_item)
                     if call_id:
@@ -747,6 +781,7 @@ class SessionStore:
                         "args": {},
                         "result": result,
                         "status": "error" if result.startswith("ERROR") else "done",
+                        "agent_id": owner,
                     }
                 )
                 if cid:

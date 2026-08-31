@@ -1,4 +1,5 @@
 import type { PendingConfirm } from "../types/chat";
+import { IconCheck, IconX } from "./icons";
 
 type Props = {
   pending: PendingConfirm;
@@ -15,7 +16,7 @@ export function ConfirmBanner({ pending, onCancel, onError }: Props) {
       </div>
       <div className="confirm-banner-actions">
         <button type="button" className="fe-inline-btn cancel" title="取消" onClick={onCancel}>
-          ✕
+          <IconX size={14} />
         </button>
         <button
           type="button"
@@ -29,7 +30,7 @@ export function ConfirmBanner({ pending, onCancel, onError }: Props) {
             );
           }}
         >
-          ✕
+          <IconCheck size={14} />
         </button>
       </div>
     </div>

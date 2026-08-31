@@ -13,6 +13,7 @@ import {
   saveSession,
   setWorkspace,
   truncateSession,
+  replaySession,
   uploadFile,
   type Health,
   type SkillItem,
@@ -698,6 +699,53 @@ async function submitEdit(msgId: string, restoreFiles: boolean) {
   await sendChat(text);
 }
 
+async function replayTurn(userTurn: number, fallbackText = "") {
+  if (busyRef.current) {
+    setToast(t("editBusy"));
+    return;
+  }
+  if (!sessionId) {
+    setToast(t("undoReplayNeedSession"));
+    return;
+  }
+  const list = transcriptRef.current;
+  let seen = 0;
+  let cut = list.length;
+  for (let i = 0; i < list.length; i++) {
+    if (list[i].role === "user") {
+      if (seen === userTurn) {
+        cut = i;
+        break;
+      }
+      seen += 1;
+    }
+  }
+  commit(list.slice(0, cut));
+  setDetail(null);
+  setSubs([]);
+  setLive([]);
+  setApproval(null);
+  setAskPrompt(null);
+  setAskChoice("");
+  setAskOtherText("");
+  try {
+    const res = await replaySession(sessionId, userTurn, { restoreFiles: true });
+    setFsRefresh((n) => n + 1);
+    const text = (res.user_text || fallbackText || "").trim();
+    if (!text) {
+      setToast(t("undoReplayNoText"));
+      return;
+    }
+    const n = res.file_undo?.undone_count ?? 0;
+    if (n > 0) {
+      setToast(t("undoReplayOk", String(n)));
+    }
+    await sendChat(text, { showUser: true });
+  } catch (e) {
+    setToast(e instanceof Error ? e.message : String(e));
+  }
+}
+
 async function addAttachments(files: FileList | null) {
     if (!files || files.length === 0) return;
     if (!activeWs?.path) {
@@ -861,6 +909,7 @@ async function send(text?: string) {
     cancelEdit,
     requestSubmitEdit,
     submitEdit,
+    replayTurn,
     addAttachments,
     buildMessageWithAttachments,
     send,

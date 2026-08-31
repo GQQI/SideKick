@@ -1,8 +1,21 @@
 /** Pure helpers extracted from App to keep the shell leaner. */
 
-import { fileRawUrl, withAuthToken, type FilePayload, type SessionDetailMessage } from "../api";
+import { fileRawUrl, type FilePayload, type SessionDetailMessage } from "../api";
 import type { ChatMsg, DetailView, MsgAttachment, SubNode, SubTranscriptItem, ToolCard } from "../types/chat";
 import { formatToolSummary } from "./toolSummary";
+import {
+  alignCanvasSlots,
+  canvasGoalsMatch,
+  canvasPlaceholderId,
+  isEphemeralCanvasId,
+  limitCanvasRoots,
+} from "./canvasSlots";
+
+export {
+  canvasPlaceholderId,
+  isEphemeralCanvasId,
+  limitCanvasRoots,
+} from "./canvasSlots";
 
 export type GreetingKey =
   | "greetingLateNight"
@@ -166,8 +179,7 @@ export function fileToDetail(
     preview: file.preview || "",
     editable: Boolean(file.editable ?? kind === "text"),
     message: file.message || (kind === "unsupported" ? "暂不支持预览此文件" : ""),
-    // Prefer path-based URL so the current local token is always attached
-    rawUrl: withAuthToken(file.raw_url) || fileRawUrl(file.path),
+    rawUrl: fileRawUrl(file.path),
     highlightQuery: opts?.highlightQuery,
     focusLine: opts?.focusLine,
     forceEdit: false,
@@ -249,29 +261,219 @@ function toolArgsRecord(args: unknown): Record<string, unknown> {
   return {};
 }
 
-function asSubagentMsg(node: SubNode): ChatMsg {
+export function stripToolCallMarkup(text: string): string {
+  if (!text) return text;
+  if (
+    !/<tool_call\b|<function\s*=|<invoke\s+name=|<\/function>|<parameter\b|<\/parameter/i.test(
+      text,
+    )
+  ) {
+    return text;
+  }
+  let s = text.replace(/<\/?(?:minimax:)?tool_call>/gi, " ");
+  s = s.replace(/<function\s*=[\s\S]*?(?:<\/function>|$)/gi, " ");
+  s = s.replace(/<invoke\s+name=[^>]+>[\s\S]*?(?:<\/invoke>|$)/gi, " ");
+  s = s.replace(/<parameter\s*=[^>]*>[\s\S]*?<\/parameter>/gi, " ");
+  s = s.replace(/<\/parameter\s*=[^>]*>[\s\S]*?<\/parameter>/gi, " ");
+  s = s.replace(/<\/parameter>\s*[A-Za-z_][\w]*\s*>[\s\S]*?<\/parameter>/gi, " ");
+  s = s.replace(/<\/?parameter[^>]*>/gi, " ");
+  s = s.replace(/(?:^|\s)function\s*=\s*[A-Za-z0-9_.-]+/g, " ");
+  s = s.replace(/<\/(?:function|invoke)>/gi, " ");
+  return s.replace(/\s+/g, " ").trim();
+}
+
+/** Keep one robot per slot when history restore + live replay both emit cards. */
+export function dedupeCanvasNodes(nodes: SubNode[]): SubNode[] {
+  const out: SubNode[] = [];
+  for (const node of nodes) {
+    const hit = out.find((x) => sameSubagentSlot(x, node));
+    if (!hit) {
+      out.push(node);
+      continue;
+    }
+    const hitLen = (hit.transcript || []).length;
+    const nextLen = (node.transcript || []).length;
+    if (nextLen > hitLen) {
+      const idx = out.indexOf(hit);
+      out[idx] = {
+        ...hit,
+        ...node,
+        children: hit.children?.length ? hit.children : node.children,
+        transcript: node.transcript?.length ? node.transcript : hit.transcript,
+      };
+    } else if (node.children?.length && !hit.children?.length) {
+      hit.children = node.children;
+    }
+  }
+  return out;
+}
+
+export function asSubagentMsg(node: SubNode, stage?: number): ChatMsg {
   return {
     id: uid(),
     role: "subagent",
     content: node.summary || node.goal,
     subagent: node,
+    stage,
+    agent_id: node.id,
   };
 }
 
-function taskItemsFromDelegateArgs(args: Record<string, unknown>): { goal: string; role: string }[] {
+const GENERIC_SUBAGENT_ROLES = new Set(["leaf", "orchestrator", "task", "subagent"]);
+
+export function isGenericSubagentRole(role?: string): boolean {
+  const r = (role || "").trim().toLowerCase();
+  return !r || GENERIC_SUBAGENT_ROLES.has(r);
+}
+
+/** Match a live card to its spawn event without collapsing every `leaf` into one. */
+export function sameSubagentSlot(
+  existing: SubNode,
+  incoming: { id?: string; role?: string; goal?: string },
+): boolean {
+  if (incoming.id && existing.id === incoming.id) return true;
+  const existingId = String(existing.id || "");
+  const incomingId = String(incoming.id || "");
+  if (
+    incomingId &&
+    existingId &&
+    !isEphemeralCanvasId(existingId) &&
+    !isEphemeralCanvasId(incomingId)
+  ) {
+    return false;
+  }
+  if (canvasGoalsMatch(existing.goal, incoming.goal)) return true;
+  const role = (incoming.role || "").trim();
+  if (
+    role &&
+    !isGenericSubagentRole(role) &&
+    (existing.role === role ||
+      existing.goal === role ||
+      existing.goal.startsWith(`${role} —`) ||
+      existing.goal.startsWith(`You are ${role}`))
+  ) {
+    return true;
+  }
+  return false;
+}
+
+/** Bind tool-payload workers onto the live tree without creating extra roots. */
+export function unionCanvasNodes(
+  tree: SubNode[],
+  expanded: SubNode[],
+  declared?: number,
+): SubNode[] {
+  const preferTree = tree.length >= expanded.length;
+  const aligned = alignCanvasSlots(
+    preferTree ? tree : expanded,
+    preferTree ? expanded : tree,
+  );
+  const cap =
+    declared && declared > 0
+      ? declared
+      : tree.length && expanded.length
+        ? Math.min(tree.length, expanded.length)
+        : Math.max(tree.length, expanded.length);
+  return nestHelperAgents(dedupeCanvasNodes(limitCanvasRoots(aligned, cap)));
+}
+
+export function delegateSlotCount(name: string, args: unknown): number {
+  const rec = toolArgsRecord(args);
+  if (name === "delegate_task") return taskItemsFromDelegateArgs(rec).length;
+  if (name === "delegate_dialogue") return speakersFromDelegateArgs(rec).length;
+  return 0;
+}
+
+export function declaredDelegateSlotCount(messages: ChatMsg[], stage: number): number {
+  let total = 0;
+  for (const message of messages) {
+    if ((message.stage ?? 0) !== stage || message.role !== "tool" || !message.tool) continue;
+    if (!DELEGATE_TOOL_NAMES.has(message.tool.name)) continue;
+    total += delegateSlotCount(message.tool.name, message.tool.args);
+  }
+  return total;
+}
+
+export function canvasRootsForStage(messages: ChatMsg[], stage: number): SubNode[] {
+  const nodes = messages
+    .filter(
+      (message) =>
+        message.role === "subagent" &&
+        message.subagent &&
+        (message.stage ?? 0) === stage,
+    )
+    .map((message) => message.subagent!);
+  const declared = declaredDelegateSlotCount(messages, stage);
+  return nestHelperAgents(dedupeCanvasNodes(limitCanvasRoots(nodes, declared)));
+}
+
+function partyOwnsTask(party: SubNode, task: SubNode): boolean {
+  if (task.parent_id && (task.parent_id === party.id || task.parent_id === party.role)) {
+    return true;
+  }
+  const label = (party.role || "").trim();
+  if (!label || isGenericSubagentRole(label)) return false;
+  const hay = `${task.goal || ""} ${task.role || ""}`;
+  return hay.includes(label);
+}
+
+/** Dialogue cast stays the roots; nested delegate_task helpers hang off their owner. */
+export function nestHelperAgents(nodes: SubNode[]): SubNode[] {
+  if (nodes.length < 2) return nodes;
+  const cloned = nodes.map((n) => ({ ...n, children: [...(n.children || [])] }));
+  const byId = new Map(cloned.map((n) => [n.id, n]));
+  const nested = new Set<string>();
+  for (const node of cloned) {
+    const pid = (node.parent_id || "").trim();
+    if (!pid || pid === node.id) continue;
+    const host =
+      byId.get(pid) ||
+      cloned.find(
+        (p) =>
+          p.id !== node.id &&
+          ((p.role && p.role === pid) || (p.goal && p.goal === pid)),
+      );
+    if (!host) continue;
+    if (!(host.children || []).some((c) => c.id === node.id)) {
+      host.children = [...(host.children || []), node];
+    }
+    nested.add(node.id);
+  }
+  const remaining = cloned.filter((n) => !nested.has(n.id));
+  const parties = remaining.filter((n) => n.kind === "party" || n.kind === "talk");
+  const others = remaining.filter((n) => n.kind !== "party" && n.kind !== "talk");
+  if (parties.length < 2 || !others.length) return remaining;
+  const roots = parties.map((p) => ({ ...p, children: [...(p.children || [])] }));
+  for (const task of others) {
+    const host = roots.find((p) => partyOwnsTask(p, task)) || roots[roots.length - 1];
+    if (!(host.children || []).some((c) => c.id === task.id)) {
+      host.children = [...(host.children || []), task];
+    }
+  }
+  return roots;
+}
+
+export function taskItemsFromDelegateArgs(args: Record<string, unknown>): { goal: string; role: string }[] {
   const items: { goal: string; role: string }[] = [];
   const tasks = args.tasks;
   if (Array.isArray(tasks) && tasks.length) {
     for (const raw of tasks) {
+      if (typeof raw === "string") {
+        const goal = raw.trim();
+        if (goal) items.push({ goal, role: "leaf" });
+        continue;
+      }
       if (raw && typeof raw === "object" && !Array.isArray(raw)) {
         const rec = raw as Record<string, unknown>;
-        const goal = String(rec.goal || "").trim();
+        const goal = String(
+          rec.goal || rec.task || rec.query || rec.prompt || rec.description || "",
+        ).trim();
         if (goal) items.push({ goal, role: String(rec.role || "leaf") });
       }
     }
-    return items;
+    if (items.length) return items;
   }
-  const goal = String(args.goal || args.task || "").trim();
+  const goal = String(args.goal || args.task || args.query || args.prompt || "").trim();
   if (goal) items.push({ goal, role: String(args.role || "leaf") });
   return items;
 }
@@ -313,6 +515,7 @@ export function subagentMessagesFromDelegateTool(m: {
   args?: unknown;
   result?: string;
   status?: string;
+  stage?: number;
 }): ChatMsg[] {
   const name = m.name || "";
   if (!DELEGATE_TOOL_NAMES.has(name)) return [];
@@ -347,21 +550,23 @@ export function subagentMessagesFromDelegateTool(m: {
         row && typeof row === "object" && !Array.isArray(row)
           ? (row as Record<string, unknown>)
           : {};
-      const summary = String(rec.summary || "").trim();
+      const summary = String(rec.summary || rec.text || rec.result || "").trim();
       const err = summary.startsWith("ERROR");
-      const done = Boolean(summary) && !running;
+      const finished = !running;
       const node: SubNode = {
-        id: `restored:${callId}:${i}`,
+        id: canvasPlaceholderId("restored", callId, i),
         goal: item.goal,
         role: item.role || "leaf",
-        status: err ? "error" : done ? "done" : "running",
+        kind: "task",
+        parent_id: String(args.parent_id || args.owner || ""),
+        status: err ? "error" : finished ? "done" : "running",
         summary: summary || undefined,
-        activity: done || err ? undefined : "运行中…",
+        activity: finished || err ? undefined : "运行中…",
         transcript: summary
-          ? [{ id: uid(), kind: "assistant", text: summary }]
+          ? [{ id: uid(), kind: "assistant", text: stripToolCallMarkup(summary), turnAt: i }]
           : [],
       };
-      return asSubagentMsg(node);
+      return asSubagentMsg(node, m.stage);
     });
   }
 
@@ -377,42 +582,71 @@ export function subagentMessagesFromDelegateTool(m: {
     }
   }
   const turns = Array.isArray(resultObj?.turns) ? resultObj.turns : [];
+  const byName = new Map<string, SubTranscriptItem[]>();
+  turns.forEach((raw, idx) => {
+    if (!raw || typeof raw !== "object" || Array.isArray(raw)) return;
+    const rec = raw as Record<string, unknown>;
+    const speaker = String(rec.name || "").trim();
+    const text = String(rec.text || "").trim();
+    if (!speaker || !text) return;
+    const list = byName.get(speaker) || [];
+    list.push({ id: uid(), kind: "assistant", text: stripToolCallMarkup(text), turnAt: idx });
+    byName.set(speaker, list);
+  });
   return speakers.map((sp, i) => {
-    const speakerTurns = turns.filter(
-      (t) =>
-        t &&
-        typeof t === "object" &&
-        !Array.isArray(t) &&
-        String((t as Record<string, unknown>).name || "") === sp.name,
-    );
-    const texts = speakerTurns
-      .map((t) => String((t as Record<string, unknown>).text || "").trim())
-      .filter(Boolean);
-    const summary = texts.join("\n\n");
+    const transcript = byName.get(sp.name) || [];
+    const summary = transcript
+      .map((item) => (item.kind === "assistant" ? item.text : ""))
+      .filter(Boolean)
+      .join("\n\n");
     const done = hasResult && !running;
-    const transcript: SubTranscriptItem[] = texts.map((text) => ({
-      id: uid(),
-      kind: "assistant" as const,
-      text,
-    }));
     const node: SubNode = {
-      id: `restored:${callId}:${i}`,
+      id: canvasPlaceholderId("restored", callId, i),
       goal: sp.brief ? `${sp.name} — ${sp.brief}` : sp.name,
       role: sp.name,
+      kind: "party",
       status: done ? "done" : "running",
       summary: summary || undefined,
       activity: done ? undefined : "运行中…",
       transcript,
     };
-    return asSubagentMsg(node);
+    return asSubagentMsg(node, m.stage);
   });
 }
 
-export function mapSessionMessages(messages: SessionDetailMessage[]): ChatMsg[] {
+function latestCanvasTree(agentTree?: unknown[]): unknown[] {
+  if (!Array.isArray(agentTree) || !agentTree.length) return [];
+  const rows = agentTree.filter((raw) => raw && typeof raw === "object" && !Array.isArray(raw));
+  const waves = rows.map((raw) => Number((raw as Record<string, unknown>).turn || 0));
+  const latestTurn = Math.max(0, ...waves.filter(Number.isFinite));
+  if (latestTurn > 0) {
+    return rows.filter(
+      (raw) => Number((raw as Record<string, unknown>).turn || 0) === latestTurn,
+    );
+  }
+  return rows;
+}
+
+export function nodesFromAgentTree(agentTree?: unknown[]): SubNode[] {
+  return nestHelperAgents(
+    latestCanvasTree(agentTree)
+      .map((raw) => canvasItemToNode(raw))
+      .filter((n): n is SubNode => Boolean(n?.id)),
+  );
+}
+
+export function mapSessionMessages(
+  messages: SessionDetailMessage[],
+  agentTree?: unknown[],
+): ChatMsg[] {
+  const treeRoots = nodesFromAgentTree(agentTree);
+  const expandedByStage = new Map<number, SubNode[]>();
   const out: ChatMsg[] = [];
+  let stage = 0;
   for (const m of messages || []) {
     if (m.role === "user") {
       if (isHiddenUserContent(m.content || "")) continue;
+      stage += 1;
       const parsed = parseUserAttachments(
         normalizeRestoredUserContent(m.content || ""),
       );
@@ -421,17 +655,21 @@ export function mapSessionMessages(messages: SessionDetailMessage[]): ChatMsg[] 
         role: "user",
         content: parsed.text,
         attachments: parsed.attachments.length ? parsed.attachments : undefined,
+        stage,
+        agent_id: m.agent_id,
       });
       continue;
     }
     if (m.role === "assistant") {
-      const content = (m.content || "").trim();
+      const content = stripToolCallMarkup((m.content || "").trim());
       if (!content && !m.reasoning) continue;
       out.push({
         id: uid(),
         role: "assistant",
         content,
         reasoning: m.reasoning || undefined,
+        stage,
+        agent_id: m.agent_id,
       });
       continue;
     }
@@ -443,10 +681,20 @@ export function mapSessionMessages(messages: SessionDetailMessage[]): ChatMsg[] 
         args: m.args,
         result: m.result,
         status: m.status,
+        stage,
       });
       if (expanded.length) {
-        out.push(...expanded);
-        continue;
+        const nodes = expanded
+          .map((row) => row.subagent)
+          .filter((n): n is SubNode => Boolean(n));
+        expandedByStage.set(
+          stage,
+          unionCanvasNodes(
+            expandedByStage.get(stage) || [],
+            nodes,
+            (expandedByStage.get(stage) || []).length + nodes.length,
+          ),
+        );
       }
       const callId = m.call_id || uid();
       const statusRaw = (m.status || "done").toLowerCase();
@@ -472,10 +720,93 @@ export function mapSessionMessages(messages: SessionDetailMessage[]): ChatMsg[] 
         role: "tool",
         content: "",
         tool,
+        stage,
       });
     }
   }
+  const latestStage = Math.max(1, ...out.map((m) => m.stage ?? 0), stage);
+  if (treeRoots.length) {
+    const fromTools = expandedByStage.get(latestStage) || [];
+    expandedByStage.set(
+      latestStage,
+      unionCanvasNodes(treeRoots, fromTools, fromTools.length || treeRoots.length),
+    );
+  }
+  for (const [stageKey, nodes] of expandedByStage) {
+    const msgs = nodes.map((n) => asSubagentMsg(n, stageKey));
+    if (!msgs.length) continue;
+    let last = -1;
+    for (let i = 0; i < out.length; i++) {
+      if ((out[i].stage ?? 0) === stageKey) last = i;
+    }
+    if (last < 0) out.push(...msgs);
+    else out.splice(last + 1, 0, ...msgs);
+  }
   return out;
+}
+
+function canvasStatus(raw: unknown): SubNode["status"] {
+  const s = String(raw || "").toLowerCase();
+  if (s === "running" || s === "pending" || s === "streaming") return "running";
+  if (s === "error") return "error";
+  return "done";
+}
+
+function canvasItemToNode(raw: unknown): SubNode | null {
+  if (!raw || typeof raw !== "object" || Array.isArray(raw)) return null;
+  const rec = raw as Record<string, unknown>;
+  const id = String(rec.child_id || rec.id || "").trim();
+  if (!id) return null;
+  const kind =
+    rec.kind === "party" || rec.kind === "talk" || rec.kind === "task" ? rec.kind : "task";
+  const kids = Array.isArray(rec.children) ? rec.children : [];
+  const transcriptRaw = Array.isArray(rec.transcript) ? rec.transcript : [];
+  const transcript = transcriptRaw.flatMap((item, i) => {
+    if (!item || typeof item !== "object" || Array.isArray(item)) return [];
+    const row = item as Record<string, unknown>;
+    if (row.kind === "tool") {
+      const name = String(row.name || "tool");
+      return [
+        {
+          id: uid(),
+          kind: "tool" as const,
+          tool: {
+            id: uid(),
+            callId: String(row.call_id || uid()),
+            name,
+            summary: name,
+            status: "done" as const,
+            result: String(row.result || ""),
+          },
+        },
+      ];
+    }
+    const text = stripToolCallMarkup(String(row.text || row.content || ""));
+    const reasoning = String(row.reasoning || "");
+    if (!text && !reasoning) return [];
+    return [
+      {
+        id: uid(),
+        kind: "assistant" as const,
+        text,
+        reasoning: reasoning || undefined,
+        turnAt: i,
+      },
+    ];
+  });
+  const status = canvasStatus(rec.status);
+  return {
+    id,
+    goal: String(rec.goal || rec.label || rec.party || ""),
+    role: String(rec.party || rec.role || "leaf"),
+    kind,
+    parent_id: String(rec.parent_id || ""),
+    status,
+    summary: String(rec.summary || "").trim() || undefined,
+    activity: status === "running" ? String(rec.activity || "") || undefined : undefined,
+    transcript,
+    children: kids.map((c) => canvasItemToNode(c)).filter((n): n is SubNode => Boolean(n)),
+  };
 }
 
 export function findSubNode(node: SubNode, id: string): SubNode | null {
@@ -485,6 +816,39 @@ export function findSubNode(node: SubNode, id: string): SubNode | null {
     if (hit) return hit;
   }
   return null;
+}
+
+/** Short name for a spawned agent on the canvas / detail header. */
+export function subagentDisplayName(node: SubNode, fallback = "Agent"): string {
+  const role = (node.role || "").trim();
+  if (role && role !== "leaf" && role !== "orchestrator" && !isColorSideLabel(role)) {
+    return role;
+  }
+  const goal = (node.goal || "").trim();
+  const dash = goal.split(/[—–-]/)[0]?.trim() || "";
+  const fromGoal = dash || goal;
+  if (fromGoal && !isColorSideLabel(fromGoal)) return fromGoal;
+  return fallback;
+}
+
+/** 红方/蓝方 clash with canvas robot hues — never show them as labels. */
+export function isColorSideLabel(name: string): boolean {
+  const n = (name || "").trim();
+  return /^(红方|蓝方|红队|蓝队|红色方|蓝色方|red(?:\s*team)?|blue(?:\s*team)?|team\s*red|team\s*blue)$/i.test(
+    n,
+  );
+}
+
+/** Before the first token, streaming looks like output — label it as thinking. */
+export function streamPhaseSuffix(
+  streaming: boolean,
+  opts: { reasoningStreaming?: boolean; text?: string; reasoning?: string },
+  t: (key: "thinking" | "outputting") => string,
+): string {
+  if (!streaming) return "";
+  const hasText = Boolean((opts.text || "").trim());
+  if (opts.reasoningStreaming || !hasText) return ` · ${t("thinking")}`;
+  return ` · ${t("outputting")}`;
 }
 
 export function mapSubNode(

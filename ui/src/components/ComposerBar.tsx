@@ -1,5 +1,4 @@
 import { useRef, type RefObject } from "react";
-import { AskDialog } from "./AskDialog";
 import { AtFileMenu, stripTrailingAtQuery } from "./AtFileMenu";
 import { ChangesBar } from "./ChangesBar";
 import { DiffReview } from "./DiffReview";
@@ -13,7 +12,6 @@ import type { ActivePlan } from "./TaskPlanPanel";
 import type { SlashMenuItem } from "../slash/commands";
 import type {
   ApprovalPrompt,
-  AskPrompt,
   QueuedMsg,
 } from "../types/chat";
 import type { FileDiffPreview } from "../utils/diffPreview";
@@ -22,7 +20,6 @@ import { formatArgs } from "../utils/chatHelpers";
 import type { ModelSetup, ModelRole } from "../types/modelSetup";
 import type { PlanConfirmState } from "../types/plan";
 import type { Locale, MsgKey } from "../i18n";
-import { ASK_CUSTOM_KEY } from "../types/chat";
 
 export type ComposerBarProps = {
   t: (key: MsgKey, ...args: string[]) => string;
@@ -71,16 +68,13 @@ export type ComposerBarProps = {
   approval: ApprovalPrompt | null;
   approvalDiff: FileDiffPreview | null;
   approvalDiffLoading: boolean;
-  askPrompt: AskPrompt | null;
-  askChoice: string;
-  askOtherText: string;
-  askSubmitting: boolean;
   ctxPct: number;
   ctxWarn: boolean;
   ctx: { tokens: number; limit: number };
   model: ModelSetup | null;
   modelSwitchRole: ModelRole;
   setModelSwitchRole: (role: ModelRole) => void;
+  modelSaving?: boolean;
   onSend: () => void;
   onStopChat: () => void;
   onApplySlashItem: (item: SlashMenuItem) => void;
@@ -97,9 +91,6 @@ export type ComposerBarProps = {
     remember?: boolean,
     patchArgs?: Record<string, unknown>,
   ) => void;
-  onResolveAsk: (choice: string, otherText?: string) => void;
-  setAskChoice: (key: string) => void;
-  setAskOtherText: (text: string) => void;
   onOpenSettings: (tab?: "workspace" | "model") => void;
   onSwitchModelRole: (role: ModelRole, providerId: string, modelId: string) => void;
   gitRefreshKey?: number;
@@ -136,16 +127,13 @@ export function ComposerBar({
   approval,
   approvalDiff,
   approvalDiffLoading,
-  askPrompt,
-  askChoice,
-  askOtherText,
-  askSubmitting,
   ctxPct,
   ctxWarn,
   ctx,
   model,
   modelSwitchRole,
   setModelSwitchRole,
+  modelSaving = false,
   onSend,
   onStopChat,
   onApplySlashItem,
@@ -155,9 +143,6 @@ export function ComposerBar({
   onRemoveQueued,
   onResolvePlanConfirm,
   onResolveApproval,
-  onResolveAsk,
-  setAskChoice,
-  setAskOtherText,
   onOpenSettings,
   onSwitchModelRole,
   gitRefreshKey = 0,
@@ -295,31 +280,6 @@ export function ComposerBar({
             </button>
           </div>
         </div>
-      )}
-      {askPrompt && (
-        <AskDialog
-          question={askPrompt.question}
-          options={askPrompt.options}
-          allowCustom={askPrompt.allowCustom}
-          customLabel={askPrompt.customLabel}
-          choice={askChoice}
-          otherText={askOtherText}
-          submitting={askSubmitting}
-          titleLabel={t("askNeeded")}
-          dialogLabel={t("askDialog")}
-          submitLabel={t("askSubmit")}
-          otherPlaceholder={t("askOtherPlaceholder")}
-          onPick={(key) => {
-            setAskChoice(key);
-            void onResolveAsk(key);
-          }}
-          onOtherChange={(text) => {
-            setAskChoice(ASK_CUSTOM_KEY);
-            setAskOtherText(text);
-          }}
-          onOtherFocus={() => setAskChoice(ASK_CUSTOM_KEY)}
-          onSubmitCustom={() => void onResolveAsk(ASK_CUSTOM_KEY, askOtherText)}
-        />
       )}
       <form
         className="composer"
@@ -557,6 +517,7 @@ export function ComposerBar({
             setup={model}
             locale={locale}
             role={modelSwitchRole}
+            saving={modelSaving}
             onRoleChange={setModelSwitchRole}
             onSelect={(role, providerId, modelId) =>
               void onSwitchModelRole(role, providerId, modelId)

@@ -54,6 +54,7 @@ def save_session(
     session_id: Optional[str] = None,
     user_id: Optional[str] = None,
     title: str = "",
+    extra: Optional[dict[str, Any]] = None,
 ) -> Path:
     from .tenant_context import get_user_id
 
@@ -80,13 +81,28 @@ def save_session(
         title=(title or prev_title or "").strip(),
     )
     path.write_text(
-        json.dumps({"meta": asdict(meta), "messages": messages}, ensure_ascii=False, indent=2),
+        json.dumps(
+            {
+                "meta": asdict(meta),
+                "messages": messages,
+                **{k: v for k, v in (extra or {}).items() if v is not None},
+            },
+            ensure_ascii=False,
+            indent=2,
+        ),
         encoding="utf-8",
     )
     return path
 
 
 def load_session(path: Path) -> tuple[SessionMeta, list[dict[str, Any]]]:
+    meta, messages, _extra = load_session_bundle(path)
+    return meta, messages
+
+
+def load_session_bundle(
+    path: Path,
+) -> tuple[SessionMeta, list[dict[str, Any]], dict[str, Any]]:
     data = json.loads(path.read_text(encoding="utf-8"))
     m = data.get("meta") or {}
     meta = SessionMeta(
@@ -101,7 +117,8 @@ def load_session(path: Path) -> tuple[SessionMeta, list[dict[str, Any]]]:
     messages = data.get("messages") or []
     if not isinstance(messages, list):
         raise ValueError("invalid session: messages must be a list")
-    return meta, messages
+    extra = {k: v for k, v in data.items() if k not in ("meta", "messages")}
+    return meta, messages, extra
 
 
 def workspace_matches(session_ws: str, current_ws: str | Path) -> bool:

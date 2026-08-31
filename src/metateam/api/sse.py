@@ -157,4 +157,19 @@ def gate_replay_events(sess: ChatSession) -> list[dict[str, Any]]:
                 parent_id=agent_id if nested else "",
             )
         )
+    try:
+        tree = sess.agent.canvas_tree()
+    except Exception:
+        tree = []
+    if tree:
+        events.append(
+            event_payload(
+                "canvas_sync",
+                {
+                    "tree": tree,
+                    "turn": int(getattr(sess.agent, "_canvas_turn", 0) or 0),
+                },
+                agent_id=agent_id,
+            )
+        )
     return events

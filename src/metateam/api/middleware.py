@@ -35,7 +35,7 @@ def default_is_public(method: str, path: str) -> bool:
 
 
 def bind_tenant_workspace(user_id: str) -> None:
-    """Apply this user's settings overlay; do not rewrite live chats' folders."""
+    """Bind this user's overlay (workspace / skills / memory) onto live sessions."""
     get_settings()
     try:
         STORE.refresh_settings(
@@ -73,8 +73,6 @@ class LocalAuthMiddleware(BaseHTTPMiddleware):
         public = self._is_public(request.method, path)
         if path.startswith("/api/") and not public:
             token = request.headers.get(TOKEN_HEADER) or request.headers.get("X-Sidekick-Token")
-            if not token:
-                token = request.query_params.get("token")
             resolved = resolve_token(token)
             if not resolved:
                 return JSONResponse({"detail": "missing or invalid local token"}, status_code=401)
