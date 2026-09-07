@@ -8,20 +8,20 @@ from fastapi import APIRouter, File, HTTPException, Request, UploadFile
 from fastapi.responses import FileResponse
 
 from ...services import fs_api, fs_undo
-from ..http import call_fs, require_loopback, raise_fs_http
+from ..http import call_fs, require_loopback, raise_fs_http, workspace_override
 from ..schemas import FileCreate, FileMove, FileRename, FileReveal, FileWrite, UndoBody
 
 router = APIRouter(prefix="/api/files", tags=["files"])
 
 
 @router.get("")
-def api_files_list(path: str = ".") -> dict[str, Any]:
-    return call_fs(fs_api.list_entries, path)
+def api_files_list(path: str = ".", workspace: str | None = None) -> dict[str, Any]:
+    return call_fs(fs_api.list_entries, path, workspace=workspace)
 
 
 @router.get("/search")
-def api_files_search(q: str = "", path: str = ".") -> dict[str, Any]:
-    return call_fs(fs_api.search_workspace, q, path=path)
+def api_files_search(q: str = "", path: str = ".", workspace: str | None = None) -> dict[str, Any]:
+    return call_fs(fs_api.search_workspace, q, path=path, workspace=workspace)
 
 
 @router.post("/upload")
@@ -41,14 +41,15 @@ async def api_files_upload(file: UploadFile = File(...)) -> dict[str, Any]:
 
 
 @router.get("/content")
-def api_files_read(path: str) -> dict[str, Any]:
-    return call_fs(fs_api.read_file, path)
+def api_files_read(path: str, workspace: str | None = None) -> dict[str, Any]:
+    return call_fs(fs_api.read_file, path, workspace=workspace)
 
 
 @router.get("/raw")
-def api_files_raw(path: str) -> FileResponse:
+def api_files_raw(path: str, workspace: str | None = None) -> FileResponse:
     try:
-        fp = fs_api.safe_resolve(path)
+        with workspace_override(workspace):
+            fp = fs_api.safe_resolve(path)
     except ValueError as exc:
         raise_fs_http(exc)
     if not fp.exists() or not fp.is_file():
@@ -63,34 +64,34 @@ def api_files_raw(path: str) -> FileResponse:
 
 @router.put("/content")
 def api_files_write(body: FileWrite) -> dict[str, Any]:
-    return call_fs(fs_api.write_text, body.path, body.content)
+    return call_fs(fs_api.write_text, body.path, body.content, workspace=body.workspace)
 
 
 @router.post("")
 def api_files_create(body: FileCreate) -> dict[str, Any]:
     kind = body.kind if body.kind in ("file", "dir") else "file"
-    return call_fs(fs_api.create_entry, body.path, kind)
+    return call_fs(fs_api.create_entry, body.path, kind, workspace=body.workspace)
 
 
 @router.delete("")
-def api_files_delete(path: str, recursive: bool = False) -> dict[str, Any]:
-    return call_fs(fs_api.delete_entry, path, recursive=recursive)
+def api_files_delete(path: str, recursive: bool = False, workspace: str | None = None) -> dict[str, Any]:
+    return call_fs(fs_api.delete_entry, path, recursive=recursive, workspace=workspace)
 
 
 @router.post("/rename")
 def api_files_rename(body: FileRename) -> dict[str, Any]:
-    return call_fs(fs_api.rename_entry, body.path, body.new_name)
+    return call_fs(fs_api.rename_entry, body.path, body.new_name, workspace=body.workspace)
 
 
 @router.post("/move")
 def api_files_move(body: FileMove) -> dict[str, Any]:
-    return call_fs(fs_api.move_entry, body.path, body.dest_dir)
+    return call_fs(fs_api.move_entry, body.path, body.dest_dir, workspace=body.workspace)
 
 
 @router.post("/reveal")
 def api_files_reveal(request: Request, body: FileReveal) -> dict[str, Any]:
     require_loopback(request)
-    return call_fs(fs_api.reveal_in_os, body.path)
+    return call_fs(fs_api.reveal_in_os, body.path, workspace=body.workspace)
 
 
 @router.get("/undo")

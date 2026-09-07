@@ -12,7 +12,7 @@ from sse_starlette.sse import EventSourceResponse
 
 from ...core.events import Event
 from ...core.logutil import get_logger, log_exception
-from ...runtime.context import messages_tokens
+from ...runtime.context import context_budget_tokens, messages_tokens
 from ...services.store import (
     STORE,
     _summarize_title,
@@ -31,7 +31,7 @@ _log = get_logger("metateam.api.chat")
 async def chat_sse(req: ChatRequest) -> EventSourceResponse:
     sess = STORE.get(req.session_id) if req.session_id else None
     if sess is None:
-        sess = STORE.create()
+        sess = STORE.create(workspace=req.workspace or None)
 
     display = (req.display or "").strip()
     title_src = display or req.message
@@ -66,6 +66,13 @@ async def chat_sse(req: ChatRequest) -> EventSourceResponse:
             sess.updated_at = time.time()
             sess.stop_requested = False
             sess.busy = True
+            try:
+                from ...services.model_config import apply_auto_for_task
+
+                if apply_auto_for_task(sess.agent.settings, req.message):
+                    sess.agent.rebuild_llms()
+            except Exception as exc:
+                log_exception(_log, f"auto model selection failed for {sess.id}", exc)
             result = sess.agent.run(
                 req.message,
                 mode=req.mode or "agent",
@@ -78,10 +85,17 @@ async def chat_sse(req: ChatRequest) -> EventSourceResponse:
                     _log.error("persist returned None for session %s", sess.id)
             except Exception as exc:
                 log_exception(_log, f"persist failed for {sess.id}", exc)
+            try:
+                _schemas = sess.agent.registry.schemas()
+                context_tokens = context_budget_tokens(sess.agent.messages, _schemas)
+            except Exception:
+                context_tokens = messages_tokens(result.messages)
             final_data = {
                 "text": result.text,
                 "iterations": result.iterations,
                 "tokens": messages_tokens(result.messages),
+                "context_tokens": context_tokens,
+                "context_limit": int(getattr(sess.agent.settings, "context_limit", 0) or 0),
                 "review": result.review,
                 "session_id": sess.id,
                 "cancelled": result.cancelled,
@@ -102,6 +116,12 @@ async def chat_sse(req: ChatRequest) -> EventSourceResponse:
             q.put(event_payload("error", {"message": str(exc)}))
         finally:
             sess.busy = False
+            try:
+                from ...services.shell_job_notify import flush_pending_job_notices
+
+                flush_pending_job_notices(sess.id)
+            except Exception as flush_exc:
+                log_exception(_log, f"flush job notices failed for {sess.id}", flush_exc)
             unsub()
             q.put(None)
 

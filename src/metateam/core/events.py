@@ -39,6 +39,8 @@ KNOWN_EVENT_TYPES = frozenset(
         "subagent_end",
         "canvas_sync",
         "parallel_batch",
+        "browser_open",
+        "shell_job",
         "max_iterations",
         "cancelled",
         "review",

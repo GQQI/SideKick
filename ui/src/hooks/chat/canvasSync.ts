@@ -2,9 +2,12 @@ import type { Dispatch, MutableRefObject, SetStateAction } from "react";
 import type { ChatMsg, SubNode } from "../../types/chat";
 import {
   asSubagentMsg,
+  canvasTurnFromAgentTree,
   declaredDelegateSlotCount,
   findSubNode,
+  isDelegateToolMsg,
   nodesFromAgentTree,
+  placeCanvasMessages,
   sameSubagentSlot,
   taskItemsFromDelegateArgs,
   unionCanvasNodes,
@@ -91,33 +94,27 @@ export function replaceStageSubagents(
     return mergeSubNode(prevMsg?.subagent, n);
   });
   const msgs = merged.map((n) => asSubagentMsg(n, targetStage));
-  const out: ChatMsg[] = [];
-  let inserted = false;
-  for (const m of live) {
-    if (m.role === "subagent" && (m.stage ?? 0) === targetStage) {
-      if (!inserted) {
-        out.push(...msgs);
-        inserted = true;
-      }
-      continue;
-    }
-    out.push(m);
-  }
-  if (!inserted) out.push(...msgs);
-  ctx.commit(out);
+  ctx.commit(placeCanvasMessages(live, msgs, targetStage));
   ctx.setSubs(merged);
 }
 
-export function applyCanvasTree(ctx: CanvasSyncCtx, tree: unknown) {
+function canvasStageFromTranscript(live: ChatMsg[], treeTurn = 0): number {
+  const stages = new Set(live.map((m) => m.stage ?? 0));
+  if (treeTurn > 0 && stages.has(treeTurn)) return treeTurn;
+  const subStages = live.filter((m) => m.role === "subagent").map((m) => m.stage ?? 0);
+  if (subStages.length) return Math.max(...subStages);
+  const delegateStages = live.filter(isDelegateToolMsg).map((m) => m.stage ?? 0);
+  if (delegateStages.length) return Math.max(...delegateStages);
+  if (treeTurn > 0) return treeTurn;
+  return Math.max(1, ...live.map((m) => m.stage ?? 0));
+}
+
+export function applyCanvasTree(ctx: CanvasSyncCtx, tree: unknown, turn?: number) {
   const incoming = nodesFromAgentTree(Array.isArray(tree) ? tree : []);
   if (!incoming.length) return;
   const live = ctx.transcriptRef.current;
-  const stage = Math.max(
-    0,
-    ...live.filter((m) => m.role === "subagent").map((m) => m.stage ?? 0),
-    ...live.map((m) => m.stage ?? 0),
-  );
-  const targetStage = stage || 1;
+  const treeTurn = Number(turn) || canvasTurnFromAgentTree(Array.isArray(tree) ? tree : []);
+  const targetStage = canvasStageFromTranscript(live, treeTurn);
   const existing = stageCanvasNodes(live, targetStage);
   const declared = declaredDelegateSlotCount(live, targetStage) || incoming.length;
   replaceStageSubagents(

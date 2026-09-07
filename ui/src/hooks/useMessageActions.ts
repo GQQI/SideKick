@@ -1,5 +1,6 @@
 import {
   browseWorkspace,
+  createSession,
   deleteSession,
   fetchHealth,
   fetchMemory,
@@ -8,12 +9,12 @@ import {
   fetchSessions,
   fetchSkills,
   fetchWorkspaces,
+  forgetWorkspace,
   HISTORY_PAGE_SIZE,
   readFileContent,
   saveSession,
   setWorkspace,
   truncateSession,
-  replaySession,
   uploadFile,
   type Health,
   type SkillItem,
@@ -38,6 +39,7 @@ import { uid } from "../utils/chatHelpers";
 import { modelLabel } from "../types/modelSetup";
 import type { ModelSetup } from "../types/modelSetup";
 import type { MsgKey, Locale } from "../i18n";
+import type { ActivePlan } from "../types/plan";
 
 export type MessageActionsDeps = {
   t: (key: MsgKey, ...args: string[]) => string;
@@ -93,7 +95,7 @@ export type MessageActionsDeps = {
   setSessionsPage: React.Dispatch<React.SetStateAction<number>>;
   setSessionsTotal: React.Dispatch<React.SetStateAction<number>>;
   setSessionsTotalPages: React.Dispatch<React.SetStateAction<number>>;
-  setSidePanel: (p: "files" | "search" | "history" | "browser") => void;
+  setSidePanel: (p: "files" | "search" | "history" | "browser" | "git" | "undo" | "jobs") => void;
   setExplorerCollapsed: (v: boolean) => void;
   setDetail: React.Dispatch<React.SetStateAction<DetailView>>;
   setLive: React.Dispatch<React.SetStateAction<import("../types/chat").LiveLine[]>>;
@@ -102,6 +104,7 @@ export type MessageActionsDeps = {
   setAskPrompt: React.Dispatch<React.SetStateAction<AskPrompt | null>>;
   setAskChoice: React.Dispatch<React.SetStateAction<string>>;
   setAskOtherText: React.Dispatch<React.SetStateAction<string>>;
+  setActivePlan: React.Dispatch<React.SetStateAction<ActivePlan | null>>;
   setEditingId: React.Dispatch<React.SetStateAction<string | null>>;
   setEditDraft: React.Dispatch<React.SetStateAction<string>>;
   setEditRestorePrompt: React.Dispatch<
@@ -130,6 +133,8 @@ export type MessageActionsDeps = {
     opts?: { userDisplay?: string; attachments?: MsgAttachment[] },
   ) => void;
   clearQueued: () => void;
+  /** How many messages are queued for whichever chat is currently focused. */
+  queuedCount?: number;
   sendChat: (
     msg: string,
     opts?: {
@@ -151,13 +156,21 @@ export function useMessageActions(deps: MessageActionsDeps) {
     memory, setMemory, model, health, stats, ctx, activeWs, setActiveWs, setWorkspaces,
     setHealth, setModel, setWsBusy, setFsRefresh, setToast, setSessionId, setSessions, setSessionsPage,
     setSessionsTotal, setSessionsTotalPages, setSidePanel, setExplorerCollapsed, setDetail,
-    setLive, setSubs, setApproval, setAskPrompt, setAskChoice, setAskOtherText,
+    setLive, setSubs, setApproval, setAskPrompt, setAskChoice, setAskOtherText, setActivePlan,
     setEditingId, setEditDraft, setEditRestorePrompt, editDraft, editRestorePrompt,
     setCopiedId, openSettings, openMemory, openChat, openHistoryPanel, refreshSessions, applySessionDetail,
     resetContextUsage, commit, appendMsg, transcriptRef, busyRef, streamIdRef,
     streamTextRef, streamReasoningRef, nativeReasoningRef, enqueueMessage, clearQueued,
-    sendChat, stopChat, detachListener, setBusy,
+    queuedCount = 0, sendChat, stopChat, detachListener, setBusy,
   } = deps;
+
+  /** Switching chats drops any drafts still queued for the one we're leaving. */
+  function warnAndClearQueued() {
+    if (queuedCount > 0) {
+      setToast(`已离开该对话：${queuedCount} 条排队消息未发送`);
+    }
+    clearQueued();
+  }
 
 async function applyAtFile(item: { path: string; name: string; kind?: string }) {
   setInput(stripTrailingAtQuery(input));
@@ -299,6 +312,7 @@ async function runSlashCommand(raw: string): Promise<boolean> {
       setLive([]);
       setSubs([]);
       setDetail(null);
+      setActivePlan(null);
       clearQueued();
       setAttachments([]);
       if (sessionId) {
@@ -339,7 +353,7 @@ async function runSlashCommand(raw: string): Promise<boolean> {
             return s;
           });
       if (!list.length) {
-        postSystem("暂无 Skills。可在 `skills/` 下添加 `SKILL.md`。");
+        postSystem("暂无 Skills。打开 设置 → 技能 导入或新建 SKILL.md。");
       } else {
         const body = [
           `共 ${list.length} 个 Skill（输入 \`/skill <名称> [指令]\` 调用）：`,
@@ -435,7 +449,9 @@ async function runSlashCommand(raw: string): Promise<boolean> {
       setToast(t("navBrowser"));
       return true;
     case "settings":
-      openSettings(args === "model" ? "model" : "workspace");
+      openSettings(
+        args === "model" ? "model" : args === "skills" || args === "skill" ? "skills" : "workspace",
+      );
       return true;
     default:
       postSystem(`命令 \`/${def.name}\` 尚未实现。`);
@@ -486,7 +502,7 @@ function applySlashItem(item: SlashMenuItem) {
 async function newChat() {
   sessionIdRef.current = null;
   detachListener();
-  clearQueued();
+  warnAndClearQueued();
   setAttachments([]);
   streamIdRef.current = null;
   streamTextRef.current = "";
@@ -507,13 +523,63 @@ async function newChat() {
   void refreshSessions(1);
 }
 
+/**
+ * Start a brand-new chat pinned to `path` without touching the tenant's
+ * single "active" workspace — other open chats keep running against
+ * whatever folder they were already bound to.
+ */
+async function newChatInWorkspace(path: string) {
+  if (!path) return;
+  // Detach from whatever chat is currently displayed FIRST — a slow
+  // createSession round-trip must never leave the old session's busy/stream
+  // state bleeding into the freshly opened tab (it would wrongly look
+  // "queued" the moment this new chat's first message is sent).
+  sessionIdRef.current = null;
+  detachListener();
+  warnAndClearQueued();
+  setAttachments([]);
+  streamIdRef.current = null;
+  streamTextRef.current = "";
+  streamReasoningRef.current = "";
+  nativeReasoningRef.current = false;
+  commit([]);
+  setLive([]);
+  setSubs([]);
+  setDetail(null);
+  setApproval(null);
+  setAskPrompt(null);
+  setAskChoice("");
+  setAskOtherText("");
+  resetContextUsage();
+  setBusy(false);
+  setSessionId(null);
+
+  const res = await createSession(path);
+  sessionIdRef.current = res.id;
+  setSessionId(res.id);
+  if (res.workspace?.path) {
+    setActiveWs(res.workspace);
+  }
+  setToast(res.workspace ? `新对话 · 工作区：${res.workspace.path}` : t("chatDraftStarted"));
+  void refreshSessions(1);
+  // The backend pins this folder into the recent-workspaces list — refresh
+  // so it actually shows up (e.g. in Settings) instead of only the one
+  // workspace that was active when the page loaded.
+  try {
+    const ws = await fetchWorkspaces();
+    setWorkspaces(ws.items);
+  } catch {
+    /* ignore */
+  }
+}
+
 async function openSession(id: string) {
   if (id === sessionIdRef.current) {
     return;
   }
   sessionIdRef.current = id;
   detachListener();
-  clearQueued();
+  warnAndClearQueued();
   setBusy(false);
   const detailSession = await fetchSession(id);
   applySessionDetail(detailSession);
@@ -555,6 +621,33 @@ async function browseAndSetWorkspace() {
       return;
     }
     await switchWorkspace(res.path);
+  } catch (e) {
+    setToast(e instanceof Error ? e.message : String(e));
+  } finally {
+    setWsBusy(false);
+  }
+}
+
+async function removeWorkspaceEntry(path: string) {
+  try {
+    const res = await forgetWorkspace(path);
+    setWorkspaces(res.items);
+    if (res.active?.path) setActiveWs(res.active);
+    setToast(`已移除工作区：${path}`);
+  } catch (e) {
+    setToast(e instanceof Error ? e.message : String(e));
+  }
+}
+
+async function browseForNewChat() {
+  setWsBusy(true);
+  try {
+    const res = await browseWorkspace();
+    if (res.cancelled || !res.path) {
+      setToast("已取消选择");
+      return;
+    }
+    await newChatInWorkspace(res.path);
   } catch (e) {
     setToast(e instanceof Error ? e.message : String(e));
   } finally {
@@ -671,6 +764,8 @@ async function submitEdit(msgId: string, restoreFiles: boolean) {
   setDetail(null);
   setSubs([]);
   setLive([]);
+  // The truncated turns may include the plan that is pinned above the composer.
+  setActivePlan(null);
   setApproval(null);
   setAskPrompt(null);
   setAskChoice("");
@@ -697,53 +792,6 @@ async function submitEdit(msgId: string, restoreFiles: boolean) {
     }
   }
   await sendChat(text);
-}
-
-async function replayTurn(userTurn: number, fallbackText = "") {
-  if (busyRef.current) {
-    setToast(t("editBusy"));
-    return;
-  }
-  if (!sessionId) {
-    setToast(t("undoReplayNeedSession"));
-    return;
-  }
-  const list = transcriptRef.current;
-  let seen = 0;
-  let cut = list.length;
-  for (let i = 0; i < list.length; i++) {
-    if (list[i].role === "user") {
-      if (seen === userTurn) {
-        cut = i;
-        break;
-      }
-      seen += 1;
-    }
-  }
-  commit(list.slice(0, cut));
-  setDetail(null);
-  setSubs([]);
-  setLive([]);
-  setApproval(null);
-  setAskPrompt(null);
-  setAskChoice("");
-  setAskOtherText("");
-  try {
-    const res = await replaySession(sessionId, userTurn, { restoreFiles: true });
-    setFsRefresh((n) => n + 1);
-    const text = (res.user_text || fallbackText || "").trim();
-    if (!text) {
-      setToast(t("undoReplayNoText"));
-      return;
-    }
-    const n = res.file_undo?.undone_count ?? 0;
-    if (n > 0) {
-      setToast(t("undoReplayOk", String(n)));
-    }
-    await sendChat(text, { showUser: true });
-  } catch (e) {
-    setToast(e instanceof Error ? e.message : String(e));
-  }
 }
 
 async function addAttachments(files: FileList | null) {
@@ -900,16 +948,18 @@ async function send(text?: string) {
     runSlashCommand,
     applySlashItem,
     newChat,
+    newChatInWorkspace,
     openSession,
     switchWorkspace,
     browseAndSetWorkspace,
+    browseForNewChat,
+    removeWorkspaceEntry,
     removeSession,
     copyBubble,
     startEditUser,
     cancelEdit,
     requestSubmitEdit,
     submitEdit,
-    replayTurn,
     addAttachments,
     buildMessageWithAttachments,
     send,

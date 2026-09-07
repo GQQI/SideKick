@@ -1,5 +1,5 @@
 import { IconFolder, IconPlus } from "./icons";
-import { IconRobotCube } from "./IconRobotCube";
+import { BrandMark } from "./BrandMark";
 
 export type WelcomeWorkspace = {
   path: string;
@@ -35,9 +35,12 @@ export function WelcomeGate({
       <div className="welcome-stage">
         <div className="welcome-brand">
           <span className="welcome-brand-mark">
-            <IconRobotCube size={48} />
+            <BrandMark size={52} />
           </span>
-          <span className="welcome-brand-name">Sidekick</span>
+          <div className="welcome-brand-text">
+            <span className="welcome-brand-name">Sidekick</span>
+            <span className="welcome-brand-sub">AI AGENT SYSTEM</span>
+          </div>
         </div>
 
         <h1 className="welcome-title">{title}</h1>

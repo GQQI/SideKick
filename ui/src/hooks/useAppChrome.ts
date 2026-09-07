@@ -36,6 +36,8 @@ type Deps = {
   compressState: CompressState;
   bootReady: boolean;
   contextLimit?: number;
+  /** When a session is open, its own limit (from /api/sessions and runtime events) wins. */
+  hasSession: boolean;
   setCtx: React.Dispatch<React.SetStateAction<{ tokens: number; limit: number }>>;
   toast: string;
   setToast: (msg: string) => void;
@@ -84,10 +86,13 @@ export function useAppChrome(d: Deps) {
   }, []);
 
   useEffect(() => {
-    if (d.contextLimit) {
+    // /api/health reports the *global* settings' window. A live session may run
+    // a different model (auto-routing, per-session switch), so only use the
+    // global value as a placeholder until a session supplies its own limit.
+    if (d.contextLimit && !d.hasSession) {
       d.setCtx((c) => ({ ...c, limit: d.contextLimit || c.limit }));
     }
-  }, [d.contextLimit]);
+  }, [d.contextLimit, d.hasSession]);
 
   useEffect(() => {
     if (!d.stickBottomRef.current) return;

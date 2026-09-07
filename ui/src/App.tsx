@@ -3,8 +3,11 @@ import {
   authLogin,
   authLogout,
   authSetup,
+  fetchShellJobs,
+  fetchSkills,
   type Health,
   type SessionItem,
+  type ShellJobSnapshot,
   type SkillItem,
   type WorkspaceItem,
 } from "./api";
@@ -14,6 +17,7 @@ import {
   loadSidePanel,
 } from "./layoutPersist";
 import { saveActiveSessionId } from "./sessionPersist";
+import { loadOpenTabs, saveOpenTabs, type ChatTabRef } from "./chatTabsPersist";
 import { usePrefs } from "./prefs";
 import type { ModelSetup, ModelRole } from "./types/modelSetup";
 import {
@@ -39,6 +43,7 @@ import { ActivitySidebar } from "./components/ActivitySidebar";
 import { AppHeader } from "./components/AppHeader";
 import type { BrowserOpenRequest } from "./components/BrowserPanel";
 import { ChatThread } from "./components/ChatThread";
+import { ChatTabsBar, type ChatTabView } from "./components/ChatTabsBar";
 import { ComposerBar } from "./components/ComposerBar";
 import { ConfirmBanner } from "./components/ConfirmBanner";
 import { DetailPanel } from "./components/DetailPanel";
@@ -88,6 +93,7 @@ export function App() {
     email?: string;
   } | null>(null);
   const [sessions, setSessions] = useState<SessionItem[]>([]);
+  const [openTabs, setOpenTabs] = useState<ChatTabRef[]>(() => loadOpenTabs());
   const [sessionsPage, setSessionsPage] = useState(1);
   const [sessionsTotal, setSessionsTotal] = useState(0);
   const [sessionsTotalPages, setSessionsTotalPages] = useState(1);
@@ -109,6 +115,11 @@ export function App() {
   const [sidePanel, setSidePanel] = useState(loadSidePanel);
   const [sandboxUrlPrompt, setSandboxUrlPrompt] = useState<SandboxUrlPromptState | null>(null);
   const [browserOpenRequest, setBrowserOpenRequest] = useState<BrowserOpenRequest | null>(null);
+  const lastBrowserOpenRef = useRef<{ url: string; at: number } | null>(null);
+  const [shellJobs, setShellJobs] = useState<ShellJobSnapshot[]>([]);
+  const [jobsTick, setJobsTick] = useState(0);
+  const [jobsFocusId, setJobsFocusId] = useState("");
+  const jobStatusRef = useRef<Record<string, string>>({});
   const [explorerWidth, setExplorerWidth] = useState(() => loadExplorerWidth(280));
   const [detailWidth, setDetailWidth] = useState(420);
   const [fsRefresh, setFsRefresh] = useState(0);
@@ -300,6 +311,7 @@ export function App() {
     setAskPrompt,
     setAskChoice,
     setAskOtherText,
+    setActivePlan,
     setEditingId,
     setEditDraft,
     setEditRestorePrompt,
@@ -327,6 +339,7 @@ export function App() {
     nativeReasoningRef: chat.nativeReasoningRef,
     enqueueMessage: chat.enqueueMessage,
     clearQueued: chat.clearQueued,
+    queuedCount: queued.length,
     sendChat: chat.sendChat,
     stopChat: chat.stopChat,
     detachListener: chat.detachListener,
@@ -338,13 +351,156 @@ export function App() {
   const historySessions = sessions.map((s) => ({
     ...s,
     busy:
-      Boolean(s.busy) ||
       chat.runningSessionIds.includes(s.id) ||
       Boolean(busy && s.id === sessionId),
   }));
+
+  /**
+   * Switch the active chat to `path` — reuse an already-open tab for that
+   * workspace if one exists, otherwise start a fresh chat pinned there.
+   * Every side panel (search/files/browser/git/jobs/undo/history) reads
+   * `activeWs`, so they all follow this switch automatically.
+   */
+  function switchToWorkspace(path: string) {
+    if (!path || path === activeWs?.path) return;
+    const existing = openTabs.find((t) => t.workspace === path);
+    if (existing) {
+      selectChatTab(existing.id);
+    } else {
+      void actions.newChatInWorkspace(path);
+    }
+  }
+
+  function selectChatTab(id: string) {
+    // Restore the tab's workspace immediately so the file explorer does not
+    // keep showing the previous chat's folder while fetchSession is in flight.
+    const tab = openTabs.find((t) => t.id === id);
+    if (tab?.workspace) {
+      setActiveWs({
+        path: tab.workspace,
+        name: tab.workspaceName || tab.workspace.split(/[/\\]/).pop() || tab.workspace,
+      });
+    }
+    void actions.openSession(id);
+  }
+
+  function closeTab(id: string) {
+    setOpenTabs((prev) => prev.filter((t) => t.id !== id));
+    if (id === sessionId) {
+      const remaining = openTabs.filter((t) => t.id !== id);
+      if (remaining.length) selectChatTab(remaining[0].id);
+      else void actions.newChat();
+    }
+  }
+
+  /**
+   * Remove a workspace from the recent list AND close any chat tabs still
+   * pinned to it, so it fully disappears everywhere (settings, hub row,
+   * chat tab strip) — not just from the "recent folders" list.
+   */
+  function forgetWorkspaceEverywhere(path: string) {
+    const closing = openTabs.filter((t) => t.workspace === path);
+    if (closing.length) {
+      const closingIds = new Set(closing.map((t) => t.id));
+      setOpenTabs((prev) => prev.filter((t) => !closingIds.has(t.id)));
+      if (sessionId && closingIds.has(sessionId)) {
+        const remaining = openTabs.filter((t) => !closingIds.has(t.id));
+        if (remaining.length) selectChatTab(remaining[0].id);
+        else void actions.newChat();
+      }
+    }
+    void actions.removeWorkspaceEntry(path);
+  }
+
+  // Auto-surface any session that is actually running server-side, even if
+  // the user never explicitly "opened" it as a tab (e.g. it kept going in
+  // the background while they were looking at a different workspace).
+  useEffect(() => {
+    const runningIds = new Set(chat.runningSessionIds);
+    if (sessionId) runningIds.add(sessionId);
+    if (runningIds.size === 0) return;
+    setOpenTabs((prev) => {
+      const known = new Set(prev.map((t) => t.id));
+      const additions: ChatTabRef[] = [];
+      for (const id of runningIds) {
+        if (known.has(id)) continue;
+        const hit = historySessions.find((s) => s.id === id);
+        additions.push({
+          id,
+          workspace: hit?.workspace || (id === sessionId ? activeWs?.path || "" : ""),
+          workspaceName: hit?.workspace_name || (id === sessionId ? activeWs?.name || "" : ""),
+        });
+      }
+      if (!additions.length) return prev;
+      return [...prev, ...additions].slice(0, 16);
+    });
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [chat.runningSessionIds, sessionId]);
+
+  useEffect(() => {
+    saveOpenTabs(openTabs);
+  }, [openTabs]);
+
+  // Keep the active tab's workspace stamp in sync with the session we just
+  // loaded (or the hub pick), so switching away and back restores the right folder.
+  useEffect(() => {
+    if (!sessionId || !activeWs?.path) return;
+    setOpenTabs((prev) => {
+      const hit = prev.find((t) => t.id === sessionId);
+      if (
+        hit &&
+        hit.workspace === activeWs.path &&
+        hit.workspaceName === (activeWs.name || hit.workspaceName)
+      ) {
+        return prev;
+      }
+      if (hit) {
+        return prev.map((t) =>
+          t.id === sessionId
+            ? {
+                ...t,
+                workspace: activeWs.path,
+                workspaceName: activeWs.name || t.workspaceName,
+              }
+            : t,
+        );
+      }
+      return [
+        ...prev,
+        {
+          id: sessionId,
+          workspace: activeWs.path,
+          workspaceName: activeWs.name || "",
+        },
+      ].slice(0, 16);
+    });
+  }, [sessionId, activeWs?.path, activeWs?.name]);
+
+  const chatTabViews: ChatTabView[] = openTabs.map((tab) => {
+    const hit = historySessions.find((s) => s.id === tab.id);
+    const running =
+      chat.runningSessionIds.includes(tab.id) || Boolean(busy && tab.id === sessionId);
+    const rawTitle = (hit?.title || "").trim();
+    const untitled = !rawTitle || rawTitle === "新会话" || rawTitle === "New chat" || rawTitle === "Untitled";
+    return {
+      id: tab.id,
+      title: untitled ? t("sessionUntitled") : rawTitle,
+      workspaceName: hit?.workspace_name || tab.workspaceName || tab.workspace || "",
+      running,
+      active: tab.id === sessionId,
+    };
+  });
+
+  const openTabWorkspaces = openTabs
+    .filter((tab) => tab.workspace)
+    .map((tab) => ({
+      path: tab.workspace,
+      name: tab.workspaceName || tab.workspace,
+      running: chat.runningSessionIds.includes(tab.id) || Boolean(busy && tab.id === sessionId),
+    }));
+
   const historyNeedsPoll =
-    sidePanel === "history" &&
-    (busy || chat.runningSessionIds.length > 0 || sessions.some((item) => item.busy));
+    busy || chat.runningSessionIds.length > 0 || openTabs.length > 1;
 
   const reconcileRunningRef = useRef(chat.reconcileRunningSessions);
   reconcileRunningRef.current = chat.reconcileRunningSessions;
@@ -387,6 +543,7 @@ export function App() {
     compressState,
     bootReady,
     contextLimit: health?.context_limit,
+    hasSession: Boolean(sessionId),
     setCtx,
     toast,
     setToast,
@@ -422,6 +579,98 @@ export function App() {
   useEffect(() => {
     sessionIdRef.current = sessionId;
   }, [sessionId]);
+
+  useEffect(() => {
+    const onOpen = (ev: Event) => {
+      const url = String((ev as CustomEvent<{ url?: string }>).detail?.url || "");
+      setSidePanel("browser");
+      setExplorerCollapsed(false);
+      setExplorerWidth((w) => (w < 520 ? 640 : w));
+      if (!url) return;
+      const last = lastBrowserOpenRef.current;
+      if (last && last.url === url && Date.now() - last.at < 1600) return;
+      lastBrowserOpenRef.current = { url, at: Date.now() };
+      setBrowserOpenRequest({ url, nonce: Date.now() });
+    };
+    window.addEventListener("sidekick-browser-open", onOpen);
+    return () => window.removeEventListener("sidekick-browser-open", onOpen);
+  }, []);
+
+  useEffect(() => {
+    const onJob = (ev: Event) => {
+      const d = (ev as CustomEvent<{ job_id?: string }>).detail || {};
+      if (d.job_id) setJobsFocusId(String(d.job_id));
+      setJobsTick((n) => n + 1);
+    };
+    window.addEventListener("sidekick-shell-job", onJob);
+    return () => window.removeEventListener("sidekick-shell-job", onJob);
+  }, []);
+
+  useEffect(() => {
+    if (!bootReady || authPhase !== "ok") return;
+    let cancelled = false;
+    const pull = async () => {
+      try {
+        const res = await fetchShellJobs(true);
+        if (!cancelled) setShellJobs(res.jobs || []);
+      } catch {
+        /* ignore */
+      }
+    };
+    void pull();
+    const timer = window.setInterval(pull, 3000);
+    return () => {
+      cancelled = true;
+      window.clearInterval(timer);
+    };
+  }, [bootReady, authPhase, jobsTick]);
+
+  useEffect(() => {
+    const prev = jobStatusRef.current;
+    const next: Record<string, string> = { ...prev };
+    for (const job of shellJobs) {
+      const was = prev[job.job_id];
+      next[job.job_id] = job.status;
+      if (was !== "running" || job.status === "running") continue;
+      if (job.session_id && sessionId && job.session_id !== sessionId) continue;
+      const title =
+        job.status === "killed"
+          ? t("jobsDoneKilled")
+          : job.exit_code && job.exit_code !== 0
+            ? t("jobsDoneFail")
+            : t("jobsDoneOk");
+      const lines = [
+        title,
+        "",
+        `- 命令：\`${job.command}\``,
+        `- 状态：${job.status}${job.exit_code != null ? `（exit ${job.exit_code}）` : ""}`,
+        `- 用时：${job.elapsed_sec}s`,
+        `- job_id：${job.job_id}`,
+      ];
+      if (job.log?.trim()) {
+        lines.push("", "```", job.log.trim(), "```");
+      }
+      chat.appendMsg({
+        id: `job-done-${job.job_id}`,
+        role: "assistant",
+        content: lines.join("\n"),
+        jobNotice: {
+          job_id: job.job_id,
+          status: job.status,
+          exit_code: job.exit_code,
+        },
+      });
+      setToast(t("jobsDoneToast", job.command));
+    }
+    jobStatusRef.current = next;
+  }, [shellJobs, sessionId, t, chat]);
+
+  function openJobsPanel(jobId?: string) {
+    if (jobId) setJobsFocusId(jobId);
+    setSidePanel("jobs");
+    setExplorerCollapsed(false);
+    setExplorerWidth((w) => (w < 420 ? 480 : w));
+  }
 
   function onThreadScroll() {
     const el = threadRef.current;
@@ -529,6 +778,8 @@ export function App() {
               explorerWidth={explorerWidth}
               fsRefresh={fsRefresh}
               activeWs={activeWs}
+              workspaces={workspaces}
+              openTabWorkspaces={openTabWorkspaces}
               sessions={historySessions}
               sessionId={sessionId}
               sessionsPage={sessionsPage}
@@ -536,11 +787,26 @@ export function App() {
               sessionsTotal={sessionsTotal}
               onOpenHistoryPanel={session.openHistoryPanel}
               onRefreshSessions={session.refreshSessions}
-              onOpenSession={actions.openSession}
+              onOpenSession={(id) => {
+                const hit = historySessions.find((s) => s.id === id);
+                if (hit?.workspace) {
+                  setActiveWs({
+                    path: hit.workspace,
+                    name:
+                      hit.workspace_name ||
+                      hit.workspace.split(/[/\\]/).pop() ||
+                      hit.workspace,
+                  });
+                }
+                void actions.openSession(id);
+              }}
               onNewChat={actions.newChat}
+              onSwitchWorkspace={switchToWorkspace}
+              onForgetWorkspace={forgetWorkspaceEverywhere}
               onDeleteSession={actions.removeSession}
               onOpenSettings={() => dialogs.openSettings()}
               onOpenFile={(file, opts) => openDetail(fileToDetail(file, opts))}
+              activeFilePath={detail?.type === "file" ? detail.path : null}
               onFileDeleted={(path) => {
                 setDetail((d) => {
                   if (d?.type !== "file") return d;
@@ -567,8 +833,8 @@ export function App() {
                 setToast(t("browserElementAdded"));
               }}
               browserOpenRequest={browserOpenRequest}
+              browserSuspended={settingsOpen || Boolean(sandboxUrlPrompt) || Boolean(editRestorePrompt)}
               onWorkspaceMutated={() => setFsRefresh((n) => n + 1)}
-              onReplayTurn={(userTurn, userText) => void actions.replayTurn(userTurn, userText)}
               mainView={mainView}
               onOpenMemory={() => {
                 setMainView("memory");
@@ -576,6 +842,9 @@ export function App() {
                 setSettingsOpen(false);
               }}
               onOpenChat={() => setMainView("chat")}
+              jobsRunning={shellJobs.filter((j) => j.status === "running").length}
+              jobsFocusId={jobsFocusId}
+              jobsRefreshKey={jobsTick}
             />
             {mainView === "memory" ? (
               <MemoryLibraryPanel
@@ -586,6 +855,13 @@ export function App() {
             ) : (
               <>
                 <section className="chat pane">
+                  <ChatTabsBar
+                    t={t}
+                    tabs={chatTabViews}
+                    onSelect={selectChatTab}
+                    onClose={closeTab}
+                    onNewTab={() => void actions.newChat()}
+                  />
                   <ChatThread
                     t={t}
                     messages={messages}
@@ -619,6 +895,8 @@ export function App() {
                     onResolveAsk={dialogs.resolveAsk}
                     onAskChoice={setAskChoice}
                     onAskOtherText={setAskOtherText}
+                    runningJobs={shellJobs.filter((j) => j.status === "running")}
+                    onOpenJobs={openJobsPanel}
                   />
                   <ComposerBar
                     t={t}
@@ -669,6 +947,7 @@ export function App() {
                     onSwitchModelRole={dialogs.switchModelRole}
                     gitRefreshKey={fsRefresh}
                     sessionId={sessionId}
+                    workspace={activeWs?.path || null}
                     onOpenReview={() => openDetail({ type: "changes", selectedPath: null })}
                   />
                 </section>
@@ -682,6 +961,7 @@ export function App() {
                     detailDiffLoading={detailDiffLoading}
                     fsRefresh={fsRefresh}
                     sessionId={sessionId}
+                    workspace={activeWs?.path || null}
                     onResizeStart={() => {
                       resizingDetailRef.current = true;
                       document.body.classList.add("resizing-sidebar");
@@ -723,6 +1003,8 @@ export function App() {
           wsBusy={wsBusy}
           onBrowseWorkspace={actions.browseAndSetWorkspace}
           onSwitchWorkspace={actions.switchWorkspace}
+          onForgetWorkspace={forgetWorkspaceEverywhere}
+          sessions={historySessions}
           model={model}
           modelSaving={modelSaving}
           onModelChange={setModel}
@@ -731,6 +1013,9 @@ export function App() {
           live={live}
           accountUser={accountUser}
           onToast={(msg) => setToast(msg)}
+          onSkillsChanged={() => {
+            void fetchSkills().then(setSkills).catch(() => undefined);
+          }}
           onLogout={async () => {
             await authLogout();
             setAccountUser(null);

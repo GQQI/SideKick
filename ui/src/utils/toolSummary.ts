@@ -55,6 +55,10 @@ export function formatToolSummary(name: string, args: unknown, fallback = ""): s
     const bg = a.background ? " · 后台" : "";
     return `shell${bg}: ${short(str("command"), 100)}`;
   }
+  if (name === "shell_job_list") return "列出后台脚本";
+  if (name === "shell_job_log") return `后台日志 ${str("job_id")}`;
+  if (name === "shell_job_wait") return `等待后台任务 ${str("job_id")}`;
+  if (name === "shell_job_stop") return `停止后台任务 ${str("job_id")}`;
   if (name === "git_status") return `git status @ ${str("path") || "."}`;
   if (name === "git_diff") {
     const mode = a.staged ? "staged" : "worktree";
@@ -91,6 +95,17 @@ export function formatToolSummary(name: string, args: unknown, fallback = ""): s
   if (name === "browser_console") return "浏览器 console";
   if (name === "browser_click") return `浏览器点击 ${short(str("selector"), 60)}`;
   if (name === "browser_type") return `浏览器输入 ${short(str("selector"), 40)}`;
+  if (name === "browser_find_elements") return "浏览器扫描可点击元素";
+  if (name === "browser_scroll") {
+    const dir = str("direction") || "down";
+    const sel = str("selector");
+    return sel ? `浏览器滚动到 ${short(sel, 40)}` : `浏览器滚动 (${dir})`;
+  }
+  if (name === "browser_hover") return `浏览器悬停 ${short(str("selector"), 60)}`;
+  if (name === "browser_press_key") return `浏览器按键 ${short(str("key"), 20)}`;
+  if (name === "browser_wait") return `浏览器等待 ${short(str("selector") || "…", 40)}`;
+  if (name === "browser_go_back") return "浏览器后退";
+  if (name === "browser_go_forward") return "浏览器前进";
   if (name.startsWith("skill_")) return `调用技能 ${name}`;
   for (const key of ["path", "command", "query", "name", "goal", "note", "question"]) {
     if (str(key)) return `${name}: ${short(str(key), 80)}`;

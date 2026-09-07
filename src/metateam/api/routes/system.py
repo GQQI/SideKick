@@ -7,7 +7,6 @@ from typing import Any
 from fastapi import APIRouter, HTTPException, Request
 
 from ...core.config import get_settings
-from ...runtime.tools import skill_tool_name
 from ...services.mcp_config import McpServerConfig, load_mcp_config, update_mcp_config
 from ...services.mcp_runtime import test_server as mcp_test_server
 from ...services.memory import (
@@ -19,7 +18,6 @@ from ...services.memory import (
 )
 from ...services.model_config import load_model_config, select_model_role, update_model_config
 from ...services.local_auth import get_token
-from ...services.skills import load_skills
 from ...services.store import STORE
 from ...services.user_auth import auth_status, needs_setup
 from ...services.workspace_store import get_active_workspace
@@ -146,39 +144,6 @@ def patch_model_select(body: ModelSelect) -> dict[str, Any]:
         "config": cfg.masked(),
         "note": f"已切换 {body.role} → {model_name}",
     }
-
-
-@router.get("/api/skills")
-def api_skills() -> list[dict[str, Any]]:
-    s = get_settings()
-    skills = load_skills(s.skills_dir)
-    return [
-        {
-            "name": sk.name,
-            "tool": skill_tool_name(sk.name),
-            "description": sk.description,
-            "path": str(sk.path),
-            "mode": "function_call",
-        }
-        for sk in skills
-    ]
-
-
-@router.get("/api/skills/{name}")
-def api_skill(name: str) -> dict[str, Any]:
-    s = get_settings()
-    skills = load_skills(s.skills_dir)
-    for sk in skills:
-        if sk.name == name or skill_tool_name(sk.name) == name:
-            return {
-                "name": sk.name,
-                "tool": skill_tool_name(sk.name),
-                "description": sk.description,
-                "path": str(sk.path),
-                "body": sk.read_body(),
-                "mode": "function_call",
-            }
-    raise HTTPException(404, "skill not found")
 
 
 @router.get("/api/memory")

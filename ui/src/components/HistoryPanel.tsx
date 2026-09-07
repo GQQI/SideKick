@@ -6,6 +6,7 @@ import {
   IconCheck,
   IconChevronDown,
   IconClock,
+  IconFolder,
   IconPlus,
   IconRefresh,
   IconTrash,
@@ -153,6 +154,15 @@ export function HistoryPanel({
                           <strong title={displaySessionTitle(s.title, t("sessionUntitled"), s.id)}>
                             {displaySessionTitle(s.title, t("sessionUntitled"), s.id)}
                           </strong>
+                          {s.workspace_name && (
+                            <em
+                              className={`history-ws-badge${s.is_current_workspace ? " current" : ""}`}
+                              title={s.workspace}
+                            >
+                              <IconFolder size={11} />
+                              {s.workspace_name}
+                            </em>
+                          )}
                         </span>
                         {pendingDeleteId !== s.id && (
                           <span className={`history-open-time${running ? " running" : ""}`}>

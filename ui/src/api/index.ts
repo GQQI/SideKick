@@ -24,6 +24,19 @@ export type SkillItem = {
   description: string;
   path: string;
   mode: string;
+  folder?: string;
+  writable?: boolean;
+};
+
+export type SkillDetail = SkillItem & { body: string };
+
+export type SkillValidateResult = {
+  ok: boolean;
+  errors: string[];
+  warnings: string[];
+  name: string;
+  description: string;
+  body: string;
 };
 
 /** @deprecated use ModelSetup */
@@ -229,8 +242,17 @@ export const fetchHealth = async () => {
   return r.json() as Promise<Health>;
 };
 
-export const createSession = () =>
-  json<{ id: string; demo: boolean }>("/api/sessions", { method: "POST" });
+export type SessionWorkspaceRef = { path: string; name: string };
+
+export const createSession = (workspace?: string) =>
+  json<{ id: string; demo: boolean; workspace?: SessionWorkspaceRef | null }>(
+    "/api/sessions",
+    {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ workspace: workspace || null }),
+    },
+  );
 
 export type SessionItem = {
   id: string;
@@ -242,6 +264,9 @@ export type SessionItem = {
   busy?: boolean;
   demo?: boolean;
   source?: string;
+  workspace?: string;
+  workspace_name?: string;
+  is_current_workspace?: boolean;
 };
 
 export type SessionsPage = {
@@ -262,11 +287,15 @@ export type SessionDetailMessage = {
   result?: string;
   status?: string;
   agent_id?: string;
+  /** Unix seconds when this turn/tool call was recorded (older history may lack it). */
+  ts?: number;
+  sidekick?: { kind?: string; job_id?: string; status?: string; exit_code?: number | null };
 };
 
 export type SessionDetail = {
   id: string;
   title: string;
+  workspace?: SessionWorkspaceRef | null;
   messages: SessionDetailMessage[];
   tokens: number;
   limit?: number;
@@ -291,6 +320,13 @@ export type SessionDetail = {
     summary?: string;
     tasks?: Array<{ id?: string; title: string; detail?: string; status?: string }>;
   }>;
+  /** Plan currently being executed server-side (null when idle). */
+  active_plan?: {
+    plan_id: string;
+    summary?: string;
+    shape_contract?: Record<string, unknown>;
+    tasks?: Array<{ id?: string; title: string; detail?: string; status?: string }>;
+  } | null;
 };
 
 export const HISTORY_PAGE_SIZE = 20;
@@ -325,14 +361,91 @@ export const truncateSession = (
 
 export const fetchSkills = () => json<SkillItem[]>("/api/skills");
 export const fetchSkill = (name: string) =>
-  json<{
-    name: string;
-    tool: string;
-    description: string;
-    path: string;
-    body: string;
-    mode?: string;
-  }>(`/api/skills/${encodeURIComponent(name)}`);
+  json<SkillDetail>(`/api/skills/${encodeURIComponent(name)}`);
+export const validateSkill = (payload: {
+  name?: string;
+  description?: string;
+  content?: string;
+  markdown?: string;
+}) =>
+  json<SkillValidateResult>("/api/skills/validate", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(payload),
+  });
+export const saveSkill = (payload: {
+  name: string;
+  description: string;
+  content: string;
+  overwrite?: boolean;
+  previous?: string;
+}) =>
+  json<{ status: string; skill: SkillItem }>("/api/skills", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ overwrite: true, ...payload }),
+  });
+export const updateSkill = (
+  name: string,
+  payload: { name: string; description: string; content: string },
+) =>
+  json<{ status: string; skill: SkillDetail }>(`/api/skills/${encodeURIComponent(name)}`, {
+    method: "PUT",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ overwrite: true, ...payload }),
+  });
+export const deleteSkill = (name: string) =>
+  json<{ status: string; name: string }>(`/api/skills/${encodeURIComponent(name)}`, {
+    method: "DELETE",
+  });
+export const importSkillDir = (
+  path: string,
+  overwrite = false,
+) =>
+  json<{ status: string; imported: SkillItem[] }>("/api/skills/import-dir", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ path, overwrite }),
+  });
+export const importSkillFiles = async (files: File[], overwrite = false) => {
+  const fd = new FormData();
+  for (const file of files) {
+    const rel = (file as File & { webkitRelativePath?: string }).webkitRelativePath || file.name;
+    fd.append("files", file, rel);
+  }
+  const headers = await authHeaders();
+  const q = overwrite ? "?overwrite=true" : "";
+  const r = await fetch(`${BASE}/api/skills/import-files${q}`, { method: "POST", body: fd, headers });
+  if (!r.ok) {
+    let detail = `import failed: ${r.status}`;
+    try {
+      const body = (await r.json()) as { detail?: unknown };
+      if (typeof body.detail === "string") detail = body.detail;
+    } catch {
+      /* ignore */
+    }
+    throw new Error(detail);
+  }
+  return r.json() as Promise<{ status: string; imported: SkillItem[] }>;
+};
+export const importSkillFile = async (file: File, overwrite = false) => {
+  const fd = new FormData();
+  fd.append("file", file);
+  const headers = await authHeaders();
+  const q = overwrite ? "?overwrite=true" : "";
+  const r = await fetch(`${BASE}/api/skills/import${q}`, { method: "POST", body: fd, headers });
+  if (!r.ok) {
+    let detail = `import failed: ${r.status}`;
+    try {
+      const body = (await r.json()) as { detail?: unknown };
+      if (typeof body.detail === "string") detail = body.detail;
+    } catch {
+      /* ignore */
+    }
+    throw new Error(detail);
+  }
+  return r.json() as Promise<{ status: string; imported: SkillItem[] }>;
+};
 export const fetchMemory = async () =>
   (await json<{ content: string }>("/api/memory")).content || "";
 export const saveMemory = (content: string) =>
@@ -414,6 +527,13 @@ export const createWorkspace = (path: string) =>
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({ path }),
   });
+export const forgetWorkspace = (path: string) =>
+  json<{
+    status: string;
+    configured: boolean;
+    active: { path: string; name: string; configured?: boolean } | null;
+    items: WorkspaceItem[];
+  }>(`/api/workspaces?path=${encodeURIComponent(path)}`, { method: "DELETE" });
 export const setWorkspace = (path: string, create = false) =>
   json<{
     status: string;
@@ -426,10 +546,18 @@ export const setWorkspace = (path: string, create = false) =>
     body: JSON.stringify({ path, create }),
   });
 
-export const browseWorkspace = () =>
-  json<{ cancelled: boolean; path: string | null }>("/api/workspaces/browse", {
+export async function browseWorkspace(): Promise<{ cancelled: boolean; path: string | null }> {
+  // Inside the Electron desktop app, use the native picker parented to the
+  // main window (IPC) — the backend's detached PowerShell dialog has no
+  // window owner there and can end up appearing behind the app.
+  if (typeof window !== "undefined" && window.sidekickDesktop?.isDesktop) {
+    const pick = window.sidekickDesktop.workspace?.pickFolder;
+    if (pick) return pick({ title: "选择工作区文件夹" });
+  }
+  return json<{ cancelled: boolean; path: string | null }>("/api/workspaces/browse", {
     method: "POST",
   });
+}
 
 export const deleteSession = (id: string) =>
   json<{ status: string }>(`/api/sessions/${id}`, { method: "DELETE" });
@@ -478,10 +606,16 @@ export type FilePayload = {
   supported?: boolean;
   message?: string;
   raw_url?: string;
+  /** Which open workspace this came from — carried into the detail/edit panel. */
+  workspace?: string;
 };
 
-export const listFiles = (path = ".") =>
-  json<FsList>(`/api/files?path=${encodeURIComponent(path)}`);
+export const listFiles = (path = ".", workspace?: string) =>
+  json<FsList>(
+    `/api/files?path=${encodeURIComponent(path)}${
+      workspace ? `&workspace=${encodeURIComponent(workspace)}` : ""
+    }`,
+  );
 export type SearchHit = {
   path: string;
   name: string;
@@ -496,9 +630,11 @@ export type SearchHit = {
   /** Per-line snippets for expanded view. */
   snippets?: { line: number; text: string }[];
 };
-export const searchFiles = (q: string, path = ".") =>
+export const searchFiles = (q: string, path = ".", workspace?: string) =>
   json<{ query: string; hits: SearchHit[] }>(
-    `/api/files/search?q=${encodeURIComponent(q)}&path=${encodeURIComponent(path)}`,
+    `/api/files/search?q=${encodeURIComponent(q)}&path=${encodeURIComponent(path)}${
+      workspace ? `&workspace=${encodeURIComponent(workspace)}` : ""
+    }`,
   );
 
 export type BrowserStatus = {
@@ -615,64 +751,73 @@ export const uploadFile = async (file: File) => {
   }
   return r.json() as Promise<FilePayload & { uploaded?: boolean }>;
 };
-export const readFileContent = (path: string) =>
-  json<FilePayload>(`/api/files/content?path=${encodeURIComponent(path)}`);
+export const readFileContent = (path: string, workspace?: string) =>
+  json<FilePayload>(
+    `/api/files/content?path=${encodeURIComponent(path)}${
+      workspace ? `&workspace=${encodeURIComponent(workspace)}` : ""
+    }`,
+  );
 export const getApiToken = () => _token;
 
-/** Strip query tokens — media must use fetchAuthedBlob. */
+/** Strip query tokens — media must use fetchAuthedBlob + Authorization header. */
 export function withAuthToken(url: string | undefined | null): string | undefined {
   if (!url) return undefined;
   try {
     const u = new URL(url, "http://local.invalid");
     u.searchParams.delete("token");
-    if (url.startsWith("/")) return `${u.pathname}${u.search}`;
+    if (url.startsWith("/") || url.startsWith("/api/")) {
+      return `${u.pathname}${u.search}`;
+    }
     return url;
   } catch {
     return url;
   }
 }
 
-export const fileRawUrl = (path: string) => {
+export const fileRawUrl = (path: string, workspace?: string) => {
   const q = new URLSearchParams({ path });
+  if (workspace) q.set("workspace", workspace);
   return `/api/files/raw?${q.toString()}`;
 };
-export const writeFileContent = (path: string, content: string) =>
+export const writeFileContent = (path: string, content: string, workspace?: string) =>
   json<{ path: string; size: number }>("/api/files/content", {
     method: "PUT",
     headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ path, content }),
+    body: JSON.stringify({ path, content, workspace: workspace || null }),
   });
-export const createFsEntry = (path: string, kind: "file" | "dir" = "file") =>
+export const createFsEntry = (path: string, kind: "file" | "dir" = "file", workspace?: string) =>
   json<{ path: string; type: string }>("/api/files", {
     method: "POST",
     headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ path, kind }),
+    body: JSON.stringify({ path, kind, workspace: workspace || null }),
   });
-export const deleteFsEntry = (path: string, recursive = false) =>
+export const deleteFsEntry = (path: string, recursive = false, workspace?: string) =>
   json<{ path: string; type: string; deleted: boolean }>(
-    `/api/files?path=${encodeURIComponent(path)}&recursive=${recursive ? "true" : "false"}`,
+    `/api/files?path=${encodeURIComponent(path)}&recursive=${recursive ? "true" : "false"}${
+      workspace ? `&workspace=${encodeURIComponent(workspace)}` : ""
+    }`,
     { method: "DELETE" },
   );
-export const renameFsEntry = (path: string, newName: string) =>
+export const renameFsEntry = (path: string, newName: string, workspace?: string) =>
   json<{ path: string; from: string; name: string; type: string }>("/api/files/rename", {
     method: "POST",
     headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ path, new_name: newName }),
+    body: JSON.stringify({ path, new_name: newName, workspace: workspace || null }),
   });
-export const moveFsEntry = (path: string, destDir: string) =>
+export const moveFsEntry = (path: string, destDir: string, workspace?: string) =>
   json<{ path: string; from: string; to_dir: string; type: string }>("/api/files/move", {
     method: "POST",
     headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ path, dest_dir: destDir }),
+    body: JSON.stringify({ path, dest_dir: destDir, workspace: workspace || null }),
   });
 
-export const revealFsEntry = (path: string) =>
+export const revealFsEntry = (path: string, workspace?: string) =>
   json<{ status: string; path: string; abs_path: string; type: string }>(
     "/api/files/reveal",
     {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ path }),
+      body: JSON.stringify({ path, workspace: workspace || null }),
     },
   );
 
@@ -778,6 +923,7 @@ export async function streamChat(
   signal?: AbortSignal,
   mode: "plan" | "agent" = "agent",
   display?: string,
+  workspace?: string | null,
 ): Promise<string | null> {
   let r: Response;
   try {
@@ -791,6 +937,9 @@ export async function streamChat(
       mode,
     };
     if (display && display !== message) body.display = display;
+    // Pin a brand-new session to the workspace the UI currently shows, so
+    // switching history to another project cannot leak its folder into this chat.
+    if (!sessionId && workspace) body.workspace = workspace;
     r = await fetch(`${BASE}/api/chat`, {
       method: "POST",
       headers,
@@ -973,13 +1122,52 @@ export type GitSnapshot = {
   totals?: { files: number; added: number; deleted: number };
 };
 
-export const fetchGit = () => json<GitSnapshot>("/api/git");
-export const fetchGitReview = (sessionId?: string | null) =>
+export const fetchGit = (workspace?: string) =>
   json<GitSnapshot>(
-    sessionId
-      ? `/api/git/review?session_id=${encodeURIComponent(sessionId)}`
-      : "/api/git/review",
+    workspace ? `/api/git?workspace=${encodeURIComponent(workspace)}` : "/api/git",
   );
+
+export type ShellJobSnapshot = {
+  job_id: string;
+  pid: number;
+  command: string;
+  cwd: string;
+  session_id?: string;
+  background?: boolean;
+  status: string;
+  exit_code: number | null;
+  started_at: number;
+  ended_at: number | null;
+  elapsed_sec: number;
+  log_lines: number;
+  log: string;
+};
+
+export const fetchShellJobs = (includeDone = true) =>
+  json<{ jobs: ShellJobSnapshot[]; running: number }>(
+    `/api/shell-jobs?include_done=${includeDone ? "true" : "false"}`,
+  );
+
+export const fetchShellJob = (jobId: string, tail = 120) =>
+  json<ShellJobSnapshot>(
+    `/api/shell-jobs/${encodeURIComponent(jobId)}?tail=${encodeURIComponent(String(tail))}`,
+  );
+
+export const stopShellJob = (jobId: string) =>
+  json<ShellJobSnapshot>(`/api/shell-jobs/${encodeURIComponent(jobId)}/stop`, {
+    method: "POST",
+  });
+export const deleteShellJob = (jobId: string) =>
+  json<{ status: string; job_id: string }>(`/api/shell-jobs/${encodeURIComponent(jobId)}`, {
+    method: "DELETE",
+  });
+export const fetchGitReview = (sessionId?: string | null, workspace?: string) => {
+  const q = new URLSearchParams();
+  if (sessionId) q.set("session_id", sessionId);
+  if (workspace) q.set("workspace", workspace);
+  const qs = q.toString();
+  return json<GitSnapshot>(`/api/git/review${qs ? `?${qs}` : ""}`);
+};
 export type GitFileDiff = {
   path: string;
   old: string;
@@ -989,46 +1177,60 @@ export type GitFileDiff = {
   is_deleted?: boolean;
   binary?: boolean;
 };
-export const fetchGitFileDiff = (path: string, sessionId?: string | null) => {
+export const fetchGitFileDiff = (
+  path: string,
+  sessionId?: string | null,
+  workspace?: string,
+) => {
   const q = new URLSearchParams({ path });
   if (sessionId) q.set("session_id", sessionId);
+  if (workspace) q.set("workspace", workspace);
   return json<GitFileDiff>(`/api/git/file-diff?${q.toString()}`);
 };
-export const gitStage = (paths: string[]) =>
+export const gitStage = (paths: string[], workspace?: string) =>
   json<GitSnapshot>("/api/git/stage", {
     method: "POST",
     headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ paths }),
+    body: JSON.stringify({ paths, workspace: workspace || null }),
   });
-export const gitUnstage = (paths: string[]) =>
+export const gitUnstage = (paths: string[], workspace?: string) =>
   json<GitSnapshot>("/api/git/unstage", {
     method: "POST",
     headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ paths }),
+    body: JSON.stringify({ paths, workspace: workspace || null }),
   });
-export const gitCommit = (message: string) =>
+export const gitCommit = (message: string, workspace?: string) =>
   json<GitSnapshot>("/api/git/commit", {
     method: "POST",
     headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ message }),
+    body: JSON.stringify({ message, workspace: workspace || null }),
   });
-export const gitFetch = () =>
-  json<GitSnapshot>("/api/git/fetch", { method: "POST" });
-export const gitPull = () =>
-  json<GitSnapshot>("/api/git/pull", { method: "POST" });
-export const gitPush = () =>
-  json<GitSnapshot>("/api/git/push", { method: "POST" });
-export const gitCheckout = (branch: string, create = false) =>
+export const gitFetch = (workspace?: string) =>
+  json<GitSnapshot>(
+    `/api/git/fetch${workspace ? `?workspace=${encodeURIComponent(workspace)}` : ""}`,
+    { method: "POST" },
+  );
+export const gitPull = (workspace?: string) =>
+  json<GitSnapshot>(
+    `/api/git/pull${workspace ? `?workspace=${encodeURIComponent(workspace)}` : ""}`,
+    { method: "POST" },
+  );
+export const gitPush = (workspace?: string) =>
+  json<GitSnapshot>(
+    `/api/git/push${workspace ? `?workspace=${encodeURIComponent(workspace)}` : ""}`,
+    { method: "POST" },
+  );
+export const gitCheckout = (branch: string, create = false, workspace?: string) =>
   json<GitSnapshot>("/api/git/checkout", {
     method: "POST",
     headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ branch, create }),
+    body: JSON.stringify({ branch, create, workspace: workspace || null }),
   });
-export const gitSetRemote = (url: string, name = "origin") =>
+export const gitSetRemote = (url: string, name = "origin", workspace?: string) =>
   json<GitSnapshot>("/api/git/remote", {
     method: "POST",
     headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ url, name }),
+    body: JSON.stringify({ url, name, workspace: workspace || null }),
   });
 
 export type UndoFileEntry = {

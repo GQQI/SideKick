@@ -1,4 +1,4 @@
-/** Electron desktop bridge for a live BrowserView overlay. */
+/** Electron desktop bridge — live BrowserView. */
 
 import type { DomElementPayload } from "./browser/protocol";
 
@@ -11,6 +11,9 @@ export type DesktopBounds = {
 
 export type SidekickDesktopApi = {
   isDesktop: true;
+  workspace?: {
+    pickFolder: (opts?: { title?: string }) => Promise<{ cancelled: boolean; path: string | null }>;
+  };
   browser: {
     show: (bounds: DesktopBounds) => Promise<{ ok: boolean; live?: boolean }>;
     hide: () => Promise<{ ok: boolean }>;

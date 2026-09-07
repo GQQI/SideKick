@@ -174,6 +174,73 @@ def create_workspace(path: str) -> dict[str, Any]:
     return set_workspace(path, create=True)
 
 
+def resolve_workspace_path(path_or_name: str) -> Path:
+    """Validate an absolute folder path without touching the active workspace."""
+    raw = (path_or_name or "").strip().strip('"').strip("'")
+    if not raw:
+        raise ValueError("请填写本机文件夹的绝对路径")
+    candidate = Path(raw).expanduser()
+    if not candidate.is_absolute():
+        raise ValueError("请使用绝对路径，例如 D:\\Projects\\my-app 或 /home/user/proj")
+    candidate = candidate.resolve()
+    if not candidate.is_dir():
+        raise ValueError(f"不是文件夹或不存在：{candidate}")
+    return candidate
+
+
+def remember_recent(path: Path) -> None:
+    """Add a folder to the recent-workspaces list without switching the active one.
+
+    Lets a new chat pin itself to a folder (so several chats can run against
+    different projects at once) while the tenant's single "active" workspace
+    (used by the file/git side panels) stays wherever the user left it.
+    """
+    prev = _read_state()
+    recent = list(prev.get("recent") or [])
+    resolved = str(path.resolve())
+    recent = [resolved, *[p for p in recent if p != resolved]][:MAX_RECENT]
+    state_path = tenant_workspace_path(get_user_id())
+    state_path.parent.mkdir(parents=True, exist_ok=True)
+    state_path.write_text(
+        json.dumps(
+            {"path": str(prev.get("path") or resolved), "recent": recent},
+            ensure_ascii=False,
+            indent=2,
+        ),
+        encoding="utf-8",
+    )
+
+
+def forget_recent(path_or_name: str) -> list[dict[str, Any]]:
+    """Remove a folder from the recent-workspaces list.
+
+    Never touches the tenant's currently active workspace even if it's the
+    one being removed — it just stops showing up in the recent/hub list for
+    picking a *new* chat. Returns the updated recent list.
+    """
+    raw = (path_or_name or "").strip().strip('"').strip("'")
+    if not raw:
+        raise ValueError("请提供要移除的工作区路径")
+    try:
+        target = str(Path(raw).expanduser().resolve())
+    except Exception:
+        target = raw
+
+    prev = _read_state()
+    recent = [p for p in (prev.get("recent") or []) if str(p) != target]
+    state_path = tenant_workspace_path(get_user_id())
+    state_path.parent.mkdir(parents=True, exist_ok=True)
+    state_path.write_text(
+        json.dumps(
+            {"path": str(prev.get("path") or ""), "recent": recent},
+            ensure_ascii=False,
+            indent=2,
+        ),
+        encoding="utf-8",
+    )
+    return list_workspaces()
+
+
 def apply_saved_workspace(settings: Any | None = None) -> bool:
     """Load the current user's saved workspace into ``settings``.
 

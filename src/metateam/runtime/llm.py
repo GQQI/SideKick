@@ -288,6 +288,7 @@ class LLM:
         reasoning_parts: list[str] = []
         tool_acc: dict[int, dict[str, str]] = {}
         cancelled = False
+        looped_text = False
         xml_hold = ""
         xml_tools = XmlToolStream()
         # Stateful splitter for <think>…</think> embedded in content stream
@@ -335,9 +336,21 @@ class LLM:
                             if visible:
                                 content_parts.append(visible)
                                 yield ("delta", visible)
+                                if streaming_text_looped("".join(content_parts)):
+                                    looped_text = True
+                                    try:
+                                        self.close_active_stream()
+                                    except Exception:
+                                        pass
+                                    break
                             if not tool_acc:
                                 for payload in xml_tools.feed(xml_hold):
                                     yield ("tool_delta", payload)
+                    if looped_text:
+                        break
+
+                if looped_text:
+                    break
 
                 for tc in getattr(delta, "tool_calls", None) or []:
                     idx = int(getattr(tc, "index", 0) or 0)
@@ -455,6 +468,24 @@ class LLM:
             temperature=temperature,
         )
         return (msg.get("content") or "").strip()
+
+
+def streaming_text_looped(text: str) -> bool:
+    """True when the model is stuck repeating the same sentence/paragraph."""
+    blob = text or ""
+    if len(blob) < 360:
+        return False
+    tail = blob[-96:]
+    window = blob[-960:] if len(blob) > 960 else blob
+    if tail.strip() and window.count(tail) >= 4:
+        return True
+    lines = [ln.strip() for ln in blob.splitlines() if len(ln.strip()) >= 16]
+    if len(lines) >= 5 and lines[-1] == lines[-2] == lines[-3] == lines[-4]:
+        return True
+    paras = [p.strip() for p in re.split(r"\n\s*\n", blob) if len(p.strip()) >= 40]
+    if len(paras) >= 4 and paras[-1] == paras[-2] == paras[-3]:
+        return True
+    return False
 
 
 def extract_content_text(msg: Any) -> str:
@@ -609,19 +640,25 @@ def _salvage_tool_args(raw: str) -> dict[str, Any]:
 
 
 def parse_tool_args(raw: str) -> dict[str, Any]:
+    text = raw or ""
     try:
-        data = json.loads(raw or "{}")
+        data = json.loads(text.strip() or "{}")
         return data if isinstance(data, dict) else {}
     except json.JSONDecodeError:
-        m = re.search(r"\{.*\}", raw or "", re.DOTALL)
-        if m:
-            try:
-                data = json.loads(m.group(0))
-                if isinstance(data, dict):
-                    return data
-            except json.JSONDecodeError:
-                pass
-        return _salvage_tool_args(raw or "")
+        pass
+    match = re.search(r"\{.*\}", text, re.DOTALL)
+    if match:
+        try:
+            data = json.loads(match.group(0))
+            if isinstance(data, dict):
+                return data
+        except json.JSONDecodeError:
+            pass
+    salvaged = dict(_salvage_tool_args(text) or {})
+    salvaged["_incomplete"] = True
+    if not any(k != "_incomplete" for k in salvaged):
+        salvaged["_raw"] = text
+    return salvaged
 
 
 def _strip_for_api(messages: list[dict[str, Any]]) -> list[dict[str, Any]]:

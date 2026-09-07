@@ -2,15 +2,18 @@
 
 from __future__ import annotations
 
+import copy
 import json
+import re
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
 from concurrent.futures import TimeoutError as FuturesTimeout
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Any, Callable, Optional
 
-from .agent_execute import AgentExecuteMixin
+from .agent_execute import AgentExecuteMixin, file_tool_results_blocked
 from .agent_grounding import AgentGroundingMixin
 from .agent_history import AgentHistoryMixin
 from .approval import ApprovalGate
@@ -23,15 +26,19 @@ from .ask import (
 )
 from ..core.config import Settings, get_settings
 from .context import (
+    COMPACTION_MARK,
+    cheap_compact,
     context_budget_tokens,
+    current_turn_start,
     debug_dump_budget,
     ensure_fit,
     messages_tokens,
     schemas_tokens,
+    squeeze_fresh_tool_results,
 )
 from ..core.events import EventBus, emit, new_id
-from ..core.guardrails import Guardrails
-from .llm import LLM
+from ..core.guardrails import Guardrails, tool_call_signature
+from .llm import LLM, parse_tool_args
 from .plan import (
     PLAN_PREP_HINT,
     PLAN_PREP_MAX_ROUNDS,
@@ -50,8 +57,10 @@ from .plan import (
 from .prompts import build_system_prompt
 from .coherence import inject_contract_into_goal, shape_contract_from_plan
 from .review import run_review
-from ..services.skills import Skill, load_skills
+from ..services.skills import Skill, invalidate_skills_cache, load_skills
+from .tool_registry import skill_tool_name
 from .tools import ToolRegistry, build_registry
+from .tools.support import _skill_as_tool
 
 PrintFn = Callable[[str], None]
 
@@ -128,6 +137,13 @@ _STALL_NUDGE = (
     "Continue the task now: call a tool or give a concise answer. "
     "Do not restart a long silent thinking pass."
 )
+_FILE_RETRY_NUDGE = (
+    "The previous file tool returned ERROR or WARNING. "
+    "Retry that file operation now with the exact filename and complete "
+    "path/content arguments. If the error is about decoding, retry with "
+    "encoding= set to another codec. Do not skip ahead or treat a "
+    "partial/garbled result as success."
+)
 
 
 class Agent(AgentHistoryMixin, AgentExecuteMixin, AgentGroundingMixin):
@@ -174,6 +190,15 @@ class Agent(AgentHistoryMixin, AgentExecuteMixin, AgentGroundingMixin):
             self.guard.max_explore_streak = max(self.guard.max_explore_streak, 64)
         self._cancel = threading.Event()
         self._abandoned = False
+        self._last_compressed = False
+        self._compress_lock = threading.Lock()
+        self._compress_job: Optional[dict[str, Any]] = None
+        self._archived_messages: list[dict[str, Any]] = []
+        # The plan currently being executed by _execute_plan (None when idle).
+        # Single source of truth for the pinned plan panel on reattach.
+        self._active_plan: Optional[dict[str, Any]] = None
+        self._tool_repeat_streak = 0
+        self._last_tool_sig_set: Optional[frozenset[str]] = None
         self.approval = approval or ApprovalGate()
         self.ask = ask or AskGate()
         self.plan_gate = plan_gate or PlanGate()
@@ -185,23 +210,7 @@ class Agent(AgentHistoryMixin, AgentExecuteMixin, AgentGroundingMixin):
         self._allow_mutating_tools = not self.talk_only
 
         self.skills: list[Skill] = [] if self.talk_only else load_skills(self.settings.skills_dir)
-        llm_cap = int(getattr(self.settings, "max_tokens", 0) or 0) or None
-        if is_subagent:
-            self.llm = LLM(
-                self.settings,
-                model=self.settings.subagent_model,
-                api_key=getattr(self.settings, "subagent_api_key", None) or self.settings.api_key,
-                base_url=getattr(self.settings, "subagent_base_url", None) or self.settings.base_url,
-                max_tokens=llm_cap,
-            )
-        else:
-            self.llm = LLM(self.settings, model=self.settings.model, max_tokens=llm_cap)
-        self.compress_llm = LLM(
-            self.settings,
-            model=self.settings.compress_model,
-            api_key=getattr(self.settings, "compress_api_key", None) or self.settings.api_key,
-            base_url=getattr(self.settings, "compress_base_url", None) or self.settings.base_url,
-        )
+        self.rebuild_llms()
 
         # Teams are intentionally one level deep: workers execute scoped work
         # and report to the lead; they never create invisible grandchild teams.
@@ -229,6 +238,7 @@ class Agent(AgentHistoryMixin, AgentExecuteMixin, AgentGroundingMixin):
                 workspace=self.settings.workspace,
                 skills=self.skills,
                 memory_file=self.settings.memory_file,
+                skills_dir=self.settings.skills_dir,
                 is_subagent=is_subagent,
                 role=self.role,
                 goal=goal,
@@ -241,6 +251,91 @@ class Agent(AgentHistoryMixin, AgentExecuteMixin, AgentGroundingMixin):
             self.messages = [{"role": "system", "content": system}]
         if (not is_subagent) or self.full_agent:
             self._refresh_workspace_grounding()
+
+    def rebuild_llms(self) -> None:
+        """(Re)construct self.llm / self.compress_llm from self.settings.
+
+        Called at __init__ and whenever settings.model/subagent_model/
+        compress_model change after construction — e.g. a settings refresh,
+        or an "Auto" model pick resolved for the current turn.
+        """
+        llm_cap = int(getattr(self.settings, "max_tokens", 0) or 0) or None
+        if self.is_subagent:
+            self.llm = LLM(
+                self.settings,
+                model=self.settings.subagent_model,
+                api_key=getattr(self.settings, "subagent_api_key", None) or self.settings.api_key,
+                base_url=getattr(self.settings, "subagent_base_url", None) or self.settings.base_url,
+                max_tokens=llm_cap,
+            )
+        else:
+            self.llm = LLM(self.settings, model=self.settings.model, max_tokens=llm_cap)
+        self.compress_llm = LLM(
+            self.settings,
+            model=self.settings.compress_model,
+            api_key=getattr(self.settings, "compress_api_key", None) or self.settings.api_key,
+            base_url=getattr(self.settings, "compress_base_url", None) or self.settings.base_url,
+            max_tokens=int(getattr(self.settings, "compress_max_tokens", 0) or 0) or None,
+        )
+
+    def _refresh_skills(self) -> None:
+        """Pick up skills imported after this session started."""
+        if self.talk_only:
+            return
+        invalidate_skills_cache(self.settings.skills_dir)
+        fresh = load_skills(self.settings.skills_dir)
+        self.skills[:] = fresh
+        self.registry.drop_skill_tools()
+        for sk in self.skills:
+            self.registry.register(_skill_as_tool(sk))
+
+    def _requested_skill_tool(self, text: str) -> str:
+        raw = (text or "").strip()
+        if not raw:
+            return ""
+        m = re.search(r"请立即调用函数工具\s*`?(skill_[A-Za-z0-9_]+)`?", raw)
+        if m:
+            name = m.group(1)
+            return name if self.registry.get(name) else ""
+        m = re.search(r"/skill\s+([A-Za-z0-9._-]+)", raw, re.I)
+        if not m:
+            return ""
+        want = skill_tool_name(m.group(1))
+        if self.registry.get(want):
+            return want
+        token = re.sub(r"[^a-z0-9]+", "_", m.group(1).lower()).strip("_")
+        for name in self.registry.names():
+            if name.startswith("skill_") and token and token in name:
+                return name
+        return ""
+
+    def _autoload_requested_skill(self, user_text: str) -> None:
+        name = self._requested_skill_tool(user_text)
+        if not name:
+            return
+        task = ""
+        m = re.search(r"task 参数为：(.+?)(?:。|$)", user_text, re.S)
+        if m:
+            task = m.group(1).strip()
+        if not task or "可省略 task" in task:
+            task = "按该 Skill 的标准流程执行"
+        call_id = "skill_autoload_1"
+        tool_calls = [
+            {
+                "id": call_id,
+                "type": "function",
+                "function": {
+                    "name": name,
+                    "arguments": json.dumps({"task": task}, ensure_ascii=False),
+                },
+            }
+        ]
+        self.messages.append({"role": "assistant", "content": "", "tool_calls": tool_calls})
+        self._emit("assistant_status", {"text": f"调用工具：{name}", "tools": [name]})
+        batch_start = len(self.messages)
+        for tr in self._execute_tools(tool_calls):
+            self.messages.append(tr)
+        self._squeeze_tool_batch(batch_start)
 
     def _apply_subagent_context_budget(self) -> None:
         """Each child gets its own smaller window so a long debate cannot exhaust max_tokens."""
@@ -575,6 +670,18 @@ class Agent(AgentHistoryMixin, AgentExecuteMixin, AgentGroundingMixin):
                 roots.append(item)
         return roots
 
+    def active_plan_snapshot(self) -> Optional[dict[str, Any]]:
+        """The plan being executed right now, or None. Cleared on plan_done/cancel."""
+        plan = self._active_plan
+        if not plan:
+            return None
+        return {
+            "plan_id": str(plan.get("plan_id") or ""),
+            "summary": str(plan.get("summary") or ""),
+            "shape_contract": plan.get("shape_contract") or {},
+            "tasks": snapshot_plan_tasks(list(plan.get("tasks") or [])),
+        }
+
     def live_subagent_snapshot(self) -> list[dict[str, Any]]:
         """Running children (including nested) so a reattached UI can restore cards."""
         out: list[dict[str, Any]] = []
@@ -687,61 +794,319 @@ class Agent(AgentHistoryMixin, AgentExecuteMixin, AgentGroundingMixin):
             )
         return answer
 
-    def _maybe_compress(self) -> None:
-        schemas = self.registry.schemas()
-        before = context_budget_tokens(self.messages, schemas)
+    @staticmethod
+    def _tool_call_sig_set(msg: dict[str, Any]) -> frozenset[str]:
+        sigs: list[str] = []
+        for tc in msg.get("tool_calls") or []:
+            fn = tc.get("function") if isinstance(tc.get("function"), dict) else {}
+            name = str((fn or {}).get("name") or "")
+            if not name:
+                continue
+            args = parse_tool_args(str((fn or {}).get("arguments") or "{}"))
+            sigs.append(tool_call_signature(name, args))
+        return frozenset(sigs)
+
+    def _collapse_repeated_assistant(self, assistant: dict[str, Any]) -> bool:
+        """Drop copy-pasted turns. True = stop the loop (identical tool replay)."""
+
+        def _norm(text: str) -> str:
+            return re.sub(r"\s+", " ", (text or "").strip())
+
+        prev: Optional[dict[str, Any]] = None
+        for m in reversed(self.messages[:-1]):
+            if m.get("role") == "assistant":
+                prev = m
+                break
+        if not prev:
+            return False
+        text = _norm(str(assistant.get("content") or ""))
+        prev_text = _norm(str(prev.get("content") or ""))
+        text_repeats = bool(text) and len(text) >= 24 and (
+            text == prev_text
+            or (len(prev_text) >= 40 and prev_text in text)
+            or (len(text) >= 40 and text in prev_text)
+        )
+        has_tools = bool(assistant.get("tool_calls"))
+        fp = self._tool_call_sig_set(assistant)
+        same_tools = bool(fp) and fp == self._tool_call_sig_set(prev)
+        if text_repeats:
+            assistant["content"] = ""
+            if same_tools or not has_tools:
+                assistant["tool_calls"] = []
+                return True
+            return False
+        if same_tools:
+            assistant["tool_calls"] = []
+            return True
+        return False
+
+    def _compress_msg_limit(self, schemas: Optional[list[dict[str, Any]]] = None) -> int:
+        schemas = schemas if schemas is not None else self.registry.schemas()
+        limit = self.settings.context_limit
+        gen_reserve = int(getattr(self.settings, "max_tokens", 0) or 0)
+        if self.is_subagent and gen_reserve <= 0:
+            gen_reserve = 2048
+        return max(4000, limit - schemas_tokens(schemas) - 256 - gen_reserve)
+
+    def _archive_dropped(self, meta: dict[str, Any]) -> None:
+        """Keep whole messages that compaction removed, for display/persistence."""
+        dropped = meta.get("dropped_messages") or []
+        if dropped:
+            self._archived_messages.extend(dropped)
+            # Bytes left the window — dedup must not tell the model that an
+            # earlier read is "already in context" when it may be gone.
+            try:
+                self.guard.reset_read_coverage()
+            except Exception:
+                pass
+        if dropped or meta.get("compressed"):
+            self._write_recoverable_history()
+
+    def _write_recoverable_history(self) -> None:
+        """Cursor-style: compacted history lives as a workspace file the agent can search."""
+        try:
+            ws = Path(self.settings.workspace)
+            out_dir = ws / ".sidekick" / "context"
+            out_dir.mkdir(parents=True, exist_ok=True)
+            path = out_dir / "history.md"
+            lines = [
+                "# Session history (recover details after compaction)",
+                "",
+                "This file is **not** in the live model window. If the compaction summary",
+                "omitted something, `search_text` or `read_file` this path, then re-read",
+                "the original workspace files — do not guess.",
+                "",
+            ]
+            for m in self.full_transcript():
+                role = m.get("role")
+                if role == "system":
+                    continue
+                text = str(m.get("content") or "").replace("\r\n", "\n")
+                if role == "tool":
+                    name = str(m.get("name") or "tool")
+                    if len(text) > 500:
+                        text = text[:500] + "\n…"
+                    lines.append(f"### tool {name}")
+                    lines.append(text)
+                    lines.append("")
+                elif role == "user":
+                    if text.startswith(COMPACTION_MARK):
+                        continue
+                    clip = text if len(text) <= 2000 else text[:2000] + "…"
+                    lines.append(f"### user")
+                    lines.append(clip)
+                    lines.append("")
+                elif role == "assistant":
+                    clip = text if len(text) <= 1500 else text[:1500] + "…"
+                    if clip.strip():
+                        lines.append("### assistant")
+                        lines.append(clip)
+                        lines.append("")
+            path.write_text("\n".join(lines), encoding="utf-8")
+            rel = ".sidekick/context/history.md"
+            for m in self.messages:
+                if m.get("role") == "user" and str(m.get("content") or "").startswith(COMPACTION_MARK):
+                    body = str(m.get("content") or "")
+                    if rel not in body:
+                        m["content"] = (
+                            body.rstrip()
+                            + f"\n\n## Recover\nEarlier turns: `{rel}` — "
+                            "search_text/read_file if this summary omitted a detail."
+                        )
+                    break
+        except Exception as exc:  # noqa: BLE001
+            from ..core.logutil import get_logger, log_exception
+
+            log_exception(get_logger("metateam.agent"), "write recoverable history failed", exc)
+
+    def full_transcript(self) -> list[dict[str, Any]]:
+        """Complete chronological history for display/persistence.
+
+        ``self.messages`` is the live LLM working set and may have been
+        compacted (old turns folded into a synthetic summary). This stitches
+        the archived originals back in and drops the summary stub, so the UI
+        and disk history never lose turns to context compression.
+        """
+        if not self.messages:
+            return list(self._archived_messages)
+        system = self.messages[0] if self.messages[0].get("role") == "system" else None
+        body = self.messages[1:] if system else self.messages
+        display_body = [
+            m for m in body if not str(m.get("content") or "").startswith(COMPACTION_MARK)
+        ]
+        out: list[dict[str, Any]] = []
+        if system:
+            out.append(system)
+        out.extend(self._archived_messages)
+        out.extend(display_body)
+        return out
+
+    def _apply_ready_compress(self) -> None:
+        """Swap in a finished background compaction without blocking the loop."""
+        job = self._compress_job
+        if not job:
+            return
+        done: threading.Event = job["done"]
+        if not done.is_set():
+            return
+        self._compress_job = None
+        rebuilt, meta = job["box"].get("ok") or (None, {})
+        if not rebuilt:
+            return
+        snap_ids: set[int] = set(job.get("snap_ids") or [])
+        extras = [m for m in self.messages if id(m) not in snap_ids]
+        self.messages = list(rebuilt) + extras
+        self._archive_dropped(meta)
+        if meta.get("compressed"):
+            self._last_compressed = True
+        after = context_budget_tokens(self.messages, self.registry.schemas())
+        self._emit(
+            "compress",
+            {
+                "before": job.get("before") or 0,
+                "after": after,
+                "limit": self.settings.context_limit,
+                "meta": meta,
+                "phase": "done",
+                "background": True,
+                "blocking": False,
+                "message": f"上下文已在后台整理 {job.get('before') or 0}→{after}",
+            },
+        )
+
+    def _run_ensure_fit(self, snapshot: list[dict[str, Any]]) -> tuple[list[dict[str, Any]], dict[str, Any]]:
+        return ensure_fit(
+            snapshot,
+            context_limit=self._compress_msg_limit(),
+            keep_recent_tokens=self.settings.keep_recent_tokens,
+            trigger_ratio=self.settings.compress_trigger_ratio,
+            max_attempts=1,
+            llm=self.compress_llm,
+        )
+
+    def _start_background_compress(self, before: int) -> None:
+        if self._compress_job and not self._compress_job["done"].is_set():
+            return
+        snapshot = copy.deepcopy(self.messages)
+        snap_ids = [id(m) for m in self.messages]
+        box: dict[str, Any] = {}
+        done = threading.Event()
+        job = {"done": done, "box": box, "snap_ids": snap_ids, "before": before}
+        self._compress_job = job
+
+        def work() -> None:
+            try:
+                box["ok"] = self._run_ensure_fit(snapshot)
+            except Exception as exc:  # noqa: BLE001
+                box["ok"] = (None, {"error": str(exc)})
+            finally:
+                done.set()
+
+        threading.Thread(target=work, name="sidekick-compress", daemon=True).start()
+        self._emit(
+            "compress_start",
+            {
+                "before": before,
+                "limit": self.settings.context_limit,
+                "attempt": 1,
+                "max_attempts": 1,
+                "phase": "background",
+                "background": True,
+                "blocking": False,
+                "message": "后台整理上下文（对话继续）…",
+            },
+        )
+
+    def _emit_context_usage(self, schemas: list[dict[str, Any]] | None = None) -> int:
+        """Publish the *current* window usage; returns the estimate."""
+        schemas = schemas if schemas is not None else self.registry.schemas()
+        tokens = context_budget_tokens(self.messages, schemas)
         limit = self.settings.context_limit
         self._emit(
             "context_usage",
             {
-                "tokens": before,
+                "tokens": tokens,
                 "limit": limit,
-                "ratio": round(before / max(1, limit), 4),
+                "ratio": round(tokens / max(1, limit), 4),
                 "messages_tokens": messages_tokens(self.messages),
                 "schemas_tokens": schemas_tokens(schemas),
             },
         )
+        return tokens
+
+    def _squeeze_tool_batch(self, start: int) -> None:
+        """Keep a fresh batch of tool results from overflowing the window.
+
+        The LLM-backed compressor only runs at the top of the next iteration;
+        without this, one parallel batch of large reads could report
+        "77k / 64k" to the UI and 400 on the provider before anything reacts.
+        """
+        schemas = self.registry.schemas()
+        limit = self.settings.context_limit
+        # Leave room for the model's reply and the schemas we send every turn.
+        gen_reserve = int(getattr(self.settings, "max_tokens", 0) or 0) or 2048
+        target = int(limit * 0.85) - schemas_tokens(schemas) - 256 - gen_reserve
+        target = max(2000, target)
+        squeezed, did = squeeze_fresh_tool_results(
+            self.messages, start, target_tokens=target
+        )
+        if did:
+            self.messages = squeezed
+            self._last_compressed = True
+            self._emit_context_usage(schemas)
+
+    def _maybe_compress(self) -> None:
+        schemas = self.registry.schemas()
+        self._apply_ready_compress()
+        before = context_budget_tokens(self.messages, schemas)
+        limit = self.settings.context_limit
         trigger = int(limit * self.settings.compress_trigger_ratio)
+        # Instant shrink of PREVIOUS turns' fat tool dumps — never waits on an
+        # LLM, and never touches the active turn (clearing a read_file result
+        # the agent is still using forces it into a re-read loop).
+        if before >= int(limit * 0.55):
+            compacted, cheap_did = cheap_compact(
+                self.messages, protect_from=current_turn_start(self.messages)
+            )
+            if cheap_did:
+                self.messages = compacted
+                self._last_compressed = True
+                before = context_budget_tokens(self.messages, schemas)
         if before < trigger:
+            self._emit_context_usage(schemas)
             return
+
+        emergency = before >= int(limit * 0.90)
+        if not emergency:
+            self._emit_context_usage(schemas)
+            self._start_background_compress(before)
+            return
+
+        # Over the hard line: one sync pass so the next provider call cannot 400.
+        job = self._compress_job
+        if job and not job["done"].is_set():
+            job["done"].wait(timeout=8.0)
+            self._apply_ready_compress()
+            before = context_budget_tokens(self.messages, schemas)
+            if before < trigger:
+                self._emit_context_usage(schemas)
+                return
+        self._compress_job = None
 
         self._emit(
             "compress_start",
             {
                 "before": before,
                 "limit": limit,
-                "attempt": 0,
-                "max_attempts": self.settings.max_compress_attempts,
-                "phase": "start",
-                "message": "上下文接近上限，开始重置…",
+                "attempt": 1,
+                "max_attempts": 1,
+                "phase": "emergency",
+                "blocking": True,
+                "message": "上下文接近上限，正在快速整理…",
             },
         )
-
-        def _progress(info: dict[str, Any]) -> None:
-            self._emit(
-                "compress_progress",
-                {
-                    **info,
-                    "before": before,
-                    "limit": limit,
-                },
-            )
-
-        # Reserve tools[] plus this agent's completion budget so prompt+output
-        # cannot exceed the provider max_tokens / context window.
-        gen_reserve = int(getattr(self.settings, "max_tokens", 0) or 0)
-        if self.is_subagent and gen_reserve <= 0:
-            gen_reserve = 2048
-        msg_limit = max(4000, limit - schemas_tokens(schemas) - 256 - gen_reserve)
-        self.messages, meta = ensure_fit(
-            self.messages,
-            context_limit=msg_limit,
-            keep_recent_tokens=self.settings.keep_recent_tokens,
-            trigger_ratio=self.settings.compress_trigger_ratio,
-            max_attempts=self.settings.max_compress_attempts,
-            llm=self.compress_llm,
-            on_progress=_progress,
-        )
+        self.messages, meta = self._run_ensure_fit(self.messages)
+        self._archive_dropped(meta)
         after = context_budget_tokens(self.messages, schemas)
         if meta.get("compressed"):
             self._last_compressed = True
@@ -753,7 +1118,8 @@ class Agent(AgentHistoryMixin, AgentExecuteMixin, AgentGroundingMixin):
                 "limit": limit,
                 "meta": meta,
                 "phase": "done",
-                "message": f"上下文已重置 {before}→{after}",
+                "blocking": True,
+                "message": f"上下文已整理 {before}→{after}",
             },
         )
         self._emit(
@@ -779,7 +1145,8 @@ class Agent(AgentHistoryMixin, AgentExecuteMixin, AgentGroundingMixin):
         prep_cancelled = False
         prep_compressed = False
         gathered = ""
-        round_iters = max(4, self.settings.max_iterations // 6)
+        cap = int(self.settings.max_iterations or 0)
+        round_iters = 0 if cap <= 0 else max(4, cap // 6)
         try:
             for round_i in range(PLAN_PREP_MAX_ROUNDS):
                 self.guard.begin_plan_step()
@@ -877,7 +1244,7 @@ class Agent(AgentHistoryMixin, AgentExecuteMixin, AgentGroundingMixin):
             md = format_plan_markdown(plan, awaiting_confirm=False)
             self._emit("assistant_delta", {"chunk": "", "reset": True, "discard": True})
             self._emit("assistant_delta", {"chunk": md})
-            self.messages.append({"role": "assistant", "content": md})
+            self.messages.append({"role": "assistant", "content": md, "ts": time.time()})
             self._emit(
                 "plan_done",
                 {
@@ -901,12 +1268,30 @@ class Agent(AgentHistoryMixin, AgentExecuteMixin, AgentGroundingMixin):
         return self._execute_plan(plan, user_text)
 
     def _execute_plan(self, plan: dict[str, Any], user_text: str) -> tuple[str, int, bool, bool]:
-        from .coherence import format_shape_contract_markdown
-
         plan_id = str(plan["plan_id"])
         tasks: list[dict[str, Any]] = list(plan.get("tasks") or [])
         shape_contract = shape_contract_from_plan(plan)
         summary = str(plan.get("summary") or "")
+        self._active_plan = {
+            "plan_id": plan_id,
+            "summary": summary,
+            "shape_contract": shape_contract,
+            "tasks": tasks,
+        }
+        try:
+            return self._execute_plan_steps(plan_id, tasks, shape_contract, summary)
+        finally:
+            self._active_plan = None
+
+    def _execute_plan_steps(
+        self,
+        plan_id: str,
+        tasks: list[dict[str, Any]],
+        shape_contract: dict[str, Any],
+        summary: str,
+    ) -> tuple[str, int, bool, bool]:
+        from .coherence import format_shape_contract_markdown
+
         self._emit(
             "plan_created",
             {
@@ -925,7 +1310,8 @@ class Agent(AgentHistoryMixin, AgentExecuteMixin, AgentGroundingMixin):
         self._emit("assistant_delta", {"chunk": "", "reset": True})
         self._emit("assistant_delta", {"chunk": intro})
 
-        per_step = max(8, self.settings.max_iterations // 3)
+        cap = int(self.settings.max_iterations or 0)
+        per_step = 0 if cap <= 0 else max(8, cap // 3)
         turned = 0
         was_cancelled = False
         compressed = bool(getattr(self, "_last_compressed", False))
@@ -1003,14 +1389,15 @@ class Agent(AgentHistoryMixin, AgentExecuteMixin, AgentGroundingMixin):
                 was_cancelled = True
             from ..core.textutil import safe_clip
 
-            note = f"{title}: {safe_clip((step_final or '').strip(), 400)}"
-            step_notes.append(note)
             status = "done"
             if step_cancelled:
                 status = "cancelled"
             elif (step_final or "").startswith("ERROR"):
                 status = "error"
             task["status"] = status
+            icon = {"done": "✅", "error": "❌", "cancelled": "⏹"}.get(status, "•")
+            note = f"{icon} {title}: {safe_clip((step_final or '').strip(), 400)}"
+            step_notes.append(note)
             # Snapshot the full list so the UI does not depend on id/index matching.
             self._emit(
                 "plan_step",
@@ -1027,12 +1414,26 @@ class Agent(AgentHistoryMixin, AgentExecuteMixin, AgentGroundingMixin):
             if was_cancelled:
                 break
 
-        self._emit("plan_done", {"plan_id": plan_id, "message": "计划执行完成"})
-        lines = [intro, "### 执行结果", ""]
+        self._emit(
+            "plan_done",
+            {
+                "plan_id": plan_id,
+                "cancelled": was_cancelled,
+                "message": "计划已停止" if was_cancelled else "计划执行完成",
+            },
+        )
+        heading = "### 执行结果（已停止）" if was_cancelled else "### 执行结果"
+        lines = [intro, heading, ""]
         for note in step_notes:
-            lines.append(f"- ✅ {note}")
+            lines.append(f"- {note}")
+        remaining = [
+            str(t.get("title") or "") for t in tasks if t.get("status") in (None, "pending")
+        ]
+        if was_cancelled and remaining:
+            lines.append("")
+            lines.append("未执行：" + "、".join(r for r in remaining if r))
         final = "\n".join(lines)
-        self.messages.append({"role": "assistant", "content": final})
+        self.messages.append({"role": "assistant", "content": final, "ts": time.time()})
         self._emit("assistant_delta", {"chunk": "", "reset": True})
         self._emit("assistant_delta", {"chunk": final})
         return final, turned, was_cancelled, compressed
@@ -1051,8 +1452,18 @@ class Agent(AgentHistoryMixin, AgentExecuteMixin, AgentGroundingMixin):
         was_cancelled = False
         stall_nudges = 0
         delegate_nudges = 0
+        file_fail_nudges = 0
+        cap = int(max_iters or 0)
+        i = 0
+        exhausted = False
+        self._tool_repeat_streak = 0
+        self._last_tool_sig_set = None
 
-        for i in range(1, max_iters + 1):
+        while True:
+            i += 1
+            if cap > 0 and i > cap:
+                exhausted = True
+                break
             if self.cancelled():
                 was_cancelled = True
                 break
@@ -1115,10 +1526,15 @@ class Agent(AgentHistoryMixin, AgentExecuteMixin, AgentGroundingMixin):
                         if emit_assistant_text:
                             self._emit("assistant_delta", {"chunk": str(payload)})
                     elif kind == "reasoning_delta":
-                        self._emit(
-                            "assistant_reasoning_delta",
-                            {"chunk": str(payload)},
-                        )
+                        # Gate on emit_assistant_text like the content branch above —
+                        # otherwise a silent loop (plan-prep) never sends the opening
+                        # reset:true, so every internal round's reasoning glues onto
+                        # whatever bubble happened to exist first.
+                        if emit_assistant_text:
+                            self._emit(
+                                "assistant_reasoning_delta",
+                                {"chunk": str(payload)},
+                            )
                     elif kind == "tool_delta" and isinstance(payload, dict):
                         self._emit("tool_call_delta", payload)
                     elif kind == "done":
@@ -1128,7 +1544,7 @@ class Agent(AgentHistoryMixin, AgentExecuteMixin, AgentGroundingMixin):
                     was_cancelled = True
                     if streamed_buf.strip() and not final:
                         final = streamed_buf.strip()
-                        self.messages.append({"role": "assistant", "content": final})
+                        self.messages.append({"role": "assistant", "content": final, "ts": time.time()})
                     break
                 if stalled:
                     if assistant is None and streamed_buf.strip():
@@ -1148,13 +1564,13 @@ class Agent(AgentHistoryMixin, AgentExecuteMixin, AgentGroundingMixin):
                         partial = streamed_buf.strip()
                     if partial:
                         final = partial
-                        self.messages.append({"role": "assistant", "content": final})
+                        self.messages.append({"role": "assistant", "content": final, "ts": time.time()})
                 break
             if assistant is None:
                 if stalled and not self.cancelled():
                     stall_nudges += 1
                     self.messages.append(
-                        {"role": "assistant", "content": streamed_buf.strip()}
+                        {"role": "assistant", "content": streamed_buf.strip(), "ts": time.time()}
                     )
                     if stall_nudges <= 2:
                         self.messages.append({"role": "user", "content": _STALL_NUDGE})
@@ -1164,12 +1580,52 @@ class Agent(AgentHistoryMixin, AgentExecuteMixin, AgentGroundingMixin):
                 was_cancelled = True
                 if streamed_buf.strip() and not final:
                     final = streamed_buf.strip()
-                    self.messages.append({"role": "assistant", "content": final})
+                    self.messages.append({"role": "assistant", "content": final, "ts": time.time()})
                 break
+            assistant.setdefault("ts", time.time())
             self.messages.append(assistant)
 
             tool_calls = assistant.get("tool_calls") or []
             preamble = (assistant.get("content") or "").strip()
+
+            # Cross-turn watchdog: the exact same tool+args fired twice in a row
+            # (e.g. guard keeps returning the same ERROR and the model keeps
+            # retrying verbatim) — hard stop instead of burning iterations on a
+            # call that will never succeed differently. Computed on the raw
+            # assistant message, before any text/tool collapsing below.
+            if tool_calls:
+                cur_sig = self._tool_call_sig_set(assistant)
+                if cur_sig and cur_sig == self._last_tool_sig_set:
+                    self._tool_repeat_streak += 1
+                else:
+                    self._tool_repeat_streak = 0
+                self._last_tool_sig_set = cur_sig
+            else:
+                self._tool_repeat_streak = 0
+                self._last_tool_sig_set = None
+
+            if self._tool_repeat_streak >= 1:
+                final = preamble or (
+                    "检测到连续重复调用同一工具且参数相同，已停止本轮，避免空转。"
+                    "请说明遇到的问题或改用其他方式继续。"
+                )
+                self.messages[-1]["content"] = final
+                self.messages[-1]["tool_calls"] = []
+                if emit_assistant_text:
+                    self._emit("assistant_delta", {"chunk": "", "reset": True})
+                    self._emit("assistant_delta", {"chunk": final})
+                break
+
+            if self._collapse_repeated_assistant(assistant):
+                preamble = (assistant.get("content") or "").strip()
+                tool_calls = assistant.get("tool_calls") or []
+                if not tool_calls and not preamble:
+                    final = "（已停止重复输出）"
+                    assistant["content"] = final
+                    if emit_assistant_text:
+                        self._emit("assistant_delta", {"chunk": "", "reset": True})
+                        self._emit("assistant_delta", {"chunk": final})
+                    break
 
             if not tool_calls:
                 if (
@@ -1202,7 +1658,7 @@ class Agent(AgentHistoryMixin, AgentExecuteMixin, AgentGroundingMixin):
                         options=list(parsed_ask.get("options") or []),
                         allow_custom=bool(parsed_ask.get("allow_custom", True)),
                     )
-                    self.messages.append({"role": "user", "content": answer})
+                    self.messages.append({"role": "user", "content": answer, "ts": time.time()})
                     continue
 
                 if stalled:
@@ -1245,26 +1701,41 @@ class Agent(AgentHistoryMixin, AgentExecuteMixin, AgentGroundingMixin):
             if self.cancelled():
                 was_cancelled = True
                 break
+            tool_results: list[dict[str, Any]] = []
+            batch_start = len(self.messages)
             for tr in self._execute_tools(tool_calls):
                 if self.cancelled():
                     was_cancelled = True
                     break
                 self.messages.append(tr)
+                tool_results.append(tr)
             if was_cancelled:
                 break
-        else:
-            if not was_cancelled:
-                self._emit("max_iterations", {"n": max_iters})
-                if emit_assistant_text:
-                    self.messages.append(
-                        {
-                            "role": "user",
-                            "content": "Iteration budget exhausted. Summarize status and stop.",
-                        }
-                    )
-                    final = self._stream_final_reply()
-                else:
-                    final = ""
+            self._squeeze_tool_batch(batch_start)
+            if (
+                file_fail_nudges < 2
+                and file_tool_results_blocked(tool_results)
+            ):
+                file_fail_nudges += 1
+                self.messages.append(
+                    {
+                        "role": "user",
+                        "sidekick_internal": True,
+                        "content": _FILE_RETRY_NUDGE,
+                    }
+                )
+        if exhausted and not was_cancelled:
+            self._emit("max_iterations", {"n": cap})
+            if emit_assistant_text:
+                self.messages.append(
+                    {
+                        "role": "user",
+                        "content": "Iteration budget exhausted. Summarize status and stop.",
+                    }
+                )
+                final = self._stream_final_reply()
+            else:
+                final = ""
 
         return final, turned, was_cancelled, compressed
 
@@ -1277,13 +1748,16 @@ class Agent(AgentHistoryMixin, AgentExecuteMixin, AgentGroundingMixin):
         display: str = "",
     ) -> AgentResult:
         from ..services.fs_api import bind_active_workspace, reset_active_workspace
+        from ..services.tenant_context import bind_session_id, reset_session_id
 
         ws_token = bind_active_workspace(self.settings.workspace)
+        sid_token = bind_session_id(self.session_id or "")
         try:
             return self._run_turn(
                 user_text, mode=mode, do_review=do_review, display=display
             )
         finally:
+            reset_session_id(sid_token)
             reset_active_workspace(ws_token)
 
     def _run_turn(
@@ -1294,6 +1768,7 @@ class Agent(AgentHistoryMixin, AgentExecuteMixin, AgentGroundingMixin):
         do_review: bool = True,
         display: str = "",
     ) -> AgentResult:
+        self._refresh_skills()
         self._delegation_started = False
         self._requires_initial_delegation = bool(
             not self.is_subagent and is_multi_agent_request(user_text)
@@ -1320,7 +1795,7 @@ class Agent(AgentHistoryMixin, AgentExecuteMixin, AgentGroundingMixin):
             # Persisted agent scenes belong to one user turn. History can then
             # restore the matching team rather than every team ever spawned.
             self._canvas_turn = user_turn + 1
-        user_msg: dict[str, Any] = {"role": "user", "content": user_text}
+        user_msg: dict[str, Any] = {"role": "user", "content": user_text, "ts": time.time()}
         disp = (display or "").strip()
         if disp and disp != user_text:
             user_msg["sidekick"] = {"display": disp}
@@ -1350,6 +1825,8 @@ class Agent(AgentHistoryMixin, AgentExecuteMixin, AgentGroundingMixin):
             "turn_start",
             {"text": (disp or user_text)[:500], "message": "user turn"},
         )
+        if not self.talk_only:
+            self._autoload_requested_skill(user_text)
 
         max_iters = (
             self.settings.max_iterations
@@ -1471,17 +1948,17 @@ class Agent(AgentHistoryMixin, AgentExecuteMixin, AgentGroundingMixin):
         except Exception:
             if self.cancelled():
                 text = "".join(parts)
-                self.messages.append({"role": "assistant", "content": text})
+                self.messages.append({"role": "assistant", "content": text, "ts": time.time()})
                 return text
             assistant = self.llm.chat(self.messages, tools=None)
             text = assistant.get("content") or ""
             if text:
                 self._stream_text_to_ui(text)
-            self.messages.append({"role": "assistant", "content": text})
+            self.messages.append({"role": "assistant", "content": text, "ts": time.time()})
             return text
 
         text = "".join(parts)
-        self.messages.append({"role": "assistant", "content": text})
+        self.messages.append({"role": "assistant", "content": text, "ts": time.time()})
         return text
 
 def run_once(prompt: str, settings: Optional[Settings] = None) -> AgentResult:

@@ -1,5 +1,5 @@
 import { useState } from "react";
-import { IconRobotCube } from "./IconRobotCube";
+import { BrandMark } from "./BrandMark";
 
 type Props = {
   mode: "setup" | "login";
@@ -11,7 +11,7 @@ type Props = {
 
 const EMAIL_RE = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
 
-/** First-run admin setup or login for local multi-user. */
+/** First-run admin setup, or login. Additional accounts are created while signed in. */
 export function AuthGate({ mode, busy, error, onSetup, onLogin }: Props) {
   const [username, setUsername] = useState("");
   const [email, setEmail] = useState("");
@@ -19,11 +19,11 @@ export function AuthGate({ mode, busy, error, onSetup, onLogin }: Props) {
   const [password2, setPassword2] = useState("");
   const [localError, setLocalError] = useState<string | null>(null);
 
-  const title = mode === "setup" ? "创建管理员账号" : "登录 Sidekick";
-  const hint =
-    mode === "setup"
-      ? "本机多用户：用邮箱创建首个管理员后，会话 / 模型 / MCP 配置按账号隔离。"
-      : "使用邮箱登录。数据仅保存在本机。新账号由已登录用户添加。";
+  const registering = mode === "setup";
+  const title = mode === "setup" ? "创建管理员账号" : "登录Sidekick";
+  const hint = mode === "setup"
+    ? "用邮箱创建本机账号。每个账号的对话、模型、记忆和工作区互相隔离。"
+    : "使用邮箱登录。数据仅保存在本机。新账号由已登录用户添加。";
 
   const submit = async () => {
     setLocalError(null);
@@ -32,7 +32,7 @@ export function AuthGate({ mode, busy, error, onSetup, onLogin }: Props) {
       setLocalError("请输入有效邮箱");
       return;
     }
-    if (mode === "setup") {
+    if (registering) {
       const u = username.trim();
       if (u.length < 2) {
         setLocalError("显示名至少 2 个字符");
@@ -43,7 +43,7 @@ export function AuthGate({ mode, busy, error, onSetup, onLogin }: Props) {
       setLocalError("密码至少 6 位");
       return;
     }
-    if (mode === "setup" && password !== password2) {
+    if (registering && password !== password2) {
       setLocalError("两次密码不一致");
       return;
     }
@@ -63,9 +63,12 @@ export function AuthGate({ mode, busy, error, onSetup, onLogin }: Props) {
       <div className="welcome-stage">
         <div className="welcome-brand">
           <span className="welcome-brand-mark">
-            <IconRobotCube size={48} />
+            <BrandMark size={52} />
           </span>
-          <span className="welcome-brand-name">Sidekick</span>
+          <div className="welcome-brand-text">
+            <span className="welcome-brand-name">Sidekick</span>
+            <span className="welcome-brand-sub">AI AGENT SYSTEM</span>
+          </div>
         </div>
 
         <h1 className="welcome-title">{title}</h1>
@@ -78,7 +81,7 @@ export function AuthGate({ mode, busy, error, onSetup, onLogin }: Props) {
             void submit();
           }}
         >
-          {mode === "setup" && (
+          {registering && (
             <label className="auth-field">
               <span>显示名</span>
               <input
@@ -105,14 +108,14 @@ export function AuthGate({ mode, busy, error, onSetup, onLogin }: Props) {
             <span>密码</span>
             <input
               type="password"
-              autoComplete={mode === "setup" ? "new-password" : "current-password"}
+              autoComplete={registering ? "new-password" : "current-password"}
               placeholder="至少 6 位"
               value={password}
               disabled={busy}
               onChange={(e) => setPassword(e.target.value)}
             />
           </label>
-          {mode === "setup" && (
+          {registering && (
             <label className="auth-field">
               <span>确认密码</span>
               <input
@@ -131,7 +134,9 @@ export function AuthGate({ mode, busy, error, onSetup, onLogin }: Props) {
             </p>
           )}
           <button type="submit" className="welcome-cta" disabled={busy}>
-            <span>{busy ? "请稍候…" : mode === "setup" ? "完成设置" : "登录"}</span>
+            <span>
+              {busy ? "请稍候…" : mode === "setup" ? "完成设置" : "登录"}
+            </span>
           </button>
         </form>
       </div>

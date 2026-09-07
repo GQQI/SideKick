@@ -485,7 +485,20 @@ def read_file(rel: str, max_chars: int = 200_000) -> dict[str, Any]:
         "message": "",
     }
     if kind == "text":
-        text = fp.read_text(encoding="utf-8", errors="replace")
+        from ..core.textcodec import decode_path
+
+        decoded = decode_path(fp)
+        if not decoded.ok:
+            return {
+                **base,
+                "content": "",
+                "preview": "",
+                "truncated": False,
+                "editable": True,
+                "encoding": decoded.encoding,
+                "message": decoded.error or "无法按 UTF-8 解码，请指定编码后重试",
+            }
+        text = decoded.text
         truncated = len(text) > max_chars
         if truncated:
             text = text[:max_chars]
@@ -495,6 +508,8 @@ def read_file(rel: str, max_chars: int = 200_000) -> dict[str, Any]:
             "preview": "",
             "truncated": truncated,
             "editable": True,
+            "encoding": decoded.encoding,
+            "message": "",
         }
     if kind == "document":
         preview, ok = extract_document_preview(fp, max_chars=min(max_chars, 100_000))
@@ -559,15 +574,19 @@ def read_text(rel: str, max_chars: int = 200_000) -> dict[str, Any]:
     }
 
 
-def _atomic_write_text(fp: Path, content: str) -> None:
-    """Write UTF-8 text portably (Windows / Linux / 麒麟)."""
+def _atomic_write_text(fp: Path, content: str, *, encoding: str = "utf-8") -> None:
+    """Write text portably (Windows / Linux / 麒麟), keeping the caller's encoding."""
     import os as _os
 
+    from ..core.textcodec import encode_text
+
     text = "" if content is None else str(content)
+    text = text.replace("\r\n", "\n").replace("\r", "\n")
+    payload = encode_text(text, encoding or "utf-8")
     fp.parent.mkdir(parents=True, exist_ok=True)
     tmp = fp.with_name(f".{fp.name}.{_os.getpid()}.tmp")
     try:
-        tmp.write_text(text, encoding="utf-8", newline="\n")
+        tmp.write_bytes(payload)
         _os.replace(str(tmp), str(fp))
     except OSError:
         if tmp.exists():
@@ -575,8 +594,7 @@ def _atomic_write_text(fp: Path, content: str) -> None:
                 tmp.unlink()
             except OSError:
                 pass
-        # Some network / 麒麟 filesystems reject replace — write in place.
-        fp.write_text(text, encoding="utf-8", newline="\n")
+        fp.write_bytes(payload)
     except Exception:
         if tmp.exists():
             try:
@@ -586,7 +604,13 @@ def _atomic_write_text(fp: Path, content: str) -> None:
         raise
 
 
-def write_text(rel: str, content: str, *, allow_outside: bool = False) -> dict[str, Any]:
+def write_text(
+    rel: str,
+    content: str,
+    *,
+    allow_outside: bool = False,
+    encoding: str | None = None,
+) -> dict[str, Any]:
     from . import fs_undo
 
     text = "" if content is None else str(content)
@@ -596,10 +620,18 @@ def write_text(rel: str, content: str, *, allow_outside: bool = False) -> dict[s
         raise ValueError(f"invalid path {rel!r}: {exc}") from exc
     if fp.exists() and detect_kind(fp) != "text":
         raise ValueError(f"cannot overwrite non-text file as text: {rel}")
+    chosen = encoding
+    if not chosen and fp.exists() and fp.is_file():
+        try:
+            from ..core.textcodec import bom_encoding_of
+
+            chosen = bom_encoding_of(fp.read_bytes()[:4]) or "utf-8"
+        except OSError:
+            chosen = "utf-8"
     out = rel_to_workspace(fp)
     fs_undo.push_before_write(out, fp)
     try:
-        _atomic_write_text(fp, text)
+        _atomic_write_text(fp, text, encoding=chosen or "utf-8")
     except OSError as exc:
         raise OSError(
             f"write_file failed for {fp}: {exc}. "
@@ -749,10 +781,12 @@ def create_entry(rel: str, kind: str = "file") -> dict[str, Any]:
     return {"path": rel_to_workspace(fp), "type": "file"}
 
 
-def delete_entry(rel: str, *, recursive: bool = False) -> dict[str, Any]:
+def delete_entry(
+    rel: str, *, recursive: bool = False, allow_outside: bool = False
+) -> dict[str, Any]:
     from . import fs_undo
 
-    fp = safe_resolve(rel)
+    fp = safe_resolve(rel, allow_outside=allow_outside)
     root = workspace_root().resolve()
     if fp.resolve() == root:
         raise ValueError("cannot delete workspace root")

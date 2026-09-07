@@ -1,6 +1,6 @@
 /** Persist left activity sidebar selection across refresh. */
 
-export type SidePanel = "files" | "search" | "history" | "browser" | "git" | "undo";
+export type SidePanel = "files" | "search" | "history" | "browser" | "git" | "undo" | "jobs";
 
 const SIDE_PANEL_KEY = "sidekick.sidePanel";
 const EXPLORER_COLLAPSED_KEY = "sidekick.explorerCollapsed";
@@ -9,7 +9,16 @@ const EXPLORER_WIDTH_KEY = "sidekick.explorerWidth";
 export function loadSidePanel(): SidePanel {
   try {
     const v = localStorage.getItem(SIDE_PANEL_KEY);
-    if (v === "search" || v === "history" || v === "files" || v === "browser" || v === "git" || v === "undo") return v;
+    if (
+      v === "search" ||
+      v === "history" ||
+      v === "files" ||
+      v === "browser" ||
+      v === "git" ||
+      v === "undo" ||
+      v === "jobs"
+    )
+      return v;
   } catch {
     /* ignore */
   }

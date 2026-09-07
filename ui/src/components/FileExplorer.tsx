@@ -31,6 +31,7 @@ import {
   IconTrash,
   IconX,
 } from "./icons";
+import { ancestorFsDirs, relFsPath, sameFsPath } from "../utils/fsPath";
 
 type Props = {
   rootName: string;
@@ -41,6 +42,8 @@ type Props = {
   onToggle: () => void;
   onOpenFile: (file: import("../api").FilePayload) => void;
   refreshKey?: number;
+  /** Workspace-relative (or absolute) path of the file shown in the detail panel. */
+  activeFilePath?: string | null;
   /** Called after a path is deleted (file or folder). */
   onDeleted?: (path: string) => void;
 };
@@ -80,6 +83,7 @@ export function FileExplorer({
   onToggle,
   onOpenFile,
   refreshKey = 0,
+  activeFilePath = null,
   onDeleted,
 }: Props) {
   const { t } = usePrefs();
@@ -96,10 +100,15 @@ export function FileExplorer({
   const [deleteBusy, setDeleteBusy] = useState(false);
   const [pendingDeletePath, setPendingDeletePath] = useState<string | null>(null);
   const [selectedDir, setSelectedDir] = useState(".");
+  const [pickedFile, setPickedFile] = useState<string | null>(null);
   const [draggingPath, setDraggingPath] = useState<string | null>(null);
   const [dropTarget, setDropTarget] = useState<string | null>(null);
   const [actionError, setActionError] = useState("");
   const openClickTimer = useRef<number | null>(null);
+  const treeRef = useRef<HTMLDivElement | null>(null);
+  const dirsRef = useRef(dirs);
+  dirsRef.current = dirs;
+  const shownFile = activeFilePath || pickedFile;
 
   function absPathFor(entry: Pick<FsEntry, "path" | "abs_path">): string {
     if (entry.abs_path) return entry.abs_path;
@@ -114,7 +123,7 @@ export function FileExplorer({
   async function revealInOs(path: string) {
     setCtxMenu(null);
     try {
-      await revealFsEntry(path);
+      await revealFsEntry(path, workspaceAbsPath || undefined);
     } catch (e) {
       setActionError(
         t("feRevealFail", e instanceof Error ? e.message : String(e)),
@@ -125,7 +134,7 @@ export function FileExplorer({
   const loadDir = useCallback(async (path: string) => {
     setDirs((prev) => ({ ...prev, [path]: { ...prev[path], loading: true, error: undefined } }));
     try {
-      const data = await listFiles(path);
+      const data = await listFiles(path, workspaceAbsPath || undefined);
       setDirs((prev) => ({
         ...prev,
         [path]: { loading: false, entries: data.entries },
@@ -140,13 +149,15 @@ export function FileExplorer({
         },
       }));
     }
-  }, []);
+  }, [workspaceAbsPath]);
 
   useEffect(() => {
+    setDirs({});
     void loadDir(".");
     setExpanded({ ".": true });
     setSelectedDir(".");
-  }, [loadDir, rootName]);
+    setPickedFile(null);
+  }, [loadDir, rootName, workspaceAbsPath]);
 
   useEffect(() => {
     if (refreshKey <= 0) return;
@@ -182,6 +193,37 @@ export function FileExplorer({
       window.removeEventListener("keydown", onKey);
     };
   }, [ctxMenu]);
+
+  useEffect(() => {
+    if (!activeFilePath) return;
+    const parents = ancestorFsDirs(activeFilePath, workspaceAbsPath);
+    setExpanded((prev) => {
+      let changed = false;
+      const next = { ...prev };
+      for (const dir of parents) {
+        if (!next[dir]) {
+          next[dir] = true;
+          changed = true;
+        }
+      }
+      return changed ? next : prev;
+    });
+    for (const dir of parents) {
+      const state = dirsRef.current[dir];
+      if (!state?.entries && !state?.loading) void loadDir(dir);
+    }
+  }, [activeFilePath, workspaceAbsPath, loadDir]);
+
+  useEffect(() => {
+    const rel = relFsPath(shownFile, workspaceAbsPath);
+    if (!rel || rel === ".") return;
+    const root = treeRef.current;
+    if (!root) return;
+    const node = root.querySelector(`[data-fe-path="${CSS.escape(rel)}"]`);
+    if (node instanceof HTMLElement) {
+      node.scrollIntoView({ block: "nearest" });
+    }
+  }, [shownFile, workspaceAbsPath, dirs]);
 
   function parentOf(path: string) {
     const norm = path.replace(/\\/g, "/");
@@ -229,7 +271,7 @@ export function FileExplorer({
     setPendingDeletePath(null);
     setActionError("");
     try {
-      await deleteFsEntry(entry.path, isDir);
+      await deleteFsEntry(entry.path, isDir, workspaceAbsPath || undefined);
       if (selectedDir === entry.path || selectedDir.startsWith(`${entry.path}/`)) {
         setSelectedDir(parentOf(entry.path));
       }
@@ -267,7 +309,7 @@ export function FileExplorer({
     }
     setActionError("");
     try {
-      await moveFsEntry(srcPath, destDir);
+      await moveFsEntry(srcPath, destDir, workspaceAbsPath || undefined);
       if (selectedDir === srcPath || selectedDir.startsWith(`${srcPath}/`)) {
         setSelectedDir(destDir);
       }
@@ -375,7 +417,7 @@ export function FileExplorer({
     try {
       const parent = parentPath === "." ? "" : parentPath;
       const path = parent ? `${parent}/${name}` : name;
-      await createFsEntry(path, kind);
+      await createFsEntry(path, kind, workspaceAbsPath || undefined);
       cancelCreate();
       await loadDir(parentPath);
       if (parentPath !== ".") await loadDir(".");
@@ -404,7 +446,7 @@ export function FileExplorer({
     setRenameBusy(true);
     setRenameError("");
     try {
-      await renameFsEntry(renaming.path, name);
+      await renameFsEntry(renaming.path, name, workspaceAbsPath || undefined);
       const parent = renaming.parent;
       cancelRename();
       await loadDir(parent);
@@ -428,8 +470,8 @@ export function FileExplorer({
     openClickTimer.current = window.setTimeout(() => {
       void (async () => {
         try {
-          const data = await readFileContent(path);
-          onOpenFile(data);
+          const data = await readFileContent(path, workspaceAbsPath || undefined);
+          onOpenFile(workspaceAbsPath ? { ...data, workspace: workspaceAbsPath } : data);
         } catch (e) {
           console.error(t("feReadFail", e instanceof Error ? e.message : String(e)));
         }
@@ -646,7 +688,7 @@ export function FileExplorer({
           const isDragging = draggingPath === e.path;
           if (e.type === "dir") {
             const open = Boolean(expanded[e.path]);
-            const selected = selectedDir === e.path;
+            const selected = !shownFile && selectedDir === e.path;
             const isDrop = dropTarget === e.path;
             return (
               <div key={e.path}>
@@ -692,20 +734,23 @@ export function FileExplorer({
               </div>
             );
           }
+          const fileSelected = sameFsPath(e.path, shownFile, workspaceAbsPath);
           return (
             <div
               key={e.path}
-              className={`fe-row-wrap${isDragging ? " dragging" : ""}`}
+              className={`fe-row-wrap${isDragging ? " dragging" : ""}${fileSelected ? " selected" : ""}`}
               style={{ paddingLeft: 8 + depth * 14 }}
             >
               <button
                 type="button"
-                className="fe-row"
+                className={`fe-row${fileSelected ? " selected" : ""}`}
+                data-fe-path={relFsPath(e.path, workspaceAbsPath)}
                 draggable
                 title={absPathFor(e)}
                 onDragStart={(ev) => onDragStart(ev, e.path)}
                 onDragEnd={onDragEnd}
                 onClick={() => {
+                  setPickedFile(e.path);
                   setSelectedDir(parentOf(e.path));
                   scheduleOpenFile(e.path);
                 }}
@@ -796,7 +841,7 @@ export function FileExplorer({
       </div>
       <button
         type="button"
-        className={`fe-root-label${selectedDir === "." ? " selected" : ""}${
+        className={`fe-root-label${!shownFile && selectedDir === "." ? " selected" : ""}${
           dropTarget === "." ? " drop-target" : ""
         }`}
         title={workspaceAbsPath || rootName}
@@ -825,7 +870,7 @@ export function FileExplorer({
         <span>{rootName}</span>
       </button>
       {actionError && <div className="fe-hint err fe-action-error">{actionError}</div>}
-      <div className="fe-tree">{renderEntries(".", 0)}</div>
+      <div className="fe-tree" ref={treeRef}>{renderEntries(".", 0)}</div>
       {ctxMenu && (
         <div
           className="fe-ctx-menu"
@@ -841,6 +886,7 @@ export function FileExplorer({
               onClick={() => {
                 const path = ctxMenu.entry.path;
                 setCtxMenu(null);
+                setPickedFile(path);
                 scheduleOpenFile(path);
               }}
             >

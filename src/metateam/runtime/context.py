@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import re
 from typing import Any, Callable, Optional, TYPE_CHECKING
 
 if TYPE_CHECKING:
@@ -84,51 +85,316 @@ def context_budget_tokens(
     return messages_tokens(messages) + schemas_tokens(schemas) + overhead
 
 
-_COMPRESS_PROMPT = """You compress agent transcripts into durable working memory.
+COMPACTION_MARK = "[CONTEXT COMPACTION]"
+_PIN_MARK = "## Pinned (do not drop)"
+_MEMORY_MARK = "## Working memory"
 
-Output EXACTLY these markdown sections:
+_COMPRESS_PROMPT = """You write durable working memory for an ongoing agent session.
+
+The pinned facts are already preserved separately — do NOT repeat them.
+Write ONLY these sections, in the user's language:
+
 ## Goal
 ## Progress
 ## Decisions
-## Artifacts
-## Workspace
+## Files
 ## Open Issues
 ## Next
 
 Rules:
-- Prefer paths, commands, error strings, IDs that must survive.
-- ## Workspace MUST list confirmed files/dirs from tools (e.g. only index.html). Never invent src/ if not observed.
-- Drop raw tool dumps and chit-chat.
-- Match the user's language.
-- Keep under 900 tokens."""
+- Keep every user request, named decision, file path (with line ranges if read), URL, command, error, and ID that still matters.
+- ## Files: list paths already read/written/listed this session (e.g. report.md lines 1-136). The agent can re-read them; do not invent paths.
+- Never invent files, folders, or APIs that were not observed.
+- Drop raw tool dumps, screenshots, HTML, and chit-chat.
+- If a previous working-memory block is provided, UPDATE it — do not shrink it into a vague recap.
+- Keep under 1600 tokens. Prefer concrete leftovers over prose."""
+
+_URL_RE = re.compile(r"https?://[^\s)\]>\"'`]+", re.IGNORECASE)
+_DATA_URI_RE = re.compile(r"data:image/[a-zA-Z0-9.+-]+;base64,[A-Za-z0-9+/=\s]{80,}")
 
 
 def _stringify_for_summary(messages: list[dict[str, Any]]) -> str:
     parts: list[str] = []
     for m in messages:
         role = m.get("role", "?")
-        content = m.get("content") or ""
+        content = _content_text(m)
         if m.get("tool_calls"):
             names = [(tc.get("function") or {}).get("name", "?") for tc in m["tool_calls"]]
             content = (content + "\n" if content else "") + f"[tools: {', '.join(names)}]"
         if role == "tool":
-            content = content[:900] + ("…" if len(content) > 900 else "")
-            parts.append(f"tool: {content}")
+            name = str(m.get("name") or "tool")
+            clip = content[:700] + ("…" if len(content) > 700 else "")
+            parts.append(f"tool {name}: {clip}")
+        elif role == "user":
+            parts.append(f"user: {content[:4000]}")
         else:
-            parts.append(f"{role}: {str(content)[:2200]}")
+            parts.append(f"{role}: {content[:1800]}")
     return "\n\n".join(parts)
 
 
-def _hard_trim_tool_payloads(messages: list[dict[str, Any]], cap: int = 1200) -> list[dict[str, Any]]:
+def _strip_heavy_payloads(text: str) -> str:
+    if not text:
+        return text
+    cleaned = _DATA_URI_RE.sub("[image omitted]", text)
+    if "<html" in cleaned.lower() and len(cleaned) > 2500:
+        cleaned = cleaned[:1200] + "\n…[html truncated]"
+    return cleaned
+
+
+_CLEARED_PREFIX = "[cleared tool result:"
+_RANGE_TRAILER_RE = re.compile(r"lines (\d+)-(\d+) of (\d+)")
+
+
+def _tool_result_stub(msg: dict[str, Any]) -> str:
+    """Claude-style clear_tool_uses: keep the call, drop the bulky payload."""
+    name = str(msg.get("name") or "tool")
+    text = _content_text(msg)
+    extra = ""
+    m = _RANGE_TRAILER_RE.search(text)
+    if m:
+        extra = f" lines {m.group(1)}-{m.group(2)} of {m.group(3)}"
+    elif name == "read_file":
+        first = text.strip().split("\n", 1)[0][:80]
+        if first and not first.startswith("ERROR"):
+            extra = f" ({first})"
+    return (
+        f"{_CLEARED_PREFIX} {name}{extra}. "
+        "Call the same tool again if you still need the raw text.]"
+    )
+
+
+def current_turn_start(messages: list[dict[str, Any]]) -> int:
+    """Index of the latest REAL user message (not compaction/internal).
+
+    Everything from there on is the active turn — the agent is still working
+    with those tool results, so mid-turn clearing must never touch them.
+    """
+    for i in range(len(messages) - 1, -1, -1):
+        m = messages[i]
+        if m.get("role") != "user":
+            continue
+        if m.get("sidekick_internal") or m.get("internal"):
+            continue
+        text = str(m.get("content") or "")
+        if text.startswith(COMPACTION_MARK) or text.lstrip().startswith("[Plan step "):
+            continue
+        return i
+    return len(messages)
+
+
+def cheap_compact(
+    messages: list[dict[str, Any]],
+    *,
+    old_cap: int = 900,
+    recent_cap: int = 2200,
+    recent_tools: int = 4,
+    protect_from: int | None = None,
+) -> tuple[list[dict[str, Any]], bool]:
+    """Shrink context without an LLM.
+
+    Tool results from PREVIOUS turns get truncated, and bulky old payloads are
+    replaced with a one-line stub that still names the call (Claude Code
+    clear_tool_uses / Cursor: keep the record, re-fetch if needed).
+
+    Messages at or after ``protect_from`` (the active turn) are left intact —
+    clearing a read_file result the agent is still working from forces it into
+    a re-read loop. Pass ``protect_from=None`` to compact everything (only
+    safe for snapshots that are about to be summarized anyway).
+    """
+    if not messages:
+        return messages, False
+    guard_idx = len(messages) if protect_from is None else max(0, protect_from)
+    tool_idxs = [i for i, m in enumerate(messages) if m.get("role") == "tool"]
+    # NB: tool_idxs[-0:] would be the whole list — 0 must mean "none recent".
+    recent = set(tool_idxs[-recent_tools:]) if recent_tools > 0 else set()
+    changed = False
     out: list[dict[str, Any]] = []
-    for m in messages:
-        if m.get("role") == "tool" and isinstance(m.get("content"), str) and len(m["content"]) > cap:
+    for i, m in enumerate(messages):
+        if m.get("role") != "tool" or not isinstance(m.get("content"), str):
+            out.append(m)
+            continue
+        if i >= guard_idx:
+            out.append(m)
+            continue
+        raw = _strip_heavy_payloads(m["content"])
+        if i not in recent and not raw.startswith(_CLEARED_PREFIX) and len(raw) > old_cap:
             nm = dict(m)
-            nm["content"] = m["content"][:cap] + "\n…[truncated]"
+            nm["content"] = _tool_result_stub(m)
             out.append(nm)
+            changed = True
+            continue
+        cap = recent_cap if i in recent else old_cap
+        if len(raw) > cap:
+            raw = raw[:cap] + "\n…[truncated]"
+        if raw != m["content"]:
+            nm = dict(m)
+            nm["content"] = raw
+            out.append(nm)
+            changed = True
         else:
             out.append(m)
+    return out, changed
+
+
+def _hard_trim_tool_payloads(messages: list[dict[str, Any]], cap: int = 1200) -> list[dict[str, Any]]:
+    out, _ = cheap_compact(messages, old_cap=cap, recent_cap=cap, recent_tools=0)
     return out
+
+
+_SQUEEZE_NOTE = (
+    "\n…[truncated to fit the context window — call the tool again with a "
+    "narrower range (offset/limit, tighter query) if you need the rest]"
+)
+
+
+def squeeze_fresh_tool_results(
+    messages: list[dict[str, Any]],
+    start: int,
+    *,
+    target_tokens: int,
+    floor_chars: int = 600,
+) -> tuple[list[dict[str, Any]], bool]:
+    """Shrink tool results appended since ``start`` until the transcript fits.
+
+    Compression only runs at the top of the next loop iteration, so one
+    parallel batch of fat tool dumps could push the context far past the
+    limit before anything reacts. This trims the *freshest* results, largest
+    first, so the window is back under ``target_tokens`` before the next
+    provider call. Everything before ``start`` is untouched.
+    """
+    if start < 0 or start >= len(messages):
+        return messages, False
+    total = messages_tokens(messages)
+    if total <= target_tokens:
+        return messages, False
+    out = list(messages)
+    fresh = [
+        i
+        for i in range(start, len(out))
+        if out[i].get("role") == "tool" and isinstance(out[i].get("content"), str)
+    ]
+    if not fresh:
+        return messages, False
+    changed = False
+    # Repeatedly halve the largest fresh result until we fit or hit the floor.
+    for _ in range(40):
+        total = messages_tokens(out)
+        if total <= target_tokens:
+            break
+        fresh.sort(key=lambda i: len(out[i]["content"]), reverse=True)
+        idx = fresh[0]
+        text = out[idx]["content"]
+        if len(text) <= floor_chars:
+            break
+        body = text
+        if body.endswith(_SQUEEZE_NOTE):
+            body = body[: -len(_SQUEEZE_NOTE)]
+        new_len = max(floor_chars, len(body) // 2)
+        nm = dict(out[idx])
+        nm["content"] = body[:new_len].rstrip() + _SQUEEZE_NOTE
+        out[idx] = nm
+        changed = True
+    return out, changed
+
+
+def extract_durable_pins(messages: list[dict[str, Any]], *, prior: str = "") -> str:
+    """Lossless-ish facts that must survive even if the LLM summary is lossy."""
+    users: list[str] = []
+    artifacts: list[str] = []
+    errors: list[str] = []
+    urls: list[str] = []
+    seen_url: set[str] = set()
+
+    def add_url(u: str) -> None:
+        u = (u or "").rstrip(").,;]")
+        if u and u not in seen_url and not u.lower().endswith(
+            (".png", ".jpg", ".jpeg", ".gif", ".webp")
+        ):
+            seen_url.add(u)
+            urls.append(u)
+
+    for m in messages:
+        role = m.get("role")
+        text = _content_text(m)
+        if role == "user" and text and not text.startswith(COMPACTION_MARK):
+            clip = text.strip()
+            if clip and clip not in users:
+                users.append(clip[:2000])
+        if role == "tool":
+            name = str(m.get("name") or "tool")
+            if text.lstrip().upper().startswith("ERROR"):
+                errors.append(f"{name}: {text.strip()[:360]}")
+            if name in {
+                "write_file",
+                "str_replace",
+                "delete_file",
+                "read_file",
+                "list_dir",
+                "browser_navigate",
+                "browser_screenshot",
+            }:
+                artifacts.append(f"{name}: {text.strip()[:240]}")
+        for tc in m.get("tool_calls") or []:
+            fn = tc.get("function") if isinstance(tc.get("function"), dict) else {}
+            name = str((fn or {}).get("name") or "")
+            args = str((fn or {}).get("arguments") or "")
+            if name and args:
+                artifacts.append(f"{name}({args[:180]})")
+        for u in _URL_RE.findall(text):
+            add_url(u)
+
+    if prior:
+        for line in prior.splitlines():
+            s = line.strip()
+            if s.startswith("- "):
+                s = s[2:].strip()
+            if s.startswith("http"):
+                add_url(s)
+
+    lines = [_PIN_MARK]
+    if users:
+        lines.append("### User requests")
+        # Keep the earliest goals and the latest asks — those are what models forget.
+        keep_u = users[:6]
+        if len(users) > 6:
+            keep_u = users[:3] + users[-3:]
+        for u in keep_u:
+            lines.append(f"- {u.replace(chr(10), ' / ')[:500]}")
+    if artifacts:
+        lines.append("### Artifacts")
+        for a in artifacts[-16:]:
+            lines.append(f"- {a.replace(chr(10), ' ')[:220]}")
+    if urls:
+        lines.append("### URLs")
+        for u in urls[-12:]:
+            lines.append(f"- {u}")
+    if errors:
+        lines.append("### Errors")
+        for e in errors[-8:]:
+            lines.append(f"- {e.replace(chr(10), ' ')[:220]}")
+    return "\n".join(lines) if len(lines) > 1 else ""
+
+
+def _peel_prior_compaction(body: list[dict[str, Any]]) -> tuple[str, str, list[dict[str, Any]]]:
+    pins: list[str] = []
+    memories: list[str] = []
+    rest: list[dict[str, Any]] = []
+    for m in body:
+        text = _content_text(m)
+        if m.get("role") == "user" and text.startswith(COMPACTION_MARK):
+            payload = text[len(COMPACTION_MARK) :].lstrip("\n")
+            if _PIN_MARK in payload and _MEMORY_MARK in payload:
+                pre, _, mem = payload.partition(_MEMORY_MARK)
+                pin = pre
+                if _PIN_MARK in pin:
+                    pin = pin.split(_PIN_MARK, 1)[1]
+                    pins.append(_PIN_MARK + "\n" + pin.strip())
+                memories.append(mem.strip())
+            else:
+                memories.append(payload.strip())
+        else:
+            rest.append(m)
+    return "\n\n".join(p for p in pins if p), "\n\n".join(m for m in memories if m), rest
 
 
 def _split_keep_recent(
@@ -136,6 +402,11 @@ def _split_keep_recent(
 ) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
     if not messages:
         return [], []
+    # Always keep the latest user utterance even if it is older than the tool tail.
+    last_user = -1
+    for i, m in enumerate(messages):
+        if m.get("role") == "user" and not str(m.get("content") or "").startswith(COMPACTION_MARK):
+            last_user = i
     tail: list[dict[str, Any]] = []
     used = 0
     i = len(messages) - 1
@@ -164,7 +435,21 @@ def _split_keep_recent(
         used += cost
         i -= 1
     head = messages[: i + 1] if i >= 0 else []
+    if last_user >= 0:
+        held = messages[last_user]
+        if held not in tail and held in head:
+            head = [m for m in head if m is not held]
+            tail = [held] + tail
     return head, tail
+
+
+def _build_compaction_message(pins: str, memory: str) -> dict[str, Any]:
+    parts = [COMPACTION_MARK]
+    if pins.strip():
+        parts.append(pins.strip())
+    if memory.strip():
+        parts.append(f"{_MEMORY_MARK}\n{memory.strip()}")
+    return {"role": "user", "content": "\n\n".join(parts)}
 
 
 def compress_messages(
@@ -175,48 +460,74 @@ def compress_messages(
     trigger_ratio: float,
     llm: Optional["LLM"],
     prior_summary: str = "",
-) -> tuple[list[dict[str, Any]], str, bool]:
+) -> tuple[list[dict[str, Any]], str, bool, list[dict[str, Any]]]:
+    """Return (messages, summary, did_compress, dropped_raw_messages).
+
+    ``dropped_raw_messages`` are the ORIGINAL (never summarized/truncated)
+    messages that were folded into the synthetic compaction stub — the
+    caller should archive them verbatim so a full transcript can still be
+    reconstructed for display/persistence even after the working set shrinks.
+    """
     if not messages:
-        return messages, prior_summary, False
+        return messages, prior_summary, False, []
 
     total = messages_tokens(messages)
     if total < int(context_limit * trigger_ratio):
-        return messages, prior_summary, False
+        return messages, prior_summary, False, []
 
     system = messages[0] if messages[0].get("role") == "system" else None
     body = messages[1:] if system else list(messages)
+    prior_pins, prior_mem, body = _peel_prior_compaction(body)
+    if prior_mem and not prior_summary:
+        prior_summary = prior_mem
 
-    # Soft prune tool payloads first (lighter than full summary)
-    pruned = _hard_trim_tool_payloads(body, cap=2500)
+    pruned, cheap_did = cheap_compact(body, protect_from=current_turn_start(body))
     if messages_tokens(([system] if system else []) + pruned) < int(context_limit * trigger_ratio):
-        return ([system] if system else []) + pruned, prior_summary, True
+        out_body = pruned
+        if prior_pins or prior_summary:
+            out_body = [_build_compaction_message(prior_pins, prior_summary)] + pruned
+        return ([system] if system else []) + out_body, prior_summary, True, []
 
-    head, tail = _split_keep_recent(pruned, keep_recent_tokens)
+    keep = max(4000, int(keep_recent_tokens or 0) or 16000)
+    head, tail = _split_keep_recent(pruned, keep)
+    extra_did = False
     if not head:
-        tail = _hard_trim_tool_payloads(tail, cap=800)
-        head, tail = _split_keep_recent(tail, keep_recent_tokens)
+        tail, extra_did = cheap_compact(
+            tail, old_cap=700, recent_cap=700, recent_tools=2,
+            protect_from=current_turn_start(tail),
+        )
+        head, tail = _split_keep_recent(tail, max(3000, keep // 2))
     if not head:
-        return ([system] if system else []) + tail, prior_summary, False
+        out = tail
+        if prior_pins or prior_summary:
+            out = [_build_compaction_message(prior_pins, prior_summary)] + tail
+        return (
+            ([system] if system else []) + out,
+            prior_summary,
+            cheap_did or extra_did or bool(prior_pins or prior_summary),
+            [],
+        )
 
+    pins = extract_durable_pins(head, prior=prior_pins)
     blob = _stringify_for_summary(head)
     if prior_summary:
-        blob = f"PREVIOUS SUMMARY:\n{prior_summary}\n\nNEW TURNS:\n{blob}"
+        blob = f"PREVIOUS WORKING MEMORY:\n{prior_summary}\n\nNEW TURNS:\n{blob}"
 
     summary = ""
     if llm is not None:
         try:
             summary = llm.complete_text(_COMPRESS_PROMPT, blob[:140_000])
         except Exception as exc:  # noqa: BLE001
-            summary = f"(compress failed: {exc})\n" + blob[:3500]
+            summary = f"(compress failed: {exc})\n" + (prior_summary or blob[:2500])
     if not summary:
-        summary = blob[:3500]
+        summary = prior_summary or blob[:2500]
 
-    synthetic = {
-        "role": "user",
-        "content": "[CONTEXT COMPACTION]\n" + summary,
-    }
+    synthetic = _build_compaction_message(pins or prior_pins, summary)
     rebuilt = ([system] if system else []) + [synthetic] + tail
-    return rebuilt, summary, True
+    # `head` (cheap-compacted: very long tool dumps may be clipped, but no
+    # whole message is dropped) is archived so the full turn history can
+    # still be reconstructed for display/persistence after compaction.
+    return rebuilt, summary, True, head
 
 
 def ensure_fit(
@@ -229,58 +540,99 @@ def ensure_fit(
     llm: Optional["LLM"],
     on_progress: Optional[Callable[[dict[str, Any]], None]] = None,
 ) -> tuple[list[dict[str, Any]], dict[str, Any]]:
-    """Return (messages, meta)."""
-    summary = ""
-    cur = messages
-    meta = {"attempts": 0, "compressed": False, "final_tokens": 0}
-    for attempt in range(max_attempts):
-        tokens_now = messages_tokens(cur)
-        if on_progress:
-            on_progress(
-                {
-                    "phase": "compressing",
-                    "attempt": attempt + 1,
-                    "max_attempts": max_attempts,
-                    "tokens": tokens_now,
-                    "limit": context_limit,
-                    "message": f"压缩上下文中（第 {attempt + 1}/{max_attempts} 轮）…",
-                }
-            )
-        cur, summary, did = compress_messages(
-            cur,
-            context_limit=context_limit,
-            keep_recent_tokens=keep_recent_tokens,
-            trigger_ratio=trigger_ratio,
-            llm=llm,
-            prior_summary=summary,
+    """Fit messages into the budget.
+
+    One cheap pass (always), at most one LLM summary, then hard trim.
+    ``max_attempts`` is kept for callers but no longer runs serial LLM rounds.
+
+    ``meta["dropped_messages"]`` carries every whole message removed from the
+    working set (folded into the compaction summary, or hard-trimmed) so the
+    caller can archive them for a lossless display/persistence transcript.
+    """
+    del max_attempts  # single-pass; reserved so existing callers keep working
+    cur = list(messages)
+    dropped: list[dict[str, Any]] = []
+    meta: dict[str, Any] = {"attempts": 0, "compressed": False, "final_tokens": 0, "llm_passes": 0}
+    tokens_now = messages_tokens(cur)
+    if on_progress:
+        on_progress(
+            {
+                "phase": "cheap",
+                "attempt": 1,
+                "max_attempts": 1,
+                "tokens": tokens_now,
+                "limit": context_limit,
+                "message": "正在整理上下文…",
+            }
         )
-        meta["attempts"] = attempt + 1
-        if did:
-            meta["compressed"] = True
-        if messages_tokens(cur) < int(context_limit * trigger_ratio):
-            meta["final_tokens"] = messages_tokens(cur)
-            meta["summary_preview"] = summary[:400]
-            return cur, meta
+    cur, cheap_did = cheap_compact(cur, protect_from=current_turn_start(cur))
+    if cheap_did:
+        meta["compressed"] = True
+        meta["cheap"] = True
+
+    trigger = int(context_limit * trigger_ratio)
+    if messages_tokens(cur) < trigger:
+        meta["final_tokens"] = messages_tokens(cur)
+        meta["dropped_messages"] = dropped
+        return cur, meta
+
+    cur, summary, did, head_dropped = compress_messages(
+        cur,
+        context_limit=context_limit,
+        keep_recent_tokens=keep_recent_tokens,
+        trigger_ratio=trigger_ratio,
+        llm=llm,
+        prior_summary="",
+    )
+    dropped.extend(head_dropped)
+    meta["attempts"] = 1
+    if did:
+        meta["compressed"] = True
+        meta["llm_passes"] = 1 if llm is not None else 0
+        meta["summary_preview"] = (summary or "")[:400]
+
+    if messages_tokens(cur) < trigger:
+        meta["final_tokens"] = messages_tokens(cur)
+        meta["dropped_messages"] = dropped
+        return cur, meta
 
     if on_progress:
         on_progress(
             {
                 "phase": "hard_trim",
-                "attempt": max_attempts,
-                "max_attempts": max_attempts,
+                "attempt": 1,
+                "max_attempts": 1,
                 "tokens": messages_tokens(cur),
                 "limit": context_limit,
-                "message": "压缩不足，正在硬裁剪上下文…",
+                "message": "正在裁剪过长工具输出…",
             }
         )
     system = cur[0] if cur and cur[0].get("role") == "system" else None
     body = cur[1:] if system else cur
-    body = _hard_trim_tool_payloads(body, cap=500)
-    while messages_tokens(([system] if system else []) + body) > context_limit and len(body) > 3:
-        body = body[1:]
-    out = ([system] if system else []) + body
+    body, _ = cheap_compact(
+        body, old_cap=500, recent_cap=900, recent_tools=2,
+        protect_from=current_turn_start(body),
+    )
+    # Never drop the compaction pin or the latest user line if we can help it.
+    guard: list[dict[str, Any]] = []
+    rest = body
+    if body and str(body[0].get("content") or "").startswith(COMPACTION_MARK):
+        guard.append(body[0])
+        rest = body[1:]
+    while messages_tokens(([system] if system else []) + guard + rest) > context_limit and len(rest) > 2:
+        # Drop oldest non-user first; only then drop older assistant/tool.
+        drop_at = 0
+        for i, m in enumerate(rest[:-1]):
+            if m.get("role") != "user":
+                drop_at = i
+                break
+        dropped.append(rest[drop_at])
+        rest = rest[:drop_at] + rest[drop_at + 1 :]
+    out = ([system] if system else []) + guard + rest
     meta["final_tokens"] = messages_tokens(out)
     meta["hard_trimmed"] = True
+    meta["compressed"] = True
+    meta["dropped_messages"] = dropped
     return out, meta
 
 

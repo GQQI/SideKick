@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import re
 from typing import Any
 
 from .coherence import format_turn_policy_block, merge_policy_into_system, policy_for_turn
@@ -9,7 +10,11 @@ from .coherence import format_turn_policy_block, merge_policy_into_system, polic
 
 class AgentGroundingMixin:
     def _ingest_workspace_fact(self, name: str, args: dict[str, Any], content: str) -> None:
-        """Pin layout discoveries so the next user turn still respects them."""
+        """Pin layout discoveries so later turns don't invent paths.
+
+        Keep this small and static-ish (Claude/Cursor: system context is
+        project truth from disk, not a growing action diary).
+        """
         if self.is_subagent and not getattr(self, "full_agent", False):
             return
         key_tools = {
@@ -26,8 +31,8 @@ class AgentGroundingMixin:
                 return
         else:
             preview = content.strip().replace("\r\n", "\n")
-            if len(preview) > 600:
-                preview = preview[:600] + "…"
+            if len(preview) > 400:
+                preview = preview[:400] + "…"
             path_hint = str(args.get("path") or args.get("query") or args.get("symbol_or_path") or ".")
             note = f"{name}({path_hint}): {preview}"
 
@@ -53,8 +58,8 @@ class AgentGroundingMixin:
             from ..services import codebase_memory as cbm
 
             idx = cbm.get_or_build_index(ws)
-            paths = [fe.path for fe in idx.files[:60]]
-            lines.append(f"Indexed files ({len(idx.files)}):")
+            paths = [fe.path for fe in idx.files[:20]]
+            lines.append(f"Indexed files ({len(idx.files)}; use codebase_overview / search_text for the rest):")
             if paths:
                 lines.extend(f"- {p}" for p in paths)
             else:
@@ -105,7 +110,10 @@ class AgentGroundingMixin:
 
         block = "\n".join(lines)
         marker = "## Workspace ground truth (authoritative)"
+        wm_marker = "## Session working memory (do not forget)"
         content = str(self.messages[0].get("content") or "")
+        if wm_marker in content:
+            content = content.split(wm_marker, 1)[0].rstrip()
         if marker in content:
             content = content.split(marker, 1)[0].rstrip()
         old_cm = "## Codebase memory (structure projection)"
@@ -116,6 +124,21 @@ class AgentGroundingMixin:
                 content = (head.rstrip() + "\n\n## " + rest[1]).strip()
             else:
                 content = head.rstrip()
+        # Keep the early WORKSPACE: line in sync with the live pin. Otherwise a
+        # session created while the tenant default was folder A, then pinned to
+        # B, still tells the model "WORKSPACE: A" while ground truth says B —
+        # and the model invents a split between "cwd" and "workspace root".
+        ws_line = f"WORKSPACE: {ws}"
+        if re.search(r"(?m)^WORKSPACE:\s*.+$", content):
+            # Use a callable replacement — a plain string would interpret
+            # Windows path `\t` / `\n` sequences as regex backslash escapes.
+            content = re.sub(
+                r"(?m)^WORKSPACE:\s*.+$", lambda _m: ws_line, content, count=1
+            )
+        elif content.strip():
+            content = content.rstrip() + "\n\n" + ws_line
+        else:
+            content = ws_line
 
         self.messages[0]["content"] = (content.rstrip() + "\n\n" + block).strip()
 

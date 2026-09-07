@@ -1,5 +1,5 @@
 import { IconClock, IconMoon, IconPlus, IconSun } from "./icons";
-import { IconRobotCube } from "./IconRobotCube";
+import { BrandMark } from "./BrandMark";
 import type { MsgKey, Theme } from "../i18n";
 
 type Props = {
@@ -24,11 +24,11 @@ export function AppHeader({
       <div className="top-left">
         <div className="brand">
           <span className="brand-mark brand-mark-anim">
-            <IconRobotCube size={30} />
+            <BrandMark size={30} />
           </span>
           <div className="brand-text">
             <strong>Sidekick</strong>
-            <span>{t("tagline")}</span>
+            <span className="brand-sub">AI AGENT SYSTEM</span>
           </div>
         </div>
         {hasWorkspace && (

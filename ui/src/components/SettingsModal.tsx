@@ -1,11 +1,13 @@
 import { useEffect, useRef } from "react";
-import { ModelSettings } from "./ModelSettings";
 import { McpSettings } from "./McpSettings";
+import { SkillSettings } from "./SkillSettings";
+import { ModelSettings } from "./ModelSettings";
 import { IconMoon, IconSun } from "./icons";
 import type { LiveLine, SettingsTab, SubNode } from "../types/chat";
 import type { ModelSetup } from "../types/modelSetup";
-import type { WorkspaceItem } from "../api";
+import type { SessionItem, WorkspaceItem } from "../api";
 import type { Density, Locale, MsgKey, Theme } from "../i18n";
+import { IconCheck, IconChat, IconFolder, IconTrash } from "./icons";
 
 const APP_VERSION = "0.3.1";
 
@@ -25,6 +27,8 @@ export type SettingsModalProps = {
   wsBusy: boolean;
   onBrowseWorkspace: () => void;
   onSwitchWorkspace: (path: string) => void;
+  onForgetWorkspace?: (path: string) => void;
+  sessions?: SessionItem[];
   model: ModelSetup | null;
   modelSaving: boolean;
   onModelChange: (next: ModelSetup) => void;
@@ -34,6 +38,7 @@ export type SettingsModalProps = {
   accountUser?: { id: string; username: string; email?: string } | null;
   onLogout?: () => void;
   onToast?: (msg: string) => void;
+  onSkillsChanged?: () => void;
 };
 
 export function SettingsModal({
@@ -52,6 +57,8 @@ export function SettingsModal({
   wsBusy,
   onBrowseWorkspace,
   onSwitchWorkspace,
+  onForgetWorkspace,
+  sessions = [],
   model,
   modelSaving,
   onModelChange,
@@ -61,6 +68,7 @@ export function SettingsModal({
   accountUser,
   onLogout,
   onToast,
+  onSkillsChanged,
 }: SettingsModalProps) {
   const logEndRef = useRef<HTMLLIElement | null>(null);
 
@@ -69,11 +77,18 @@ export function SettingsModal({
     logEndRef.current?.scrollIntoView({ block: "nearest" });
   }, [settingsTab, live.length]);
 
+  const closeAndSave = () => {
+    // Model edits are deliberately staged in React state.  This is the only
+    // implicit commit point; role pickers no longer write on every click.
+    if (model) void onModelSave(model, { restartChat: false });
+    onClose();
+  };
+
   return (
     <div
       className="modal-backdrop"
       onClick={(e) => {
-        if (e.target === e.currentTarget) onClose();
+        if (e.target === e.currentTarget) closeAndSave();
       }}
     >
       <div className="modal settings-modal" role="dialog" aria-modal="true" aria-label={t("settings")}>
@@ -88,7 +103,7 @@ export function SettingsModal({
             >
               {theme === "dark" ? <IconSun /> : <IconMoon />}
             </button>
-            <button type="button" className="icon-btn" onClick={onClose}>
+            <button type="button" className="icon-btn" onClick={closeAndSave}>
               {t("close")}
             </button>
           </div>
@@ -98,6 +113,7 @@ export function SettingsModal({
             [
               ["workspace", t("tabWorkspace")],
               ["model", t("tabModel")],
+              ["skills", t("tabSkills")],
               ["mcp", "MCP"],
               ["appearance", t("tabAppearance")],
               ["runtime", t("tabRuntime")],
@@ -116,39 +132,80 @@ export function SettingsModal({
         </div>
         <div className="modal-body">
           {settingsTab === "workspace" && (
-            <div className="settings-pane">
+            <div className="settings-pane ws-settings-pane">
               <h3>{t("workspaceTitle")}</h3>
-              <p className="hint path-line">{activeWs?.path || t("workspaceNone")}</p>
-              <div className="ws-actions">
-                <button
-                  type="button"
-                  className="primary"
-                  disabled={wsBusy}
-                  onClick={() => void onBrowseWorkspace()}
-                >
-                  {wsBusy ? t("browsing") : t("openFolder")}
-                </button>
+              <div className="ws-current-card">
+                <span className="ws-current-icon">
+                  <IconFolder size={18} />
+                </span>
+                <div className="ws-current-info">
+                  <strong>{activeWs?.name || t("workspaceNone")}</strong>
+                  <span title={activeWs?.path || ""}>{activeWs?.path || t("workspaceNone")}</span>
+                </div>
+                <em className="ws-default-badge">{t("wsIsDefault")}</em>
               </div>
+              <button
+                type="button"
+                className="primary ws-browse-btn"
+                disabled={wsBusy}
+                onClick={() => void onBrowseWorkspace()}
+              >
+                <IconFolder size={14} />
+                {wsBusy ? t("browsing") : t("openFolder")}
+              </button>
+
               {workspaces.length > 0 && (
                 <>
                   <h3 className="settings-subhead">{t("recentFolders")}</h3>
-                  <ul className="item-list">
-                    {workspaces.map((w) => (
-                      <li key={w.path}>
-                        <div>
-                          <strong>{w.name}</strong>
-                          <span>{w.path}</span>
-                        </div>
-                        <button
-                          type="button"
-                          className="mini"
-                          disabled={activeWs?.path === w.path || wsBusy}
-                          onClick={() => void onSwitchWorkspace(w.path)}
-                        >
-                          {activeWs?.path === w.path ? t("inUse") : t("switch")}
-                        </button>
-                      </li>
-                    ))}
+                  <ul className="ws-open-list">
+                    {workspaces.map((w) => {
+                      const isDefault = activeWs?.path === w.path;
+                      const runningCount = sessions.filter(
+                        (s) => s.workspace === w.path && s.busy,
+                      ).length;
+                      return (
+                        <li key={w.path} className="ws-row">
+                          <span className="ws-row-icon">
+                            <IconFolder size={14} />
+                          </span>
+                          <div className="ws-row-info">
+                            <strong>
+                              {w.name}
+                              {isDefault && <em className="ws-default-badge">{t("wsIsDefault")}</em>}
+                              {runningCount > 0 && (
+                                <em className="ws-running-badge">
+                                  <IconChat size={10} />
+                                  {t("wsRunningCount", String(runningCount))}
+                                </em>
+                              )}
+                            </strong>
+                            <span title={w.path}>{w.path}</span>
+                          </div>
+                          <div className="ws-row-actions">
+                            <button
+                              type="button"
+                              className="icon-btn"
+                              title={isDefault ? t("wsIsDefault") : t("wsSetDefault")}
+                              disabled={isDefault || wsBusy}
+                              onClick={() => void onSwitchWorkspace(w.path)}
+                            >
+                              <IconCheck size={14} />
+                            </button>
+                            {onForgetWorkspace && (
+                              <button
+                                type="button"
+                                className="icon-btn danger"
+                                title={t("wsRemove")}
+                                disabled={wsBusy}
+                                onClick={() => onForgetWorkspace(w.path)}
+                              >
+                                <IconTrash size={14} />
+                              </button>
+                            )}
+                          </div>
+                        </li>
+                      );
+                    })}
                   </ul>
                 </>
               )}
@@ -164,6 +221,10 @@ export function SettingsModal({
               onSave={(next, opts) => void onModelSave(next, opts)}
               t={t}
             />
+          )}
+
+          {settingsTab === "skills" && (
+            <SkillSettings t={t} onToast={onToast} onChanged={onSkillsChanged} />
           )}
 
           {settingsTab === "mcp" && <McpSettings onToast={onToast} />}

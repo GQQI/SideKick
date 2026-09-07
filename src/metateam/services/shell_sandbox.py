@@ -1,7 +1,9 @@
-"""Claude Code–style shell sandbox: real disk, path allowlist (not a copy FS).
+"""Shell sandbox: real disk, cwd stays in the workspace (not a copy FS).
 
-Bash/cmd still runs with cwd=workspace on the host. We only restrict which
-paths the command may touch (heuristic scan + cwd fence) and scrub the env.
+Commands still run with cwd=workspace on the host. Paths outside the
+workspace are not hard-blocked — they go through the approval dialog.
+Only empty commands and a cwd that already left the workspace are rejected
+here. Destructive denylist lives in the shell tool, not this scanner.
 """
 
 from __future__ import annotations
@@ -156,13 +158,61 @@ def _extract_path_candidates(command: str) -> list[str]:
     return found
 
 
+def _token_leaves_sandbox(
+    token: str,
+    *,
+    cwd: Path,
+    policy: ShellSandboxPolicy,
+) -> bool:
+    """True if this path token resolves outside the workspace/temp roots."""
+    expanded = token
+    if expanded.startswith("~/") or expanded.startswith("~\\"):
+        expanded = str(Path.home() / expanded[2:])
+    p = Path(expanded)
+    cwd_r = _norm(cwd)
+    if not p.is_absolute():
+        if not _DOTDOT_RE.search(token.replace("/", os.sep)):
+            return False
+        try:
+            resolved = (cwd_r / p).resolve()
+        except OSError:
+            return True
+        return not path_allowed(resolved, policy) and not _is_allowed_browser_exe(resolved)
+    return not path_allowed(p, policy) and not _is_allowed_browser_exe(p)
+
+
+def outside_shell_paths(
+    command: str,
+    *,
+    cwd: Path,
+    policy: ShellSandboxPolicy,
+) -> list[str]:
+    """Path tokens (or `cd ..`) that leave the workspace. Empty if none."""
+    if not policy.enabled:
+        return []
+    cmd = (command or "").strip()
+    if not cmd:
+        return []
+    found: list[str] = []
+    if re.search(r"(?:^|[;&|]\s*)cd\s+\.\.(?:\s|$|[;&|])", cmd, re.IGNORECASE):
+        found.append("cd ..")
+    for token in _extract_path_candidates(cmd):
+        if _token_leaves_sandbox(token, cwd=cwd, policy=policy):
+            found.append(token)
+    return found
+
+
 def check_command(
     command: str,
     *,
     cwd: Path,
     policy: ShellSandboxPolicy,
 ) -> Optional[str]:
-    """Return an error string if the command violates the sandbox; else None."""
+    """Hard-block only empty commands and a cwd that already left the workspace.
+
+    Outside-workspace *paths inside the command* are not rejected here — the
+    approval gate asks the user instead.
+    """
     if not policy.enabled:
         return None
     cmd = (command or "").strip()
@@ -172,28 +222,6 @@ def check_command(
     cwd_r = _norm(cwd)
     if not path_allowed(cwd_r, policy):
         return f"ERROR: shell cwd outside sandbox: {cwd_r}"
-
-    # Bare `cd ..` / `cd ../..` style escapes (common in agent output).
-    if re.search(r"(?:^|[;&|]\s*)cd\s+\.\.(?:\s|$|[;&|])", cmd, re.IGNORECASE):
-        return "ERROR: shell sandbox blocked path escape (cd ..)"
-
-    for token in _extract_path_candidates(cmd):
-        expanded = token
-        if expanded.startswith("~/") or expanded.startswith("~\\"):
-            expanded = str(Path.home() / expanded[2:])
-        p = Path(expanded)
-        if not p.is_absolute():
-            # Relative with .. that would leave cwd
-            if _DOTDOT_RE.search(token.replace("/", os.sep)):
-                try:
-                    resolved = (cwd_r / p).resolve()
-                except OSError:
-                    return f"ERROR: shell sandbox blocked path: {token}"
-                if not path_allowed(resolved, policy) and not _is_allowed_browser_exe(resolved):
-                    return f"ERROR: shell sandbox blocked path outside allowlist: {token}"
-            continue
-        if not path_allowed(p, policy) and not _is_allowed_browser_exe(p):
-            return f"ERROR: shell sandbox blocked path outside allowlist: {token}"
 
     return None
 
@@ -224,4 +252,4 @@ def describe_policy(policy: ShellSandboxPolicy) -> str:
     if not policy.enabled:
         return "shell sandbox: off"
     roots = ", ".join(str(r) for r in policy.roots)
-    return f"shell sandbox: on · allowlist=[{roots}]"
+    return f"shell sandbox: on · workspace=[{roots}]（区外路径需确认）"

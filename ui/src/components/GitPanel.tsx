@@ -19,6 +19,8 @@ import { IconCheck, IconChevronDown, IconGit, IconRefresh } from "./icons";
 type Props = {
   refreshKey?: number;
   onChanged?: () => void;
+  /** Absolute path of the workspace to show — defaults to the tenant workspace. */
+  workspace?: string | null;
 };
 
 type DetailPart = { key: MsgKey; args?: string[] } | { text: string };
@@ -126,8 +128,9 @@ function suggestedStep(snap: GitSnapshot): 1 | 2 | 3 {
   return 1;
 }
 
-export function GitPanel({ refreshKey = 0, onChanged }: Props) {
+export function GitPanel({ refreshKey = 0, onChanged, workspace }: Props) {
   const { t } = usePrefs();
+  const ws = workspace || undefined;
   const [snap, setSnap] = useState<GitSnapshot | null>(null);
   const [loading, setLoading] = useState(false);
   const [message, setMessage] = useState("");
@@ -143,7 +146,7 @@ export function GitPanel({ refreshKey = 0, onChanged }: Props) {
   const load = useCallback(async () => {
     setLoading(true);
     try {
-      const next = await fetchGit();
+      const next = await fetchGit(ws);
       setSnap(next);
       if (next.remote_url) setRemoteUrl(next.remote_url);
       setStep(suggestedStep(next));
@@ -156,11 +159,17 @@ export function GitPanel({ refreshKey = 0, onChanged }: Props) {
     } finally {
       setLoading(false);
     }
-  }, [t]);
+  }, [ws]);
 
   useEffect(() => {
     void load();
   }, [load, refreshKey]);
+
+  useEffect(() => {
+    setSnap(null);
+    setSelected(new Set());
+    setNotice(null);
+  }, [ws]);
 
   const files = snap?.files || [];
   const groups = useMemo(() => groupFiles(files), [files]);
@@ -366,7 +375,7 @@ export function GitPanel({ refreshKey = 0, onChanged }: Props) {
       setNotice({ kind: "warn", titleKey: "gitStep1NeedSelect" });
       return;
     }
-    void run(() => gitStage(paths), selectedUnstaged.length ? "stage" : "stageAll");
+    void run(() => gitStage(paths, ws), selectedUnstaged.length ? "stage" : "stageAll");
   }
 
   const steps: Array<{ n: 1 | 2 | 3; title: MsgKey; locked: boolean }> = [
@@ -414,7 +423,7 @@ export function GitPanel({ refreshKey = 0, onChanged }: Props) {
                 type="button"
                 className="text-btn"
                 disabled={!remoteUrl.trim() || busyNow || remoteUrl.trim() === (snap.remote_url || "")}
-                onClick={() => void run(() => gitSetRemote(remoteUrl.trim()), "remote")}
+                onClick={() => void run(() => gitSetRemote(remoteUrl.trim(), "origin", ws), "remote")}
               >
                 {snap.remote_url ? t("gitRemoteSave") : t("gitRemoteLink")}
               </button>
@@ -570,7 +579,7 @@ export function GitPanel({ refreshKey = 0, onChanged }: Props) {
                     const msg = message.trim();
                     if (!msg || !hasStaged) return;
                     void run(async () => {
-                      const next = await gitCommit(msg);
+                      const next = await gitCommit(msg, ws);
                       setMessage("");
                       setSelected(new Set());
                       return next;
@@ -627,7 +636,7 @@ export function GitPanel({ refreshKey = 0, onChanged }: Props) {
                     type="button"
                     className="approval-btn allow"
                     disabled={busyNow || unpublished <= 0 || !remoteUrl.trim()}
-                    onClick={() => void run(gitPush, "push")}
+                    onClick={() => void run(() => gitPush(ws), "push")}
                   >
                     {t("gitStep3Next")}
                   </button>
@@ -638,10 +647,10 @@ export function GitPanel({ refreshKey = 0, onChanged }: Props) {
             <details className="git-more" open={moreOpen} onToggle={(e) => setMoreOpen(e.currentTarget.open)}>
               <summary>{t("gitMore")}</summary>
               <div className="git-sync-row">
-                <button type="button" className="text-btn" disabled={busyNow} onClick={() => void run(gitPull, "pull")}>
+                <button type="button" className="text-btn" disabled={busyNow} onClick={() => void run(() => gitPull(ws), "pull")}>
                   {t("gitDownload")}
                 </button>
-                <button type="button" className="text-btn" disabled={busyNow} onClick={() => void run(gitFetch, "fetch")}>
+                <button type="button" className="text-btn" disabled={busyNow} onClick={() => void run(() => gitFetch(ws), "fetch")}>
                   {t("gitFetch")}
                 </button>
               </div>
@@ -654,7 +663,7 @@ export function GitPanel({ refreshKey = 0, onChanged }: Props) {
                   onChange={(e) => {
                     const next = e.target.value;
                     if (!next || next === snap.branch) return;
-                    void run(() => gitCheckout(next), "checkout");
+                    void run(() => gitCheckout(next, false, ws), "checkout");
                   }}
                 >
                   {(snap.branches || []).some((b) => b.name === (snap.branch || "")) ? null : (
@@ -676,7 +685,7 @@ export function GitPanel({ refreshKey = 0, onChanged }: Props) {
                   const name = newBranch.trim();
                   if (!name) return;
                   void run(async () => {
-                    const next = await gitCheckout(name, true);
+                    const next = await gitCheckout(name, true, ws);
                     setNewBranch("");
                     return next;
                   }, "branch");
@@ -697,7 +706,7 @@ export function GitPanel({ refreshKey = 0, onChanged }: Props) {
                   type="button"
                   className="text-btn"
                   disabled={!selectedStaged.length || busyNow}
-                  onClick={() => void run(() => gitUnstage(selectedStaged), "unstage")}
+                  onClick={() => void run(() => gitUnstage(selectedStaged, ws), "unstage")}
                 >
                   {t("gitUnstageSelected")}
                 </button>

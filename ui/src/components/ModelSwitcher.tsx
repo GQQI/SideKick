@@ -1,6 +1,6 @@
 import { useEffect, useRef, useState } from "react";
 import type { ModelSetup, ModelRole } from "../types/modelSetup";
-import { allModelOptions, modelLabel, refKey } from "../types/modelSetup";
+import { allModelOptions, modelLabel, refKey, autoRef, isAutoRef } from "../types/modelSetup";
 import type { MsgKey } from "../i18n";
 
 type Props = {
@@ -37,9 +37,12 @@ export function ModelSwitcher({
   }, [open]);
 
   const currentRef = role === "main" ? setup?.main : setup?.subagent;
+  const auto = isAutoRef(currentRef);
   const label = setup?.demo_mode
     ? "Demo"
-    : modelLabel(setup, currentRef) || t("modelSwitch");
+    : auto
+      ? `✨ ${t("modelAutoBadge")}`
+      : modelLabel(setup, currentRef) || t("modelSwitch");
 
   const options = allModelOptions(setup, { requireKey: true });
   const ready = options.filter((o) => !o.disabled);
@@ -50,6 +53,7 @@ export function ModelSwitcher({
   }, {});
 
   const activeKey = currentRef ? refKey(currentRef) : "";
+  const autoKey = refKey(autoRef());
 
   return (
     <div className="model-switcher" ref={rootRef}>
@@ -85,6 +89,23 @@ export function ModelSwitcher({
             </button>
           </div>
           <div className="model-switcher-scroll">
+            {ready.length > 0 ? (
+              <div className="model-switcher-group">
+                <button
+                  type="button"
+                  role="menuitem"
+                  className={`model-switcher-item model-switcher-auto${activeKey === autoKey ? " active" : ""}`}
+                  disabled={saving}
+                  onClick={() => {
+                    onSelect(role, autoRef().provider_id, autoRef().model_id);
+                    setOpen(false);
+                  }}
+                >
+                  <span>✨ {t("modelAutoOption")}</span>
+                  {activeKey === autoKey ? <em>✓</em> : null}
+                </button>
+              </div>
+            ) : null}
             {Object.keys(groupedReady).length === 0 ? (
               <p className="hint model-switcher-empty">
                 {locale === "en" ? "Configure API keys in settings first." : "请先在设置中配置 API Key。"}

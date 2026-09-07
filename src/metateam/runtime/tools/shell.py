@@ -7,7 +7,6 @@ import subprocess
 
 from ..shell_policy import (
     has_noninteractive_flags as _has_noninteractive_flags,
-    is_dangerous_shell as _is_dangerous_shell,
     is_long_running_command as _is_long_running_command,
     looks_interactive_scaffold as _looks_interactive_scaffold,
     strip_output_tail_filter as _strip_output_tail_filter,
@@ -16,7 +15,6 @@ from ..tool_registry import Tool, ToolRegistry
 from .context import ToolContext
 from .support import (
     _guard_shell,
-    _run_shell_background,
     _sandboxed_env,
     _shell_argv,
     _shell_host_label,
@@ -38,8 +36,6 @@ def register_shell_tools(reg: ToolRegistry, ctx: ToolContext) -> None:
         cmd = (command or "").strip()
         if not cmd:
             return "ERROR: empty command"
-        if _is_dangerous_shell(cmd):
-            return "ERROR: command blocked by safety denylist"
         blocked = _guard_shell(cmd, settings=settings, workspace=live_ws())
         if blocked:
             return blocked
@@ -76,13 +72,6 @@ def register_shell_tools(reg: ToolRegistry, ctx: ToolContext) -> None:
             return "ERROR: shell disabled (set META_ALLOW_SHELL=1 to enable)"
         command, _stripped_tail = _strip_output_tail_filter(command)
         low = command.lower().strip()
-        if _is_dangerous_shell(command):
-            return (
-                "ERROR: blocked dangerous command "
-                "(recursive delete of a drive or home root is not allowed). "
-                "To delete a project folder, use a relative path such as "
-                "Remove-Item -Path .\\login-page -Recurse -Force"
-            )
         blocked = _guard_shell(command, settings=settings, workspace=live_ws())
         if blocked:
             return blocked
@@ -101,55 +90,46 @@ def register_shell_tools(reg: ToolRegistry, ctx: ToolContext) -> None:
                 "Optional: pass stdin_text with newline-separated answers for simple prompts."
             )
 
-        env = _sandboxed_env(settings)
-        # Dev servers / watchers never exit — must not block the agent.
-        long_running = background or _is_long_running_command(low)
-        if long_running:
-            return _run_shell_background(
-                command, cwd=str(live_ws().resolve()), collect_secs=8.0, env=env
-            )
+        from ...services.shell_jobs import JOBS, format_job_result
 
-        # Optional per-call timeout (models often pass this; default = settings.shell_timeout).
+        env = _sandboxed_env(settings)
+        cwd = str(live_ws().resolve())
+        long_running = bool(background) or _is_long_running_command(low)
         try:
             want = int(timeout_sec or 0)
         except (TypeError, ValueError):
             want = 0
         timeout = max(15, min(want, 600)) if want > 0 else int(settings.shell_timeout)
 
-        input_data = stdin_text if stdin_text else None
-        try:
-            proc = subprocess.run(
-                _shell_argv(command),
-                cwd=str(live_ws().resolve()),
-                capture_output=True,
-                input=input_data,
-                **_subprocess_text_kwargs(),
-                timeout=timeout,
-                env=env,
-            )
-        except subprocess.TimeoutExpired as exc:
-            partial = (exc.stdout or "") + (("\n" + (exc.stderr or "")) if exc.stderr else "")
-            partial = partial[-8000:]
-            hint = ""
-            if _looks_interactive_scaffold(low) or "select" in partial.lower() or "?" in partial:
-                hint = (
-                    "\nHint: if the CLI is waiting for interactive choices, stop and re-run "
-                    "with non-interactive flags (e.g. `npm create vue@latest app -- --default`) "
-                    "or ask_user then pass flags / stdin_text."
+        job = JOBS.start(command, cwd=cwd, env=env, stdin_text=stdin_text or "")
+        if long_running:
+            JOBS.wait(job.id, 8.0)
+            if job.alive():
+                JOBS.mark_released(job)
+                return format_job_result(
+                    job,
+                    background=True,
+                    note="Started in background (server/watch/script). Poll with shell_job_log.",
                 )
-            return (
-                f"ERROR: timeout after {timeout}s — command still running or hung.\n"
-                f"For servers (npm run dev / vite / uvicorn), call run_shell with background=true.\n"
-                f"partial_output:\n{partial or '(none)'}"
-                f"{hint}"
+            return format_job_result(job, background=False, note="Finished during startup window.")
+
+        JOBS.wait(job.id, timeout)
+        if job.alive():
+            JOBS.mark_released(job)
+            return format_job_result(
+                job,
+                background=True,
+                note=(
+                    f"Still running after {timeout}s — moved to background instead of killing it. "
+                    "Use shell_job_wait / shell_job_log / shell_job_stop with this job_id. "
+                    "Do not re-run the same command."
+                ),
             )
-        except UnicodeDecodeError as exc:
-            # Should be unreachable with errors=replace; keep a clear fallback.
-            return f"ERROR: shell output decode failed ({exc}); retry with ASCII-only commands"
-        out = (proc.stdout or "") + (("\n" + proc.stderr) if proc.stderr else "")
+        log, _n = job.log_text(tail=200)
+        out = (log or "").strip()
         if len(out) > 14_000:
             out = out[:14_000] + "\n…[truncated]"
-        return f"exit={proc.returncode}\n{out}"
+        return f"job_id={job.id} status=exited exit={job.exit_code}\n{out}"
 
     reg.register(
         Tool(
@@ -175,9 +155,11 @@ def register_shell_tools(reg: ToolRegistry, ctx: ToolContext) -> None:
         _shell_desc = (
             "Run a shell command in the workspace. Prefer read_file for reading files. "
             f"Host shell: {_shell_host_label()}. "
-            "IMPORTANT: long-running servers (npm run dev, vite, uvicorn --reload, etc.) "
-            "are auto-started in background and return early with pid + startup logs — "
-            "do NOT wait for them to exit. Set background=true to force background mode. "
+            "IMPORTANT: long scripts, training jobs, and servers should use background=true "
+            "(or they are auto-moved to background if they exceed timeout). "
+            "The tool returns job_id + early logs; the process keeps running. "
+            "Then use shell_job_log / shell_job_wait / shell_job_stop. "
+            "Do NOT call run_shell again with the same command while that job is running. "
             "Scaffold CLIs (create-vue / create-vite / create-next-app) have NO TTY — "
             "always use non-interactive flags, e.g. "
             "`npm create vue@latest my-app -- --default` or "
@@ -228,5 +210,107 @@ def register_shell_tools(reg: ToolRegistry, ctx: ToolContext) -> None:
                 run_shell,
                 parallel_safe=False,
                 requires_approval=True,
+            )
+        )
+
+        def shell_job_list(include_done: bool = True) -> str:
+            from ...services.shell_jobs import JOBS
+
+            jobs = JOBS.list(include_done=bool(include_done))
+            if not jobs:
+                return "no shell jobs"
+            lines = [f"{len(jobs)} job(s):"]
+            for j in jobs:
+                snap = j.snapshot(tail=0)
+                lines.append(
+                    f"- {snap['job_id']} pid={snap['pid']} {snap['status']} "
+                    f"{snap['elapsed_sec']}s {j.command!r}"
+                )
+            return "\n".join(lines)
+
+        def shell_job_log(job_id: str = "", tail: int = 80) -> str:
+            from ...services.shell_jobs import JOBS, format_job_result
+
+            job = JOBS.get(job_id)
+            if not job:
+                return f"ERROR: unknown job_id={job_id!r}. Call shell_job_list."
+            return format_job_result(job, background=job.alive(), tail=max(10, min(int(tail or 80), 400)))
+
+        def shell_job_wait(job_id: str = "", timeout_sec: int = 60) -> str:
+            from ...services.shell_jobs import JOBS, format_job_result
+
+            job = JOBS.wait(job_id, max(1, min(int(timeout_sec or 60), 600)))
+            if not job:
+                return f"ERROR: unknown job_id={job_id!r}. Call shell_job_list."
+            note = "still running" if job.alive() else "finished"
+            return format_job_result(job, background=job.alive(), note=note)
+
+        def shell_job_stop(job_id: str = "") -> str:
+            from ...services.shell_jobs import JOBS, format_job_result
+
+            job = JOBS.stop(job_id)
+            if not job:
+                return f"ERROR: unknown job_id={job_id!r}. Call shell_job_list."
+            return format_job_result(job, background=False, note="stop requested")
+
+        reg.register(
+            Tool(
+                "shell_job_list",
+                "List background shell jobs started by run_shell (training, servers, long scripts).",
+                {
+                    "type": "object",
+                    "properties": {
+                        "include_done": {"type": "boolean", "default": True},
+                    },
+                    "required": [],
+                },
+                shell_job_list,
+                parallel_safe=True,
+            )
+        )
+        reg.register(
+            Tool(
+                "shell_job_log",
+                "Read recent logs from a background shell job. Pass job_id from run_shell.",
+                {
+                    "type": "object",
+                    "properties": {
+                        "job_id": {"type": "string"},
+                        "tail": {"type": "integer", "default": 80},
+                    },
+                    "required": ["job_id"],
+                },
+                shell_job_log,
+                parallel_safe=True,
+            )
+        )
+        reg.register(
+            Tool(
+                "shell_job_wait",
+                "Wait up to timeout_sec for a background shell job to exit, then return logs. "
+                "Does not kill the job if it is still running.",
+                {
+                    "type": "object",
+                    "properties": {
+                        "job_id": {"type": "string"},
+                        "timeout_sec": {"type": "integer", "default": 60},
+                    },
+                    "required": ["job_id"],
+                },
+                shell_job_wait,
+                parallel_safe=False,
+            )
+        )
+        reg.register(
+            Tool(
+                "shell_job_stop",
+                "Stop a background shell job (taskkill / SIGTERM).",
+                {
+                    "type": "object",
+                    "properties": {"job_id": {"type": "string"}},
+                    "required": ["job_id"],
+                },
+                shell_job_stop,
+                parallel_safe=False,
             )
         )

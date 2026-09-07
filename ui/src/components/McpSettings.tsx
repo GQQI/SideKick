@@ -164,10 +164,6 @@ export function McpSettings({ onToast }: Props) {
     <div className="mcp-settings settings-pane">
       <header className="settings-pane-intro">
         <h3>MCP</h3>
-        <p className="hint">
-          本地用 <code>command + args</code>，远程用 <code>url</code>（HTTP 或 SSE）。
-          工具名形如 <code>mcp_名称_工具</code>，调用需审批。
-        </p>
       </header>
 
       <div className="mcp-list">

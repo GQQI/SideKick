@@ -91,10 +91,14 @@ export type ChatMsg = {
   agent_id?: string;
   /** Uploaded files shown as chips in the bubble (not the full model payload). */
   attachments?: MsgAttachment[];
+  /** When this message was recorded, in epoch milliseconds. */
+  ts?: number;
+  /** Background shell job completion card. */
+  jobNotice?: { job_id: string; status: string; exit_code?: number | null };
 };
 
 export type LiveLine = { id: string; text: string; kind: string };
-export type SettingsTab = "workspace" | "model" | "mcp" | "runtime" | "appearance" | "account";
+export type SettingsTab = "workspace" | "model" | "mcp" | "skills" | "runtime" | "appearance" | "account";
 
 export type QueuedMsg = {
   id: string;
@@ -127,6 +131,8 @@ export type DetailView =
       editable?: boolean;
       message?: string;
       rawUrl?: string;
+      /** Which open workspace this file belongs to (undefined = default workspace). */
+      workspace?: string;
       highlightQuery?: string;
       focusLine?: number;
       forceEdit?: boolean;

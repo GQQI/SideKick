@@ -4,7 +4,7 @@ import threading
 import time
 
 from metateam.core.config import Settings
-from metateam.runtime.llm import LLM, StreamWatchdog, _stream_timeouts
+from metateam.runtime.llm import LLM, StreamWatchdog, _stream_timeouts, streaming_text_looped
 
 
 def test_stream_timeouts_from_settings() -> None:
@@ -57,3 +57,10 @@ def test_stream_chat_idle_stall_unblocks() -> None:
     assert elapsed < 6
     assert "stalled" in kinds
     assert kinds[-1] == "done"
+
+
+def test_streaming_text_looped_detects_repeats() -> None:
+    assert not streaming_text_looped("short")
+    chunk = "正在打开清华大学官网并阅读首页内容。"
+    assert streaming_text_looped((chunk + "\n") * 24)
+    assert not streaming_text_looped("第一段。\n第二段。\n第三段，内容不同。")

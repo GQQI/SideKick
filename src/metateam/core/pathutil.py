@@ -5,7 +5,42 @@ from __future__ import annotations
 import os
 import re
 from pathlib import Path
-from urllib.parse import unquote, urlparse
+from urllib.parse import unquote
+
+
+_XML_ENTITIES = (
+    ("&amp;", "&"),
+    ("&lt;", "<"),
+    ("&gt;", ">"),
+    ("&quot;", '"'),
+    ("&#39;", "'"),
+)
+
+
+def clean_tool_path_text(raw: str | Path) -> str:
+    """Strip wrapper punctuation / entities without inventing a different name."""
+    text = str(raw or "").strip()
+    if len(text) >= 2 and text[0] == text[-1] and text[0] in {"`", "'", '"'}:
+        text = text[1:-1].strip()
+    if text.startswith("<") and text.endswith(">") and "/" not in text[1:-1]:
+        text = text[1:-1].strip()
+    for src, dst in _XML_ENTITIES:
+        text = text.replace(src, dst)
+    return text.strip()
+
+
+def _try_unquote(text: str) -> str:
+    if "%" not in text:
+        return text
+    decoded = unquote(text)
+    return decoded if decoded else text
+
+
+def _join_workspace(workspace: Path, unified: str) -> Path:
+    parts = [p for p in unified.replace("\\", "/").split("/") if p and p != "."]
+    if not parts:
+        return resolve_path(workspace)
+    return resolve_path(workspace.joinpath(*parts))
 
 
 _WIN_DRIVE = re.compile(r"^([A-Za-z]):(?:/(.*))?$")
@@ -27,13 +62,17 @@ def _windows_drive_ready(letter: str) -> bool:
 
 
 def _strip_file_uri(text: str) -> str:
+    """Keep '#', '?' and encoded characters as part of the filename."""
     if not text.lower().startswith("file:"):
         return text
-    parsed = urlparse(text)
-    path = unquote(parsed.path or "")
-    if os.name == "nt" and re.match(r"^/[A-Za-z]:", path):
-        path = path[1:]
-    return path or text
+    rest = text[5:]
+    if rest.startswith("//"):
+        rest = rest[2:]
+    rest = unquote(rest)
+    unified = rest.replace("\\", "/")
+    if os.name == "nt" and re.match(r"^/[A-Za-z]:", unified):
+        rest = rest[1:]
+    return rest or text
 
 
 def _remap_into_workspace(rel: str, workspace: Path) -> Path:
@@ -56,13 +95,15 @@ def _remap_into_workspace(rel: str, workspace: Path) -> Path:
 def normalize_user_path(raw: str | Path, workspace: Path) -> Path:
     """Resolve a tool/user path onto THIS host.
 
-    Relative → workspace. Real local absolute → kept. Windows drive letters
-    that do not exist here (or that appear on Linux/麒麟) are remapped into
-    the workspace so write_file does not fail on another machine.
+    Relative → workspace. Real local absolute → kept (even if the file or
+    parent does not exist yet — approval covers writes outside the workspace).
+    Windows drive letters that do not exist here (or that appear on
+    Linux/麒麟) are remapped into the workspace so leftover paths from
+    another machine still resolve.
     """
-    text = str(raw or ".").strip().strip('"').strip("'") or "."
+    text = clean_tool_path_text(raw)
     text = _strip_file_uri(text)
-    text = text.strip() or "."
+    text = clean_tool_path_text(text) or "."
     unified = text.replace("\\", "/")
     ws = resolve_path(workspace)
 
@@ -75,16 +116,7 @@ def normalize_user_path(raw: str | Path, workspace: Path) -> Path:
         rest = (drive_m.group(2) or "").lstrip("/")
         if os.name == "nt" and _windows_drive_ready(letter):
             abs_s = f"{letter}:/{rest}" if rest else f"{letter}:/"
-            resolved = resolve_path(Path(abs_s))
-            if is_relative_to(resolved, ws):
-                return resolved
-            # Keep a real path on this PC; remap leftover paths from another machine.
-            try:
-                if resolved.exists() or resolved.parent.exists():
-                    return resolved
-            except OSError:
-                pass
-            return _remap_into_workspace(rest, ws)
+            return resolve_path(Path(abs_s))
         return _remap_into_workspace(rest, ws)
 
     if unified.startswith("//"):
@@ -108,7 +140,71 @@ def normalize_user_path(raw: str | Path, workspace: Path) -> Path:
     p = Path(text).expanduser()
     if p.is_absolute():
         return resolve_path(p)
-    return resolve_path(ws / Path(*[x for x in unified.split("/") if x and x != "."]))
+    return _join_workspace(ws, unified)
+
+
+def _exists(path: Path) -> bool:
+    try:
+        return path.exists()
+    except OSError:
+        return False
+
+
+def _case_match(parent: Path, name: str) -> Path | None:
+    try:
+        if not parent.is_dir():
+            return None
+        wanted = name.lower()
+        hits = [child for child in parent.iterdir() if child.name.lower() == wanted]
+    except OSError:
+        return None
+    if len(hits) == 1:
+        return hits[0]
+    return None
+
+
+def resolve_existing_tool_path(raw: str | Path, workspace: Path) -> Path:
+    """Resolve a tool path, preferring a real file without inventing another name."""
+    primary = normalize_user_path(raw, workspace)
+    if _exists(primary):
+        return primary
+    text = clean_tool_path_text(raw)
+    decoded = _try_unquote(text)
+    if decoded != text:
+        alt = normalize_user_path(decoded, workspace)
+        if _exists(alt):
+            return alt
+    hit = _case_match(primary.parent, primary.name)
+    if hit is not None:
+        return hit
+    return primary
+
+
+def nearby_file_names(path: Path, *, limit: int = 8) -> list[str]:
+    parent = path.parent
+    try:
+        if not parent.is_dir():
+            return []
+        names = sorted(
+            (child.name for child in parent.iterdir() if child.is_file()),
+            key=lambda n: n.lower(),
+        )
+    except OSError:
+        return []
+    stem = path.stem.lower()
+    ranked = [n for n in names if Path(n).stem.lower() == stem] + [
+        n for n in names if stem and stem in n.lower()
+    ]
+    seen: set[str] = set()
+    out: list[str] = []
+    for name in ranked + names:
+        if name in seen:
+            continue
+        seen.add(name)
+        out.append(name)
+        if len(out) >= limit:
+            break
+    return out
 
 
 def is_relative_to(child: Path | str, root: Path | str) -> bool:

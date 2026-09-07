@@ -3,7 +3,7 @@ setlocal EnableExtensions EnableDelayedExpansion
 cd /d "%~dp0"
 
 echo.
-echo  Sidekick Desktop - live embedded browser
+echo  Sidekick Desktop
 echo  ----------------------------------------------------
 echo.
 

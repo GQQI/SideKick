@@ -6,6 +6,7 @@ import re
 import threading
 import time
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Any, Optional
 
 from ..runtime.agent import Agent
@@ -27,6 +28,7 @@ class ChatSession:
     busy: bool = False
     stop_requested: bool = False
     agent_tree: list[Any] = field(default_factory=list)
+    pending_job_notices: list[dict[str, Any]] = field(default_factory=list)
 
 
 _UNTITLED_TITLES = frozenset({"新会话", "New chat", "Untitled", ""})
@@ -48,6 +50,17 @@ def _is_internal_message(m: dict[str, Any]) -> bool:
         return True
     content = str(m.get("content") or "").lstrip()
     return content.startswith("[Plan step ") or content.startswith("[sidekick:")
+
+
+def _full_transcript(agent: Any) -> list[dict[str, Any]]:
+    """Complete history for an agent, falling back to `.messages` for test doubles."""
+    fn = getattr(agent, "full_transcript", None)
+    if callable(fn):
+        try:
+            return fn()
+        except Exception:
+            pass
+    return list(getattr(agent, "messages", None) or [])
 
 
 def _user_turn_count(messages: list[dict[str, Any]]) -> int:
@@ -209,7 +222,6 @@ class SessionStore:
         is True, so saving a model does not yank another chat onto a new folder.
         """
         self.settings = reload_settings() if rebind_llm else get_settings()
-        from ..runtime.llm import LLM
         from ..services.skills import load_skills
         from .model_config import apply_to_settings, load_model_config
         from .tenant_context import apply_knowledge_to_settings, get_user_id
@@ -247,34 +259,34 @@ class SessionStore:
                 llm_demo = bool(llm is not None and getattr(llm, "demo", False))
                 if not rebind_llm and not (keyed and llm_demo):
                     continue
-                sess.agent.llm = LLM(
-                    sess.agent.settings,
-                    max_tokens=getattr(sess.agent.settings, "max_tokens", 0) or None,
-                )
-                sess.agent.compress_llm = LLM(
-                    sess.agent.settings,
-                    model=sess.agent.settings.compress_model,
-                    api_key=getattr(sess.agent.settings, "compress_api_key", None)
-                    or sess.agent.settings.api_key,
-                    base_url=getattr(sess.agent.settings, "compress_base_url", None)
-                    or sess.agent.settings.base_url,
-                    max_tokens=getattr(sess.agent.settings, "compress_max_tokens", 0) or None,
-                )
+                sess.agent.rebuild_llms()
             except Exception as exc:
                 log_exception(_log, f"refresh_settings failed for session {sess.id}", exc)
         return self.settings
 
-    def create(self) -> ChatSession:
+    def create(self, workspace: Optional[str] = None) -> ChatSession:
         # Always use latest settings for new chats (model switch)
         from .tenant_context import get_user_id
         from .model_config import apply_to_settings, load_model_config
 
         self.settings = get_settings()
         apply_to_settings(self.settings, load_model_config())
+        # Per-session clone so pinning a folder cannot mutate the tenant overlay
+        # (and so the system prompt is built AFTER the pin, not before).
+        sess_settings = self.settings.clone()
+        if workspace:
+            from .workspace_store import remember_recent, resolve_workspace_path
+
+            folder = resolve_workspace_path(workspace)
+            sess_settings.workspace = folder
+            try:
+                remember_recent(folder)
+            except Exception:
+                pass
         bus = EventBus()
         from ..runtime.approval import ApprovalGate
 
-        agent = Agent(self.settings, bus=bus, approval=ApprovalGate())
+        agent = Agent(sess_settings, bus=bus, approval=ApprovalGate())
         sess = ChatSession(id=new_id("sess"), agent=agent, user_id=get_user_id())
         agent.session_id = sess.id
         with self._lock:
@@ -341,6 +353,7 @@ class SessionStore:
             "pending_approvals": agent.approval.pending(),
             "pending_asks": agent.ask.pending(),
             "pending_plans": agent.plan_gate.pending(),
+            "active_plan": agent.active_plan_snapshot() if sess.busy else None,
             "live_subagents": agent.live_subagent_snapshot(),
         }
 
@@ -456,8 +469,7 @@ class SessionStore:
         from .model_config import apply_to_settings, load_model_config
 
         apply_to_settings(self.settings, load_model_config())
-        bus = EventBus()
-        agent = Agent(self.settings, bus=bus, messages=messages)
+        sess_settings = self.settings.clone()
         ws = (meta.workspace or "").strip()
         if ws:
             try:
@@ -465,9 +477,11 @@ class SessionStore:
 
                 folder = _Path(ws).expanduser().resolve()
                 if folder.is_dir():
-                    agent.settings.workspace = folder
+                    sess_settings.workspace = folder
             except Exception:
                 pass
+        bus = EventBus()
+        agent = Agent(sess_settings, bus=bus, messages=messages)
         mtime = path.stat().st_mtime
         title = _prefer_title(meta.title, _title_from_messages(messages, ""), fallback=meta.id)
         sess = ChatSession(
@@ -484,11 +498,21 @@ class SessionStore:
             self._sessions[sess.id] = sess
         return sess
 
-    def list(self, *, page: int = 1, page_size: int = 20) -> dict[str, Any]:
+    def list(
+        self,
+        *,
+        page: int = 1,
+        page_size: int = 20,
+        workspace: Optional[str] = None,
+    ) -> dict[str, Any]:
         from .tenant_context import get_user_id
 
         uid = get_user_id()
         current_ws = getattr(get_settings(), "workspace", "")
+        # By default show every chat regardless of which folder it is pinned
+        # to — several chats may be running against different workspaces at
+        # once. Pass ``workspace`` to narrow to one project's history.
+        filter_ws = workspace if workspace is not None else None
         items: dict[str, dict[str, Any]] = {}
 
         # Disk history first
@@ -497,7 +521,7 @@ class SessionStore:
                 meta, messages = load_session(path)
                 if meta.user_id and meta.user_id != uid:
                     continue
-                if not workspace_matches(meta.workspace, current_ws):
+                if filter_ws and not workspace_matches(meta.workspace, filter_ws):
                     continue
                 sid = meta.id or path.stem
                 user_count = _user_turn_count(messages)
@@ -525,6 +549,7 @@ class SessionStore:
                         ).timestamp()
                     except ValueError:
                         pass
+                ws_path = str(meta.workspace or "")
                 items[sid] = {
                     "id": sid,
                     "title": _prefer_title(
@@ -539,6 +564,9 @@ class SessionStore:
                     "demo": False,
                     "busy": False,
                     "source": "disk",
+                    "workspace": ws_path,
+                    "workspace_name": Path(ws_path).name if ws_path else "",
+                    "is_current_workspace": workspace_matches(ws_path, current_ws),
                 }
             except Exception:
                 continue
@@ -548,10 +576,11 @@ class SessionStore:
         for s in live:
             if s.user_id and s.user_id != uid:
                 continue
-            sess_ws = getattr(s.agent.settings, "workspace", "")
-            if not workspace_matches(str(sess_ws or ""), current_ws):
+            sess_ws = str(getattr(s.agent.settings, "workspace", "") or "")
+            if filter_ws and not workspace_matches(sess_ws, filter_ws):
                 continue
-            user_turns = _user_turn_count(s.agent.messages)
+            full_msgs = _full_transcript(s.agent)
+            user_turns = _user_turn_count(full_msgs)
             if user_turns <= 0:
                 continue
             prev = items.get(s.id)
@@ -563,16 +592,19 @@ class SessionStore:
                 "id": s.id,
                 "title": _prefer_title(
                     s.title,
-                    _title_from_messages(s.agent.messages, ""),
+                    _title_from_messages(full_msgs, ""),
                     fallback=s.id,
                 ),
                 "created_at": s.created_at,
                 "updated_at": updated,
-                "messages": len(s.agent.messages),
+                "messages": len(full_msgs),
                 "user_turns": user_turns,
                 "demo": s.agent.settings.demo_mode,
                 "busy": bool(s.busy and not s.stop_requested),
                 "source": "memory",
+                "workspace": sess_ws,
+                "workspace_name": Path(sess_ws).name if sess_ws else "",
+                "is_current_workspace": workspace_matches(sess_ws, current_ws),
             }
 
         all_items = sorted(
@@ -630,7 +662,9 @@ class SessionStore:
             return False
         if keep_user_turns < 0:
             raise ValueError("keep_user_turns must be >= 0")
-        msgs = sess.agent.messages
+        # Cut against the full archived+live transcript — some early turns may
+        # already have been moved into the compaction archive.
+        msgs = _full_transcript(sess.agent)
         count = 0
         cut = len(msgs)
         for i, m in enumerate(msgs):
@@ -640,6 +674,7 @@ class SessionStore:
                     break
                 count += 1
         sess.agent.messages = msgs[:cut]
+        sess.agent._archived_messages = []
         sess.updated_at = time.time()
         try:
             self.persist(session_id)
@@ -653,7 +688,11 @@ class SessionStore:
         if not sess:
             _log.error("persist skipped: session %s not found", session_id)
             return None
-        if _user_turn_count(sess.agent.messages) <= 0:
+        # Full chronological transcript, not the (possibly compacted) live LLM
+        # working set — otherwise context compression during a long chat would
+        # permanently erase earlier turns from disk history.
+        full_msgs = _full_transcript(sess.agent)
+        if _user_turn_count(full_msgs) <= 0:
             return None
         tree: list[Any] = []
         try:
@@ -665,7 +704,7 @@ class SessionStore:
         sess.agent_tree = tree
         path = save_session(
             self.settings.root,
-            sess.agent.messages,
+            full_msgs,
             model=self.settings.model,
             workspace=getattr(sess.agent.settings, "workspace", None) or self.settings.workspace,
             session_id=session_id,
@@ -683,7 +722,7 @@ class SessionStore:
         """
         import json as _json
 
-        msgs = sess.agent.messages
+        msgs = _full_transcript(sess.agent)
         owner = str(getattr(sess.agent, "agent_id", "") or "main")
         results_by_id: dict[str, dict[str, Any]] = {}
         for m in msgs:
@@ -703,7 +742,11 @@ class SessionStore:
                     continue
                 content = _message_display_text(m).strip()
                 if content and not content.startswith("Iteration budget exhausted"):
-                    out.append({"role": "user", "content": content, "agent_id": owner})
+                    item: dict[str, Any] = {"role": "user", "content": content, "agent_id": owner}
+                    ts = m.get("ts")
+                    if ts:
+                        item["ts"] = ts
+                    out.append(item)
                 continue
 
             if role == "assistant":
@@ -720,13 +763,19 @@ class SessionStore:
                 # Tool rounds often have empty content + reasoning + tool_calls.
                 # Dropping those rows hid thinking when history was reloaded.
                 if content or reasoning:
-                    item: dict[str, Any] = {
+                    item = {
                         "role": "assistant",
                         "content": content,
                         "agent_id": owner,
                     }
                     if reasoning:
                         item["reasoning"] = reasoning
+                    ts = m.get("ts")
+                    if ts:
+                        item["ts"] = ts
+                    meta = m.get("sidekick")
+                    if isinstance(meta, dict):
+                        item["sidekick"] = meta
                     out.append(item)
 
                 for tc in m.get("tool_calls") or []:
@@ -762,6 +811,9 @@ class SessionStore:
                         "status": status,
                         "agent_id": owner,
                     }
+                    ts = (result_msg or {}).get("ts") or m.get("ts")
+                    if ts:
+                        tool_item["ts"] = ts
                     out.append(tool_item)
                     if call_id:
                         emitted_tool_ids.add(call_id)
@@ -782,6 +834,7 @@ class SessionStore:
                         "result": result,
                         "status": "error" if result.startswith("ERROR") else "done",
                         "agent_id": owner,
+                        **({"ts": m.get("ts")} if m.get("ts") else {}),
                     }
                 )
                 if cid:

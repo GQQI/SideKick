@@ -7,7 +7,25 @@ from pathlib import Path
 
 from ..tool_registry import Tool, ToolRegistry
 from .context import ToolContext
-from .support import _needs_codebase_align, _safe_path
+from .support import _needs_codebase_align
+
+
+def _sync_skill_library(ctx: ToolContext, written: Path) -> str:
+    from ...services.skills import load_skills, sync_workspace_skill
+
+    try:
+        note = sync_workspace_skill(
+            written, ctx.live_ws(), ctx.settings.skills_dir, overwrite=True
+        )
+    except Exception as exc:
+        return f"\nnote: skill library sync failed ({exc})"
+    if not note:
+        return ""
+    try:
+        ctx.skills[:] = load_skills(ctx.settings.skills_dir)
+    except Exception:
+        pass
+    return f"\n{note}"
 
 
 def _as_int(value: object, default: int) -> int:
@@ -25,37 +43,226 @@ def _as_int(value: object, default: int) -> int:
         return default
 
 
+_OFFICE_DOC_EXTS = {
+    ".docx", ".pptx", ".xlsx", ".odt", ".odp", ".ods", ".epub", ".rtf",
+}
+_PDF_EXTS = {".pdf"}
+_LEGACY_OFFICE_EXTS = {".doc", ".ppt", ".xls", ".pps"}
+_MEDIA_EXTS = {
+    ".png", ".jpg", ".jpeg", ".gif", ".webp", ".bmp", ".ico", ".tif", ".tiff",
+    ".avif", ".mp3", ".wav", ".ogg", ".m4a", ".flac", ".aac", ".mp4", ".webm",
+    ".mov", ".mkv", ".avi", ".zip", ".7z", ".rar", ".tar", ".gz", ".exe", ".dll",
+}
+
+
+def _read_pdf_text(fp: Path, max_chars: int) -> str | None:
+    """Best-effort PDF text via pypdf when it is installed; None if unavailable."""
+    try:
+        from pypdf import PdfReader  # type: ignore
+    except Exception:
+        return None
+    try:
+        reader = PdfReader(str(fp))
+        parts: list[str] = []
+        total = 0
+        for i, page in enumerate(reader.pages):
+            chunk = (page.extract_text() or "").strip()
+            if not chunk:
+                continue
+            block = f"## page {i + 1}\n{chunk}"
+            parts.append(block)
+            total += len(block)
+            if total >= max_chars:
+                break
+        return "\n\n".join(parts)
+    except Exception as exc:  # noqa: BLE001
+        return f"ERROR: could not extract text from {fp.name}: {exc}"
+
+
+def _read_document_text(fp: Path) -> tuple[str | None, str, str]:
+    """(text, note, error) for non-plain-text documents.
+
+    text=None and error="" means "not a document — decode as plain text".
+    Office/OpenDocument/EPUB/RTF are extracted in-process; PDF needs pypdf.
+    Media and archives return a clear error so the model does not fall back
+    to unrelated tools (e.g. browser_navigate on a .docx).
+    """
+    ext = fp.suffix.lower()
+    if ext in _OFFICE_DOC_EXTS:
+        from ...services.fs_api import extract_document_preview
+
+        text, ok = extract_document_preview(fp, max_chars=400_000)
+        if not ok or not text.strip():
+            return (
+                None,
+                "",
+                f"ERROR: {fp.name} is a {ext} document but no text could be extracted "
+                "(empty, image-only, or corrupted). Ask the user for a text/markdown export.",
+            )
+        note = (
+            f"[document={ext.lstrip('.')} — text extracted from {fp.name}; "
+            "layout/images are not included]"
+        )
+        return text, note, ""
+    if ext in _PDF_EXTS:
+        text = _read_pdf_text(fp, max_chars=400_000)
+        if text is None:
+            return (
+                None,
+                "",
+                f"ERROR: {fp.name} is a PDF and this runtime has no PDF text extractor. "
+                "Do NOT open it with browser_navigate. Ask the user to export it as "
+                ".docx/.txt/.md, or run `pip install pypdf` and retry read_file.",
+            )
+        if text.startswith("ERROR:"):
+            return None, "", text
+        if not text.strip():
+            return (
+                None,
+                "",
+                f"ERROR: {fp.name} has no extractable text (scanned/image-only PDF). "
+                "Ask the user for a text version.",
+            )
+        return text, f"[document=pdf — text extracted from {fp.name}]", ""
+    if ext in _LEGACY_OFFICE_EXTS:
+        return (
+            None,
+            "",
+            f"ERROR: {fp.name} is a legacy binary Office file ({ext}); this runtime cannot "
+            "read it. Ask the user to re-save it as .docx/.xlsx/.pptx and read that instead.",
+        )
+    if ext in _MEDIA_EXTS:
+        return (
+            None,
+            "",
+            f"ERROR: {fp.name} is binary ({ext}); read_file only returns text. "
+            "Use list_dir for metadata, or describe what you need from the user.",
+        )
+    return None, "", ""
+
+
+_DEFAULT_READ_CAP = 400  # chunk size when the remaining file is still large
+_MAX_LIMIT = 500  # hard cap for one read_file call, even with an explicit limit
+# If what's left fits here, return through EOF in one call (avoids a 468-line
+# file being split at 400 and the model looping "read from line 401/193…").
+_FINISH_IF_REMAINING = 500
+
+
 def register_file_tools(reg: ToolRegistry, ctx: ToolContext) -> None:
     live_ws = ctx.live_ws
     align_state = ctx.align_state
 
-    def read_file(path: str, offset: int = 1, limit: int = 0) -> str:
-        """Read a text file. limit<=0 means read through end of file (no hard cap)."""
-        fp = _safe_path(live_ws(), path)
+    def read_file(
+        path: str,
+        offset: int = 1,
+        limit: int = 0,
+        encoding: str = "",
+    ) -> str:
+        """Read a text file. limit<=0 reads through EOF when the rest is modest."""
+        from ...core.pathutil import nearby_file_names, resolve_existing_tool_path
+        from ...core.textcodec import decode_path
+
+        fp = resolve_existing_tool_path(path, live_ws())
         if not fp.exists():
-            return f"ERROR: not found: {fp}"
-        lines = fp.read_text(encoding="utf-8", errors="replace").splitlines()
+            hint = nearby_file_names(fp)
+            extra = f" Nearby files: {', '.join(hint)}" if hint else ""
+            return (
+                f"ERROR: not found: {fp}.{extra} "
+                "Copy the exact name from list_dir/search_text "
+                "(keep spaces, parentheses, '#', and punctuation). "
+                "Do not simplify the filename or continue as if the file was read."
+            )
+        if fp.is_dir():
+            return f"ERROR: {fp} is a directory; use list_dir"
+        doc_text, doc_note, doc_err = _read_document_text(fp)
+        if doc_err:
+            return doc_err
+        if doc_text is not None:
+            text = doc_text
+            used = "document"
+        else:
+            decoded = decode_path(fp, encoding=encoding or None)
+            if not decoded.ok:
+                return f"ERROR: {decoded.error}"
+            text = decoded.text
+            used = decoded.encoding
+        lines = text.replace("\r\n", "\n").replace("\r", "\n").split("\n")
         offset = max(1, _as_int(offset, 1))
         total = len(lines)
+        if offset > total:
+            return (
+                f"EOF: {fp.name} has only {total} lines — there is nothing at "
+                f"offset {offset}. The file has been fully read; use the content "
+                "already in this conversation and continue the task."
+            )
         req_limit = _as_int(limit, 0)
-        # Default / non-positive limit → remainder of file (no artificial ceiling).
+        auto_capped = False
+        remaining = max(0, total - (offset - 1))
         if req_limit <= 0:
-            req_limit = max(0, total - (offset - 1))
+            if remaining <= _FINISH_IF_REMAINING:
+                req_limit = remaining
+            else:
+                req_limit = _DEFAULT_READ_CAP
+                auto_capped = True
+        elif req_limit > _MAX_LIMIT:
+            req_limit = _MAX_LIMIT
+            auto_capped = True
         chunk = lines[offset - 1 : offset - 1 + req_limit]
-        body = "\n".join(f"{i}|{line}" for i, line in enumerate(chunk, start=offset))
-        if offset - 1 + req_limit < total:
-            body += f"\n… next_offset={offset + req_limit} total_lines={total}"
+        # Char budget: the trailer must describe what the model ACTUALLY gets.
+        # If we served 468 lines but the executor later clipped the tail, the
+        # dedupe ledger would claim the whole file is in context while the
+        # model never saw the end — it then probes past EOF in a loop.
+        cap_chars = max(
+            4000, int(getattr(ctx.settings, "tool_result_cap", 18000) or 18000) - 800
+        )
+        served: list[str] = []
+        used_chars = 0
+        for idx, line in enumerate(chunk):
+            row = f"{offset + idx}|{line}"
+            if served and used_chars + len(row) + 1 > cap_chars:
+                break
+            served.append(row)
+            used_chars += len(row) + 1
+        body = "\n".join(served)
+        actual_end = offset - 1 + len(served)
+        char_capped = len(served) < len(chunk)
+        meta = f"\n… lines {offset}-{actual_end} of {total}"
+        if actual_end >= total:
+            if offset == 1:
+                meta += " (ENTIRE file — you now have all of it; do not read it again)"
+            else:
+                meta += " (end of file — nothing after this)"
+        else:
+            meta += (
+                f"; more below — ONE follow-up: read_file(path, offset={actual_end + 1}) "
+                f"then continue the task (do not repeat this plan)"
+            )
+            if char_capped:
+                meta += " (chunk capped by size, not by the file)"
+            elif auto_capped:
+                meta += " (large file; this chunk is capped)"
+        body += meta
+        if doc_note:
+            return f"{doc_note}\n{body}"
+        if (encoding or "").strip() or used not in ("utf-8", "utf-8-sig"):
+            return f"[encoding={used}]\n{body}"
         return body
 
-    def write_file(path: str, content: str, force_create: bool = False) -> str:
+    def write_file(
+        path: str,
+        content: str,
+        force_create: bool = False,
+        encoding: str = "",
+    ) -> str:
         from ...services import fs_api
         from ...services import codebase_memory as cbm
 
         try:
-            target = _safe_path(live_ws(), path)
-            try:
-                from ...core.pathutil import is_relative_to, relative_to_posix
+            from ...core.pathutil import is_relative_to, relative_to_posix, resolve_existing_tool_path
 
+            target = resolve_existing_tool_path(path, live_ws())
+            text = "" if content is None else str(content)
+            try:
                 rel = relative_to_posix(target, live_ws()) if is_relative_to(target, live_ws()) else str(target)
             except Exception:
                 rel = str(target)
@@ -68,7 +275,7 @@ def register_file_tools(reg: ToolRegistry, ctx: ToolContext) -> None:
                 and not align_state["aligned"]
             ):
                 # Auto-align instead of hard-failing — models often skip codebase_find_similar.
-                q = f"{Path(rel).stem} {Path(rel).suffix} {(content or '')[:240]}".strip()
+                q = f"{Path(rel).stem} {Path(rel).suffix} {text[:240]}".strip()
                 try:
                     index = cbm.get_or_build_index(live_ws())
                     hits = cbm.find_similar(index, q, limit=8)
@@ -88,9 +295,15 @@ def register_file_tools(reg: ToolRegistry, ctx: ToolContext) -> None:
                 except Exception:
                     align_state["aligned"] = True
 
-            res = fs_api.write_text(rel, content, allow_outside=True)
+            res = fs_api.write_text(
+                rel, text, allow_outside=True, encoding=encoding or None
+            )
             cbm.invalidate_index(live_ws())
-            return f"wrote {res['path']} ({res['size']} chars){align_note}"
+            note = f" encoding={encoding.strip()}" if (encoding or "").strip() else ""
+            return (
+                f"wrote {res['path']} ({res['size']} chars){note}{align_note}"
+                + _sync_skill_library(ctx, target)
+            )
         except Exception as exc:
             return f"ERROR: {exc}"
 
@@ -99,18 +312,23 @@ def register_file_tools(reg: ToolRegistry, ctx: ToolContext) -> None:
         old_string: str = "",
         new_string: str = "",
         replace_all: bool = False,
+        encoding: str = "",
     ) -> str:
-        from ...core.pathutil import is_relative_to, relative_to_posix
+        from ...core.pathutil import is_relative_to, relative_to_posix, resolve_existing_tool_path
+        from ...core.textcodec import decode_path
         from ...services import codebase_memory as cbm
         from ...services import fs_api
         from ...services.file_edit import apply_str_replace
 
         try:
-            target = _safe_path(live_ws(), path)
+            target = resolve_existing_tool_path(path, live_ws())
             if not target.exists() or not target.is_file():
                 return f"ERROR: not found: {target}"
             try:
-                text = target.read_text(encoding="utf-8")
+                decoded = decode_path(target, encoding=encoding or None)
+                if not decoded.ok:
+                    return f"ERROR: {decoded.error}"
+                text = decoded.text
             except OSError as exc:
                 return f"ERROR: {exc}"
             try:
@@ -127,26 +345,38 @@ def register_file_tools(reg: ToolRegistry, ctx: ToolContext) -> None:
                 )
             except Exception:
                 rel = str(target)
-            res = fs_api.write_text(rel, updated, allow_outside=True)
+            res = fs_api.write_text(
+                rel, updated, allow_outside=True, encoding=decoded.encoding
+            )
             cbm.invalidate_index(live_ws())
-            return f"updated {res['path']} ({n} replacement{'s' if n != 1 else ''})"
+            note = (
+                f" encoding={decoded.encoding}"
+                if decoded.encoding not in ("utf-8", "utf-8-sig")
+                else ""
+            )
+            return (
+                f"updated {res['path']} ({n} replacement{'s' if n != 1 else ''}){note}"
+                + _sync_skill_library(ctx, target)
+            )
         except Exception as exc:
             return f"ERROR: {exc}"
 
     def delete_file(path: str) -> str:
-        from ...services import fs_api
+        from ...core.pathutil import is_relative_to, relative_to_posix, resolve_existing_tool_path
         from ...services import codebase_memory as cbm
+        from ...services import fs_api
 
         try:
-            rel = path.replace("\\", "/")
+            target = resolve_existing_tool_path(path, live_ws())
             try:
-                if Path(path).is_absolute():
-                    from ...core.pathutil import relative_to_posix
-
-                    rel = relative_to_posix(path, live_ws())
+                rel = (
+                    relative_to_posix(target, live_ws())
+                    if is_relative_to(target, live_ws())
+                    else str(target)
+                )
             except Exception:
-                pass
-            res = fs_api.delete_entry(rel, recursive=False)
+                rel = str(target)
+            res = fs_api.delete_entry(rel, recursive=False, allow_outside=True)
             cbm.invalidate_index(live_ws())
             return f"deleted {res['path']}"
         except Exception as exc:
@@ -154,7 +384,9 @@ def register_file_tools(reg: ToolRegistry, ctx: ToolContext) -> None:
 
     def list_dir(path: str = ".") -> str:
         try:
-            fp = _safe_path(live_ws(), path)
+            from ...core.pathutil import resolve_existing_tool_path
+
+            fp = resolve_existing_tool_path(path, live_ws())
             if not fp.exists():
                 return f"ERROR: not found: {fp}"
             if fp.is_file():
@@ -175,10 +407,11 @@ def register_file_tools(reg: ToolRegistry, ctx: ToolContext) -> None:
         glob: str = "*",
         regex: bool = False,
     ) -> str:
+        from ...core.pathutil import resolve_existing_tool_path
         from ...services.repo_search import search_text as repo_search_text
 
         try:
-            base = _safe_path(live_ws(), path)
+            base = resolve_existing_tool_path(path, live_ws())
         except OSError as exc:
             return f"ERROR: {exc}"
         return repo_search_text(
@@ -192,8 +425,21 @@ def register_file_tools(reg: ToolRegistry, ctx: ToolContext) -> None:
     reg.register(
         Tool(
             "read_file",
-            "Read a text file with line numbers. By default reads the whole file from offset "
-            "(limit=0). Pass a positive limit only when you intentionally want a slice.",
+            f"Read a workspace file as numbered text. Handles plain text/code AND documents: "
+            f".docx/.pptx/.xlsx/.odt/.epub/.rtf are converted to text automatically "
+            f"(.pdf when pypdf is installed) — ALWAYS use read_file for local documents; "
+            f"never browser_navigate. Prefer PRECISE reads: pass offset/limit "
+            f"for the exact range you need (e.g. from search_text/codebase_* hit lines). "
+            f"limit=0/omit reads through EOF when at most {_FINISH_IF_REMAINING} lines remain; "
+            f"larger files come in {_DEFAULT_READ_CAP}-line chunks (hard max {_MAX_LIMIT} "
+            f"lines per call); the trailer tells you the single next offset. Never read the "
+            f"same lines twice: a repeat returns '[already in context]' and then errors. To "
+            f"FIND text in a file you already read, use search_text — not another read_file. "
+            "Use the exact filename (spaces and punctuation included). "
+            "Default encoding is UTF-8 (or a BOM if the file has one). "
+            "If decode fails, retry with encoding= set to another codec; "
+            "do not continue as if the file was read. "
+            "Paths outside the workspace need user approval, then are read as-is.",
             {
                 "type": "object",
                 "properties": {
@@ -202,7 +448,19 @@ def register_file_tools(reg: ToolRegistry, ctx: ToolContext) -> None:
                     "limit": {
                         "type": "integer",
                         "default": 0,
-                        "description": "Lines to read; 0 or omit = through end of file.",
+                        "description": (
+                            f"Lines to read (max {_MAX_LIMIT}); 0/omit auto-caps at "
+                            f"{_DEFAULT_READ_CAP} from offset. Pass the smallest range "
+                            "that answers your question."
+                        ),
+                        "maximum": _MAX_LIMIT,
+                    },
+                    "encoding": {
+                        "type": "string",
+                        "description": (
+                            "Optional Python codec name. Omit for UTF-8 / BOM. "
+                            "On ERROR, retry this tool with a different encoding."
+                        ),
                     },
                 },
                 "required": ["path"],
@@ -215,6 +473,11 @@ def register_file_tools(reg: ToolRegistry, ctx: ToolContext) -> None:
         Tool(
             "write_file",
             "Create a new text file or fully rewrite one. Requires user approval. "
+            "Both path and content are required — never omit content. "
+            "The full content is written (no server-side truncation). "
+            "Optional encoding= is a Python codec name (default UTF-8, or the "
+            "file BOM when rewriting). "
+            "Paths outside the workspace are allowed after the user confirms. "
             "To change an existing file, prefer str_replace (unique old_string). "
             "For NEW code modules, Sidekick auto-checks similar existing files "
             "(prefer codebase_find_similar first when reusing is likely). "
@@ -224,6 +487,13 @@ def register_file_tools(reg: ToolRegistry, ctx: ToolContext) -> None:
                 "properties": {
                     "path": {"type": "string"},
                     "content": {"type": "string"},
+                    "encoding": {
+                        "type": "string",
+                        "description": (
+                            "Optional Python codec name for the bytes on disk. "
+                            "Omit for UTF-8 (or the existing file BOM)."
+                        ),
+                    },
                     "force_create": {
                         "type": "boolean",
                         "description": (
@@ -242,8 +512,10 @@ def register_file_tools(reg: ToolRegistry, ctx: ToolContext) -> None:
         Tool(
             "str_replace",
             "Surgically edit an existing text file by replacing an exact substring. "
-            "Requires user approval. old_string must match exactly once unless "
-            "replace_all=true. Prefer this over write_file for existing files.",
+            "Requires user approval. Paths outside the workspace are allowed after "
+            "the user confirms. old_string must match exactly once unless "
+            "replace_all=true. Prefer this over write_file for existing files. "
+            "Pass the same encoding= that succeeded on read_file.",
             {
                 "type": "object",
                 "properties": {
@@ -257,6 +529,13 @@ def register_file_tools(reg: ToolRegistry, ctx: ToolContext) -> None:
                         "type": "boolean",
                         "description": "Replace every occurrence when old_string is not unique.",
                     },
+                    "encoding": {
+                        "type": "string",
+                        "description": (
+                            "Optional Python codec name. Omit for UTF-8 / BOM. "
+                            "On decode ERROR, retry with a different encoding."
+                        ),
+                    },
                 },
                 "required": ["path", "old_string", "new_string"],
             },
@@ -268,7 +547,9 @@ def register_file_tools(reg: ToolRegistry, ctx: ToolContext) -> None:
     reg.register(
         Tool(
             "delete_file",
-            "Delete a file (or empty directory) under the workspace. Requires user approval.",
+            "Delete a file or empty directory. Requires user approval. "
+            "Paths outside the workspace (and destructive deletes) are allowed "
+            "only after the user confirms.",
             {
                 "type": "object",
                 "properties": {"path": {"type": "string"}},

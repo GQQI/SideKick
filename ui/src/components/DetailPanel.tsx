@@ -24,6 +24,7 @@ type Props = {
   detailDiffLoading: boolean;
   fsRefresh: number;
   sessionId: string | null;
+  workspace?: string | null;
   onResizeStart: () => void;
   onClose: () => void;
   onChange: (next: NonNullable<DetailView>) => void;
@@ -51,6 +52,7 @@ export function DetailPanel({
   detailDiffLoading,
   fsRefresh,
   sessionId,
+  workspace = null,
   onResizeStart,
   onClose,
   onChange,
@@ -137,6 +139,7 @@ export function DetailPanel({
             t={t}
             refreshKey={fsRefresh}
             sessionId={sessionId}
+            workspace={workspace}
             selectedPath={detail.selectedPath}
             onSelectPath={(path) => onChange({ type: "changes", selectedPath: path })}
           />

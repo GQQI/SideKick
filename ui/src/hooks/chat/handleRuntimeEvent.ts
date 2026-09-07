@@ -21,7 +21,7 @@ import { declaredDelegateSlotCount, findSubNode, isEphemeralCanvasId, sameSubage
 import { canvasGoalsMatch } from "../../utils/canvasSlots";
 import type { MsgKey } from "../../i18n";
 import { upsertToolDelta, upsertToolEnd, upsertToolStart, type ToolUpsertCtx } from "./toolUpserts";
-import { applyCanvasTree } from "./canvasSync";
+import { applyCanvasTree, replaceStageSubagents } from "./canvasSync";
 
 function argsLookEmpty(args: unknown): boolean {
   if (args == null) return true;
@@ -171,14 +171,10 @@ function appendTopLevelSubagent(
     }
     return;
   }
-  ctx.setSubs((prev) => (prev.some((s) => s.id === node.id) ? prev : [...prev, node]));
-  ctx.appendMsg({
-    id: uid(),
-    role: "subagent",
-    content: node.goal,
-    subagent: node,
-    agent_id: node.id,
-  });
+  const existingNodes = current
+    .map((m) => m.subagent)
+    .filter((n): n is SubNode => Boolean(n));
+  replaceStageSubagents(ctx, [...existingNodes, node], stage);
   if (!replay && node.kind !== "party" && node.kind !== "talk") {
     ctx.setDetail({ type: "subagent", subagent: node });
   }
@@ -309,7 +305,46 @@ function parseShapeContract(raw: unknown): ShapeContract | null {
 export function handleRuntimeEvent(ev: RuntimeEvent, ctx: RuntimeEventHandlerCtx): void {
   const type = ev.type;
 
-  if (type === "plan_created") {
+  if (type === "browser_open") {
+    const url = String(ev.data?.url || "");
+    if (typeof window !== "undefined") {
+      window.dispatchEvent(new CustomEvent("sidekick-browser-open", { detail: { url } }));
+    }
+  }
+
+  if (type === "shell_job") {
+    if (typeof window !== "undefined") {
+      window.dispatchEvent(new CustomEvent("sidekick-shell-job", { detail: ev.data || {} }));
+    }
+    const jobId = String(ev.data?.job_id || "");
+    const status = String(ev.data?.status || "");
+    const phase = String(ev.data?.phase || "");
+    const message = String(ev.data?.message || "").trim();
+    if (
+      jobId &&
+      message &&
+      (phase === "done" || status === "exited" || status === "killed")
+    ) {
+      ctx.appendMsg({
+        id: `job-done-${jobId}`,
+        role: "assistant",
+        content: message,
+        jobNotice: {
+          job_id: jobId,
+          status,
+          exit_code:
+            typeof ev.data?.exit_code === "number" ? (ev.data.exit_code as number) : null,
+        },
+      });
+    }
+  }
+
+  // The pinned plan panel belongs to the root agent only. A subagent's plan
+  // (parent_id set) must not overwrite or clear it; those still flow into the
+  // subagent transcript below.
+  const isRootPlanEvent = !ev.parent_id;
+
+  if (type === "plan_created" && isRootPlanEvent) {
     const tasks = parsePlanTasks(ev.data.tasks);
     const summary = String(ev.data.summary || "");
     const planId = String(ev.data.plan_id || "");
@@ -335,18 +370,24 @@ export function handleRuntimeEvent(ev: RuntimeEvent, ctx: RuntimeEventHandlerCtx
     } else if (tasks.length) {
       ctx.executingPlanIdRef.current = planId || ctx.executingPlanIdRef.current;
       ctx.setActivePlan((prev) => {
-        const byId = new Map((prev?.tasks || []).map((t) => [t.id, t.status]));
+        // Only carry statuses over when this is the same plan being re-announced
+        // (e.g. after confirm). A different plan id replaces the panel outright,
+        // otherwise a stale plan's ticks bleed into the new one.
+        const samePlan = Boolean(prev && planId && prev.planId === planId);
+        const byId = new Map(
+          samePlan ? (prev?.tasks || []).map((t) => [t.id, t.status]) : [],
+        );
         return {
           planId,
-          summary: summary || prev?.summary || "",
+          summary: summary || (samePlan ? prev?.summary : "") || "",
           mode: "agent",
           awaitingConfirm: false,
-          shapeContract: shapeContract || prev?.shapeContract || null,
+          shapeContract: shapeContract || (samePlan ? prev?.shapeContract : null) || null,
           tasks: tasks.map((t, i) => ({
             ...t,
             status:
               byId.get(t.id) ??
-              prev?.tasks[i]?.status ??
+              (samePlan ? prev?.tasks[i]?.status : undefined) ??
               t.status ??
               "pending",
           })),
@@ -354,7 +395,7 @@ export function handleRuntimeEvent(ev: RuntimeEvent, ctx: RuntimeEventHandlerCtx
       });
     }
   }
-  if (type === "plan_confirm_request") {
+  if (type === "plan_confirm_request" && isRootPlanEvent) {
     const planId = String(ev.data.plan_id || "");
     if (ctx.executingPlanIdRef.current && ctx.executingPlanIdRef.current === planId) {
       return;
@@ -375,7 +416,7 @@ export function handleRuntimeEvent(ev: RuntimeEvent, ctx: RuntimeEventHandlerCtx
     });
     ctx.setActivePlan((prev) => (planIsExecuting(prev) ? prev : null));
   }
-  if (type === "plan_confirm_resolved") {
+  if (type === "plan_confirm_resolved" && isRootPlanEvent) {
     ctx.planPendingRef.current = false;
     ctx.setPlanConfirm((cur) =>
       cur && cur.planId === String(ev.data.plan_id || "") ? null : cur,
@@ -387,13 +428,19 @@ export function handleRuntimeEvent(ev: RuntimeEvent, ctx: RuntimeEventHandlerCtx
       ctx.setActivePlan(null);
     }
   }
-  if (type === "plan_step") {
+  if (type === "plan_step" && isRootPlanEvent) {
     const planId = String(ev.data.plan_id || "");
     if (planId) ctx.executingPlanIdRef.current = planId;
     ctx.setPlanConfirm(null);
-    ctx.setActivePlan((prev) => applyPlanStep(prev, ev.data, ctx.t("taskPlanTitle")));
+    ctx.setActivePlan((prev) => {
+      // A step for a different plan than the one pinned means the panel is
+      // stale (e.g. leftover from a deleted turn) — start fresh from the
+      // event's own task snapshot instead of padding the old list.
+      const base = prev && planId && prev.planId && prev.planId !== planId ? null : prev;
+      return applyPlanStep(base, ev.data, ctx.t("taskPlanTitle"));
+    });
   }
-  if (type === "plan_done") {
+  if (type === "plan_done" && isRootPlanEvent) {
     ctx.planPendingRef.current = false;
     ctx.executingPlanIdRef.current = null;
     ctx.setPlanConfirm(null);
@@ -651,13 +698,16 @@ export function handleRuntimeEvent(ev: RuntimeEvent, ctx: RuntimeEventHandlerCtx
   }
 
   if (type === "compress_start" || type === "compress_progress") {
-    ctx.setCompressState({
-      active: true,
-      message: String(ev.data.message || "正在快速压缩上下文…"),
-      attempt: Number(ev.data.attempt || 0),
-      maxAttempts: Number(ev.data.max_attempts || 3),
-      before: Number(ev.data.before || ev.data.tokens || 0),
-    });
+    const blocking = ev.data.blocking !== false && ev.data.background !== true;
+    if (blocking) {
+      ctx.setCompressState({
+        active: true,
+        message: String(ev.data.message || "正在快速压缩上下文…"),
+        attempt: Number(ev.data.attempt || 0),
+        maxAttempts: Number(ev.data.max_attempts || 1),
+        before: Number(ev.data.before || ev.data.tokens || 0),
+      });
+    }
     ctx.setCtx((c) => ({
       tokens: Number(ev.data.tokens ?? c.tokens),
       limit: Number(ev.data.limit ?? c.limit),
@@ -667,19 +717,24 @@ export function handleRuntimeEvent(ev: RuntimeEvent, ctx: RuntimeEventHandlerCtx
   if (type === "compress") {
     const after = Number(ev.data.after || 0);
     const before = Number(ev.data.before || 0);
-    ctx.setCompressState({
-      active: true,
-      message: String(ev.data.message || `上下文已重置 ${before}→${after}`),
-      attempt: Number((ev.data.meta as { attempts?: number } | undefined)?.attempts || 0),
-      maxAttempts: Number(ev.data.max_attempts || 3),
-      before,
-      after,
-    });
+    const blocking = ev.data.blocking !== false && ev.data.background !== true;
+    if (blocking) {
+      ctx.setCompressState({
+        active: true,
+        message: String(ev.data.message || `上下文已重置 ${before}→${after}`),
+        attempt: Number((ev.data.meta as { attempts?: number } | undefined)?.attempts || 0),
+        maxAttempts: Number(ev.data.max_attempts || 1),
+        before,
+        after,
+      });
+      window.setTimeout(() => ctx.setCompressState(null), 1600);
+    } else {
+      ctx.setCompressState(null);
+    }
     ctx.setCtx((c) => ({
       tokens: after || Number(ev.data.tokens || 0),
       limit: Number(ev.data.limit || c.limit),
     }));
-    window.setTimeout(() => ctx.setCompressState(null), 2200);
   }
 
   if (type === "assistant_delta") {
@@ -943,7 +998,8 @@ export function handleRuntimeEvent(ev: RuntimeEvent, ctx: RuntimeEventHandlerCtx
     }
   }
   if (type === "canvas_sync") {
-    applyCanvasTree(ctx, ev.data.tree);
+    const turn = Number(ev.data.turn);
+    applyCanvasTree(ctx, ev.data.tree, Number.isFinite(turn) && turn > 0 ? turn : undefined);
     return;
   }
 

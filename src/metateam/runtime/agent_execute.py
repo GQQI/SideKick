@@ -4,14 +4,31 @@ from __future__ import annotations
 
 import contextvars
 import json
+import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import Any
 
 from ..core.events import new_id
 from .approval import approval_required, approval_scope, summarize_tool_call
 from .llm import parse_tool_args
-from .tools import plan_parallel_batches, prepare_tool_args
+from .shell_policy import is_readonly_shell_command
+from .tools import missing_required_args, plan_parallel_batches, prepare_tool_args
 
+_INCOMPLETE_WRITE_TOOLS = frozenset({"write_file", "str_replace"})
+_FILE_TOOLS = frozenset(
+    {
+        "read_file",
+        "write_file",
+        "str_replace",
+        "delete_file",
+        "list_dir",
+        "search_text",
+    }
+)
+_BLOCKER_RETRY = (
+    "\n\nDo not continue as if this succeeded. Retry the same file tool with "
+    "the exact filename and a complete payload, or stop and report the blocker."
+)
 _TOOL_ALIASES = {
     "search": "web_search",
     "search_web": "web_search",
@@ -23,12 +40,71 @@ _TOOL_ALIASES = {
 }
 
 
+def _tool_arg_error(name: str, tool: Any, args: dict[str, Any]) -> str | None:
+    if name in _INCOMPLETE_WRITE_TOOLS and args.get("_incomplete"):
+        return (
+            f"ERROR: {name} arguments were cut off before the payload was complete. "
+            "Do not keep a partial file and do not skip ahead. "
+            "Call the same tool again with the full path and full content."
+        )
+    if tool is None:
+        return None
+    prepared = prepare_tool_args(name, tool.handler, args)
+    missing = missing_required_args(tool.handler, prepared)
+    if not missing:
+        return None
+    keys = sorted(str(k) for k in args if not str(k).startswith("_")) or ["(none)"]
+    return (
+        f"ERROR: {name} missing required argument(s): {', '.join(missing)}. "
+        f"Received keys: {', '.join(keys)}. "
+        "Call the same tool again with every required field. "
+        "Do not continue as if the file was written or read."
+    )
+
+
 def _alias_tool_name(name: str) -> str:
     raw = (name or "").strip()
     return _TOOL_ALIASES.get(raw, raw)
 
 
+def _is_blocker_result(content: str) -> bool:
+    text = str(content or "")
+    return text.startswith("ERROR") or text.startswith("WARNING")
+
+
+def _annotate_file_blocker(name: str, content: str) -> str:
+    if name not in _FILE_TOOLS or not _is_blocker_result(content):
+        return content
+    if "Do not continue as if this succeeded" in content:
+        return content
+    return f"{content}{_BLOCKER_RETRY}"
+
+
+def file_tool_results_blocked(results: list[dict[str, Any]]) -> bool:
+    for item in results:
+        name = str(item.get("name") or "")
+        if name in _FILE_TOOLS and _is_blocker_result(str(item.get("content") or "")):
+            return True
+    return False
+
+
 class AgentExecuteMixin:
+    def _emit_browser_open_preview(self, args: dict[str, Any]) -> bool:
+        """Reveal the in-app Browser panel before Playwright/CDP finishes."""
+        raw = str((args or {}).get("url") or "")
+        if not raw.strip():
+            return False
+        try:
+            from ..services.browser_sandbox import coerce_navigate_target
+
+            preview = coerce_navigate_target(raw)
+        except Exception:
+            preview = ""
+        if preview:
+            self._emit("browser_open", {"url": preview, "tool": "browser_navigate"})
+            return True
+        return False
+
     def _execute_one(self, tc: dict[str, Any]) -> dict[str, Any]:
         fn = tc.get("function") or {}
         raw_name = fn.get("name") or ""
@@ -37,15 +113,31 @@ class AgentExecuteMixin:
         tool = self.registry.get(name)
         call_id = str(tc.get("id") or new_id("call"))
         workspace = getattr(getattr(self, "settings", None), "workspace", None)
+        arg_error = _tool_arg_error(name, tool, args)
+        previewed = False
         scope = approval_scope(name, args, workspace)
-        needs_ok = approval_required(name, tool, args=args, workspace=workspace)
+        needs_ok = (not arg_error) and approval_required(
+            name, tool, args=args, workspace=workspace
+        )
         summary = summarize_tool_call(name, args, workspace=workspace)
         mutating = bool(needs_ok) or name in ("delegate_task", "delegate_dialogue")
+        # Read-only shell exploration (dir listing, git status, cat, ...) is
+        # exploration, not a mutation — allow it during plan-prep the same
+        # way list_dir/read_file already are. Still goes through the normal
+        # approval gate below; only the "gathering info" block is skipped.
+        if (
+            mutating
+            and name == "run_shell"
+            and is_readonly_shell_command(str(args.get("command") or ""))
+        ):
+            mutating = False
         if mutating and not getattr(self, "_allow_mutating_tools", True):
             content = (
-                "ERROR: still gathering information for the plan; "
-                "mutating tools are unavailable. Use ask_user or inspect the "
-                "workspace, then stop with a short briefing."
+                f"ERROR: still gathering information for the plan; {name} needs "
+                "approval and mutating tools are unavailable during this gathering "
+                "step. Use read_file / list_dir / search_text / codebase_* / "
+                "a read-only run_shell command (e.g. listing/inspecting, no writes), "
+                "or ask_user — then stop with a short briefing."
             )
             self._emit(
                 "tool_start",
@@ -75,6 +167,7 @@ class AgentExecuteMixin:
                 "tool_call_id": call_id,
                 "name": name,
                 "content": content,
+                "ts": time.time(),
             }
         preapproved = bool(needs_ok and self.approval.is_preapproved(scope))
         self._emit(
@@ -122,6 +215,7 @@ class AgentExecuteMixin:
                             "tool_call_id": call_id,
                             "name": name,
                             "content": content,
+                            "ts": time.time(),
                         }
                     approval_id = new_id("appr")
                     self._emit(
@@ -168,6 +262,7 @@ class AgentExecuteMixin:
                         "tool_call_id": call_id,
                         "name": name,
                         "content": content,
+                        "ts": time.time(),
                     }
             self._emit(
                 "tool_start",
@@ -220,27 +315,92 @@ class AgentExecuteMixin:
                 call_id=call_id,
             )
             try:
-                content = tool.handler(**prepare_tool_args(name, tool.handler, args))
+                if arg_error:
+                    content = arg_error
+                    previewed = False
+                else:
+                    previewed = False
+                    if name == "browser_navigate":
+                        previewed = bool(self._emit_browser_open_preview(args))
+                    served, adjusted = self.guard.dedup_read(name, args)
+                    if served is not None:
+                        # File-space hit: identical lines are already in context.
+                        content = served
+                    else:
+                        run_args = adjusted if adjusted is not None else args
+                        if adjusted is not None:
+                            args = adjusted  # tool_end/UI show the real served range
+                        content = tool.handler(
+                            **prepare_tool_args(name, tool.handler, run_args)
+                        )
             except TypeError as exc:
-                content = f"ERROR: bad arguments for {name}: {exc}"
+                content = (
+                    f"ERROR: bad arguments for {name}: {exc}. "
+                    "Retry with explicit path/content fields; do not skip ahead."
+                )
+                previewed = False
             except Exception as exc:  # noqa: BLE001
                 content = f"ERROR: {name} failed: {exc}"
+                previewed = False
             finally:
                 fs_undo.clear_mutation_meta()
 
-        if not blocked:
-            self.guard.after(name, args, content)
+        # Clip BEFORE recording coverage: the guard must only remember ranges
+        # the model actually received. Recording the pre-clip trailer made the
+        # dedupe ledger claim a whole file was in context when the tail had
+        # been truncated away — the model then probed past EOF in a loop.
         if len(content) > self.settings.tool_result_cap:
             from ..core.textutil import safe_clip
 
             content = safe_clip(
                 content, self.settings.tool_result_cap, ellipsis="\n…[truncated]"
             )
+        if not blocked:
+            self.guard.after(name, args, content)
+        content = _annotate_file_blocker(name, content)
+
+        if (
+            name.startswith("browser_")
+            and content
+            and not str(content).lstrip().startswith("ERROR")
+            and not (name == "browser_navigate" and previewed)
+        ):
+            nav_url = str(args.get("url") or "")
+            if name == "browser_navigate" or not nav_url:
+                try:
+                    payload = json.loads(content) if str(content).lstrip().startswith("{") else {}
+                    if isinstance(payload, dict) and payload.get("url"):
+                        nav_url = str(payload.get("url") or nav_url)
+                except Exception:
+                    pass
+            self._emit("browser_open", {"url": nav_url, "tool": name})
+
+        if name in {
+            "run_shell",
+            "shell_job_list",
+            "shell_job_log",
+            "shell_job_wait",
+            "shell_job_stop",
+        } and content and not str(content).lstrip().startswith("ERROR"):
+            import re as _re
+
+            mid = _re.search(r"job_id=([A-Za-z0-9_]+)", str(content))
+            st = _re.search(r"status=([a-z]+)", str(content))
+            self._emit(
+                "shell_job",
+                {
+                    "job_id": mid.group(1) if mid else "",
+                    "status": st.group(1) if st else "running",
+                    "command": str(args.get("command") or ""),
+                    "tool": name,
+                },
+            )
 
         self._ingest_workspace_fact(name, args, content)
         self._emit_coherence_tool_events(name, args, content)
 
-        if not content.startswith("ERROR"):
+        blocked_result = _is_blocker_result(content)
+        if not blocked_result:
             if name in ("write_file", "str_replace", "delete_file"):
                 self._turn_mutated = True
             if name == "verify_run":
@@ -253,7 +413,7 @@ class AgentExecuteMixin:
                 "name": name,
                 "args": args,
                 "call_id": call_id,
-                "ok": not content.startswith("ERROR"),
+                "ok": not blocked_result,
                 "preview": safe_clip(content, 400),
                 "result": safe_clip(content, 12_000, ellipsis="\n…[truncated]")
                 if len(content) > 12_000
@@ -266,6 +426,7 @@ class AgentExecuteMixin:
             "tool_call_id": call_id,
             "name": name,
             "content": content,
+            "ts": time.time(),
         }
 
     def _emit_coherence_tool_events(

@@ -95,6 +95,7 @@ export type ComposerBarProps = {
   onSwitchModelRole: (role: ModelRole, providerId: string, modelId: string) => void;
   gitRefreshKey?: number;
   sessionId?: string | null;
+  workspace?: string | null;
   onOpenReview?: () => void;
 };
 
@@ -147,6 +148,7 @@ export function ComposerBar({
   onSwitchModelRole,
   gitRefreshKey = 0,
   sessionId = null,
+  workspace = null,
   onOpenReview,
 }: ComposerBarProps) {
   const hunkPatchRef = useRef<Record<string, unknown> | null>(null);
@@ -313,6 +315,7 @@ export function ComposerBar({
               t={t}
               refreshKey={gitRefreshKey}
               sessionId={sessionId}
+              workspace={workspace}
               onOpenReview={onOpenReview}
             />
             <div className="composer-input-inner">

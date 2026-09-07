@@ -14,16 +14,16 @@ src/sessions/*
 src/data/fs_undo/
 src/memory/**
 !src/memory/MEMORY.md
-
 src/workspace/**
 !src/workspace/.gitkeep
 
 # Legacy / accidental runtime root (never commit)
 backend/
 
-# User-installed skills (keep only the placeholder)
-src/skills/**
-!src/skills/.gitkeep
+# Per-user installed skills live under src/data/tenants/ (ignored above).
+# Bundled seed skills in src/skills are committed.
+_vendor_skills/
+_vendor_superpowers/
 
 # Python
 __pycache__/
@@ -47,9 +47,11 @@ frontend/
 desktop/node_modules/
 desktop/dist/
 
-# Windows offline installer payload (rebuilt by scripts/build-windows.ps1)
+# Offline installer payloads (rebuilt by scripts/build-windows.ps1 / build-kylin.sh)
 packaging/windows/cache/
 packaging/windows/payload/
+packaging/kylin/cache/
+packaging/kylin/payload/
 
 # Local Python interpreter tip (machine-specific)
 .sidekick-python

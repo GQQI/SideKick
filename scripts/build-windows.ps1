@@ -1,4 +1,4 @@
-#Requires -Version 5.1
+﻿#Requires -Version 5.1
 <#
 .SYNOPSIS
   Build a fully offline Windows installer (NSIS .exe) and portable zip.
@@ -175,22 +175,75 @@ function Invoke-QuietExitCode {
 function Test-BundledPythonOk {
   $py = Join-Path $PythonDir "python.exe"
   if (-not (Test-Path -LiteralPath $py)) { return $false }
-  $code = Invoke-QuietExitCode { & $py -c "import fastapi, uvicorn, playwright" }
-  return ($code -eq 0)
+  # pydantic_core is the actual compiled DLL that tends to break (stale
+  # cached wheel, antivirus stripping a file, ABI mismatch) - import it
+  # explicitly instead of only the pure-Python fastapi/uvicorn wrappers,
+  # which can appear to "pass" a shallow check while the real import chain
+  # is broken (this is exactly what caused installed .exe to crash with
+  # "DLL load failed while importing _pydantic_core").
+  $savedHome = $env:PYTHONHOME
+  $savedPath = $env:PYTHONPATH
+  Remove-Item Env:PYTHONHOME -ErrorAction SilentlyContinue
+  Remove-Item Env:PYTHONPATH -ErrorAction SilentlyContinue
+  try {
+    $code = Invoke-QuietExitCode { & $py -c "import encodings, fastapi, uvicorn, playwright, pydantic_core" }
+    return ($code -eq 0)
+  } finally {
+    if ($null -ne $savedHome) { $env:PYTHONHOME = $savedHome }
+    if ($null -ne $savedPath) { $env:PYTHONPATH = $savedPath }
+  }
 }
 
-function Enable-EmbeddableSite {
-  $pth = Get-ChildItem -LiteralPath $PythonDir -Filter "python*._pth" | Select-Object -First 1
-  if (-not $pth) { throw "python*._pth not found in $PythonDir" }
-  $text = Get-Content -LiteralPath $pth.FullName -Raw -Encoding ASCII
-  $text = $text -replace '(?m)^#\s*import site\s*$', 'import site'
-  if ($text -notmatch '(?m)^import site\s*$') {
-    $text = $text.TrimEnd() + "`r`nimport site`r`n"
+function Get-EmbedStdlibZip {
+  Get-ChildItem -LiteralPath $PythonDir -File -ErrorAction SilentlyContinue |
+    Where-Object { $_.Name -match '^python\d+\.zip$' } |
+    Select-Object -First 1
+}
+
+function Write-EmbedPth {
+  $zip = Get-EmbedStdlibZip
+  if (-not $zip) { throw "pythonXX.zip not found in $PythonDir" }
+  $pthPath = Join-Path $PythonDir ([IO.Path]::ChangeExtension($zip.Name, "._pth"))
+  # Isolated-mode search path. "Lib" is the unpacked stdlib so encodings is
+  # found even if pythonXX.zip is stripped by antivirus after install.
+  $content = (@(
+    "Lib"
+    $zip.Name
+    "Lib\site-packages"
+    "import site"
+  ) -join "`r`n") + "`r`n"
+  $utf8 = New-Object System.Text.UTF8Encoding $false
+  [System.IO.File]::WriteAllText($pthPath, $content, $utf8)
+  Write-Host ("  wrote {0}" -f (Split-Path -Leaf $pthPath))
+}
+
+function Expand-EmbedStdlib {
+  $zip = Get-EmbedStdlibZip
+  if (-not $zip) { throw "pythonXX.zip not found in $PythonDir" }
+  $lib = Join-Path $PythonDir "Lib"
+  Ensure-Dir $lib
+  $marker = Join-Path $lib "encodings"
+  if (Test-Path -LiteralPath $marker) {
+    Write-Host "  stdlib already unpacked: $marker"
+    return
   }
-  if ($text -notmatch 'Lib\\site-packages') {
-    $text = $text -replace '(?m)^import site\s*$', "Lib\site-packages`r`nimport site"
+  Write-Host ("  extracting {0} into Lib (stdlib on disk, not zip-only)" -f $zip.Name)
+  $tmp = Join-Path $CacheDir "python-stdlib-extract"
+  if (Test-Path -LiteralPath $tmp) { Remove-Item -LiteralPath $tmp -Recurse -Force }
+  New-Item -ItemType Directory -Path $tmp | Out-Null
+  Add-Type -AssemblyName System.IO.Compression.FileSystem
+  [System.IO.Compression.ZipFile]::ExtractToDirectory($zip.FullName, $tmp)
+  Invoke-RobocopySafe -From $tmp -To $lib
+  Remove-Item -LiteralPath $tmp -Recurse -Force -ErrorAction SilentlyContinue
+  if (-not (Test-Path -LiteralPath $marker)) {
+    throw ("failed to extract encodings from {0}" -f $zip.Name)
   }
-  [System.IO.File]::WriteAllText($pth.FullName, $text.TrimEnd() + "`r`n")
+}
+
+function Initialize-EmbeddablePythonLayout {
+  Write-EmbedPth
+  Expand-EmbedStdlib
+  Ensure-Dir (Join-Path $PythonDir "Lib\site-packages")
 }
 
 function Install-EmbeddablePython {
@@ -207,16 +260,31 @@ function Install-EmbeddablePython {
   }
   Ensure-Dir $PythonDir
   Expand-Archive -LiteralPath $zip -DestinationPath $PythonDir -Force
-  Enable-EmbeddableSite
-  Ensure-Dir (Join-Path $PythonDir "Lib\site-packages")
+  Initialize-EmbeddablePythonLayout
 
   $py = Join-Path $PythonDir "python.exe"
   $req = Join-Path $RepoRoot "requirements.txt"
   $ok = Invoke-PipInstall -EmbedPy $py -Requirements $req
   if (-not $ok) { throw "failed to install Python packages into bundled runtime" }
 
-  & $py -c "import fastapi, uvicorn, playwright; print('python runtime ok')"
-  if ($LASTEXITCODE -ne 0) { throw "bundled Python import check failed" }
+  # Explicitly test pydantic_core (the compiled DLL most likely to be broken
+  # by a stale pip cache, an ABI/arch mismatch, or antivirus stripping a
+  # file during extraction) and print where it actually loaded from, so a
+  # future "DLL load failed" only shows up here — at build time — instead of
+  # after install on the target machine.
+  & $py -c "import fastapi, uvicorn, playwright, pydantic_core; print('python runtime ok'); print('pydantic_core:', pydantic_core.__file__)"
+  if ($LASTEXITCODE -ne 0) {
+    Write-Host "  pydantic_core import failed — forcing a clean reinstall (no cache) and retrying..." -ForegroundColor Yellow
+    & $py -m pip uninstall -y pydantic pydantic-core 2>$null | Out-Null
+    & $py -m pip install --no-cache-dir --force-reinstall -r $req --index-url (Get-PipIndex)
+    & $py -c "import fastapi, uvicorn, playwright, pydantic_core; print('python runtime ok (after clean reinstall)')"
+    if ($LASTEXITCODE -ne 0) {
+      throw ("bundled Python import check failed even after a clean reinstall. " +
+        "This is almost always antivirus quarantining/stripping a DLL under " +
+        "'$PythonDir\Lib\site-packages\pydantic_core' during extraction, or a 32/64-bit " +
+        "mismatch. Add an antivirus exclusion for '$PythonDir' and re-run with -Force.")
+    }
+  }
 }
 
 function Copy-AppPayload {
@@ -297,14 +365,50 @@ function Build-Ui {
   }
 }
 
+function Stop-SidekickBuildLockers {
+  # Product exe name is 3 CJK chars; built from codepoints so this file stays ASCII-safe for PS 5.1.
+  $productProc = -join @([char]0x9A6D, [char]0x5929, [char]0x72FC)
+  $names = @("electron", "yutianlang", "app-builder", $productProc)
+  foreach ($name in $names) {
+    Get-Process -Name $name -ErrorAction SilentlyContinue | ForEach-Object {
+      Write-Host ("  stopping PID {0} ({1}) to unlock dist files" -f $_.Id, $_.ProcessName)
+      Stop-Process -Id $_.Id -Force -ErrorAction SilentlyContinue
+    }
+  }
+}
+
+function Remove-TreeRetry([string]$path) {
+  if (-not (Test-Path -LiteralPath $path)) { return }
+  for ($i = 0; $i -lt 6; $i++) {
+    try {
+      Get-ChildItem -LiteralPath $path -Recurse -Force -ErrorAction SilentlyContinue | ForEach-Object {
+        $_.Attributes = "Normal"
+      }
+      Remove-Item -LiteralPath $path -Recurse -Force -ErrorAction Stop
+      return
+    } catch {
+      Start-Sleep -Seconds 1
+    }
+  }
+  Write-Host "  warning: could not fully delete $path (file lock)" -ForegroundColor Yellow
+}
+
+function Test-PathHasNonAscii([string]$path) {
+  foreach ($ch in $path.ToCharArray()) {
+    if ([int][char]$ch -gt 127) { return $true }
+  }
+  return $false
+}
+
 function Build-Installer {
   Write-Step "electron-builder (NSIS + zip)"
   $desktop = Join-Path $RepoRoot "desktop"
+  $dist = Join-Path $desktop "dist"
   if (-not (Test-Path -LiteralPath (Join-Path $Payload "python\python.exe"))) {
-    throw "payload/python missing — runtime was not prepared"
+    throw "payload/python missing - runtime was not prepared"
   }
   if (-not (Test-Path -LiteralPath (Join-Path $Payload "ui\dist\index.html"))) {
-    throw "payload/ui/dist missing — UI was not copied"
+    throw "payload/ui/dist missing - UI was not copied"
   }
   Push-Location $desktop
   try {
@@ -314,13 +418,60 @@ function Build-Installer {
     if (-not $env:ELECTRON_BUILDER_BINARIES_MIRROR) {
       $env:ELECTRON_BUILDER_BINARIES_MIRROR = "https://npmmirror.com/mirrors/electron-builder-binaries/"
     }
+    # Skip Windows code-sign discovery; rcedit/signing often EPERM-locks d3dcompiler_47.dll.
+    if (-not $env:CSC_IDENTITY_AUTO_DISCOVERY) {
+      $env:CSC_IDENTITY_AUTO_DISCOVERY = "false"
+    }
     if (-not (Test-Path -LiteralPath (Join-Path $desktop "node_modules\electron-builder"))) {
-      Write-Host "  npm install (desktop, including electron-builder)"
+      Write-Host "  npm install (desktop / electron-builder)"
       npm install
       if ($LASTEXITCODE -ne 0) { throw "npm install failed in desktop/" }
     }
-    npx electron-builder --win
-    if ($LASTEXITCODE -ne 0) { throw "electron-builder failed ($LASTEXITCODE)" }
+
+    # Unpack Electron under an ASCII path. Defender + a Chinese repo path commonly
+    # yields: EPERM open '...dist\win-unpacked.tmp\d3dcompiler_47.dll'
+    $packOut = $dist
+    if (Test-PathHasNonAscii $dist) {
+      $packOut = Join-Path $env:LOCALAPPDATA "yutianlang-electron-dist"
+      Write-Host "  output dir (ASCII to avoid EPERM on DLL extract): $packOut"
+    }
+
+    Stop-SidekickBuildLockers
+    foreach ($leaf in @("win-unpacked", "win-unpacked.tmp", "win-ia32-unpacked", "win-ia32-unpacked.tmp")) {
+      Remove-TreeRetry (Join-Path $packOut $leaf)
+      if ($packOut -ne $dist) { Remove-TreeRetry (Join-Path $dist $leaf) }
+    }
+
+    $ok = $false
+    $maxAttempts = 3
+    for ($attempt = 1; $attempt -le $maxAttempts; $attempt++) {
+      Write-Host "  electron-builder --win (attempt $attempt/$maxAttempts)"
+      if ($packOut -ne $dist) {
+        npx electron-builder --win "--config.directories.output=$packOut"
+      } else {
+        npx electron-builder --win
+      }
+      if ($LASTEXITCODE -eq 0) {
+        $ok = $true
+        break
+      }
+      Write-Host "  electron-builder failed ($LASTEXITCODE); retrying after unlocking dist..." -ForegroundColor Yellow
+      Stop-SidekickBuildLockers
+      Start-Sleep -Seconds (3 * $attempt)
+      foreach ($leaf in @("win-unpacked", "win-unpacked.tmp")) {
+        Remove-TreeRetry (Join-Path $packOut $leaf)
+      }
+    }
+    if (-not $ok) {
+      throw ("electron-builder failed after {0} attempts. EPERM on d3dcompiler_47.dll is usually Defender/360 locking the unpacked DLL. Close Electron if it is running, add an AV exclusion for '{1}' and '{2}', then re-run scripts\build-windows.bat" -f $maxAttempts, $packOut, $desktop)
+    }
+
+    if ($packOut -ne $dist) {
+      Ensure-Dir $dist
+      Get-ChildItem -LiteralPath $packOut -File -ErrorAction SilentlyContinue | ForEach-Object {
+        Copy-Item -LiteralPath $_.FullName -Destination (Join-Path $dist $_.Name) -Force
+      }
+    }
   } finally {
     Pop-Location
   }
@@ -328,7 +479,7 @@ function Build-Installer {
 
 # ---- main ----
 Write-Host ""
-Write-Host " Sidekick Windows offline installer"
+Write-Host " YuTianLang Windows offline installer"
 Write-Host " ----------------------------------"
 Write-Host " Repo: $RepoRoot"
 Ensure-Dir $CacheDir
@@ -356,6 +507,10 @@ if (-not $SkipRuntime -and $needRuntime) {
 } else {
   Write-Step "Reusing bundled Python"
   Write-Host "  $PythonDir"
+  Initialize-EmbeddablePythonLayout
+  if (-not (Test-BundledPythonOk)) {
+    throw "payload/python failed import check after layout fix; omit -SkipRuntime or pass -Force"
+  }
 }
 
 Copy-AppPayload

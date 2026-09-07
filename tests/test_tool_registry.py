@@ -3,7 +3,9 @@ from __future__ import annotations
 from metateam.runtime.tool_registry import (
     Tool,
     ToolRegistry,
+    missing_required_args,
     plan_parallel_batches,
+    prepare_tool_args,
     skill_tool_name,
 )
 
@@ -31,6 +33,78 @@ def test_plan_parallel_batches_groups_safe() -> None:
     assert [c["id"] for c in batches[0]] == ["read_file", "list_dir"]
     assert [c["id"] for c in batches[1]] == ["write_file"]
     assert [c["id"] for c in batches[2]] == ["read_file"]
+
+
+def test_write_file_aliases_and_nested_payload() -> None:
+    def write_file(path: str, content: str, force_create: bool = False) -> str:
+        return f"{path}:{content}:{force_create}"
+
+    nested = prepare_tool_args(
+        "write_file",
+        write_file,
+        {"file": {"file_path": "docs/a.md", "contents": "hello"}},
+    )
+    assert nested["path"] == "docs/a.md"
+    assert nested["content"] == "hello"
+    assert write_file(**nested) == "docs/a.md:hello:False"
+    deep = prepare_tool_args(
+        "write_file",
+        write_file,
+        {"params": {"file": {"file_path": "docs/b.md", "contents": "world"}}},
+    )
+    assert deep["path"] == "docs/b.md"
+    assert deep["content"] == "world"
+    assert missing_required_args(write_file, {"path": "a.md"}) == ["content"]
+    assert missing_required_args(write_file, {"path": "a.md", "content": ""}) == []
+
+
+def test_encoding_alias_from_charset() -> None:
+    def read_file(path: str, encoding: str = "") -> str:
+        return f"{path}:{encoding}"
+
+    bound = prepare_tool_args(
+        "read_file",
+        read_file,
+        {"path": "a.md", "charset": "gb18030"},
+    )
+    assert bound["path"] == "a.md"
+    assert bound["encoding"] == "gb18030"
+
+
+def test_write_file_arg_error_rejects_incomplete_and_missing() -> None:
+    from metateam.runtime.agent_execute import _tool_arg_error
+
+    def write_file(path: str, content: str, force_create: bool = False) -> str:
+        return "wrote"
+
+    tool = Tool("write_file", "d", {}, write_file)
+    cut_off = _tool_arg_error(
+        "write_file",
+        tool,
+        {"path": "a.md", "content": "partial", "_incomplete": True},
+    )
+    assert cut_off is not None and cut_off.startswith("ERROR")
+    assert "cut off" in cut_off
+    missing = _tool_arg_error("write_file", tool, {"path": "a.md"})
+    assert missing is not None and "content" in missing
+    ok = _tool_arg_error("write_file", tool, {"path": "a.md", "content": "full"})
+    assert ok is None
+
+
+def test_file_blocker_annotation_and_detection() -> None:
+    from metateam.runtime.agent_execute import (
+        _annotate_file_blocker,
+        file_tool_results_blocked,
+    )
+
+    noted = _annotate_file_blocker("read_file", "ERROR: not found: a.md")
+    assert "Do not continue as if this succeeded" in noted
+    assert file_tool_results_blocked(
+        [{"name": "read_file", "content": "WARNING: decoded as gb18030\nbody"}]
+    )
+    assert not file_tool_results_blocked(
+        [{"name": "web_search", "content": "ERROR: network"}]
+    )
 
 
 def test_schemas_hide_mutating_when_disallowed() -> None:

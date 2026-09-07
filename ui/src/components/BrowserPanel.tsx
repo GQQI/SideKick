@@ -3,13 +3,14 @@ import {
   browserClose,
   browserFetchScreenshot,
   browserNavigate,
+  browserPreviewLocal,
   browserSelect,
   browserSelectCancel,
   browserStart,
   browserStatus,
 } from "../api";
 import { parseDomElement, type DomElementPayload } from "../browser/protocol";
-import { sanitizeBrowserUrl } from "../browser/urlDetect";
+import { isLocalPreviewTarget, sanitizeBrowserUrl } from "../browser/urlDetect";
 import { getDesktop, type DesktopBounds } from "../desktopBridge";
 import { usePrefs } from "../prefs";
 import { IconChevronRight, IconRefresh, IconX } from "./icons";
@@ -22,6 +23,13 @@ export type BrowserOpenRequest = {
 type Props = {
   onPickElement: (el: DomElementPayload) => void;
   openRequest?: BrowserOpenRequest | null;
+  /**
+   * True while a modal dialog (Settings, prompts, ...) is open. The live
+   * preview is a native OS-level view painted above the DOM, so a React
+   * modal can never cover it — we must hide it ourselves and restore it
+   * once the dialog closes.
+   */
+  suspended?: boolean;
 };
 
 function readBounds(el: HTMLElement | null): DesktopBounds | null {
@@ -36,12 +44,12 @@ function readBounds(el: HTMLElement | null): DesktopBounds | null {
   };
 }
 
-export function BrowserPanel({ onPickElement, openRequest }: Props) {
+export function BrowserPanel({ onPickElement, openRequest, suspended = false }: Props) {
   const { t } = usePrefs();
   const desktop = getDesktop();
   const live = Boolean(desktop);
 
-  const [url, setUrl] = useState("http://127.0.0.1:5173");
+  const [url, setUrl] = useState("");
   const [sessionUrl, setSessionUrl] = useState("");
   const [available, setAvailable] = useState(true);
   const [message, setMessage] = useState("");
@@ -179,20 +187,39 @@ export function BrowserPanel({ onPickElement, openRequest }: Props) {
 
   async function openTarget(targetRaw: string) {
     const trimmed = targetRaw.trim() || "about:blank";
-    const target =
-      trimmed === "about:blank" ? trimmed : sanitizeBrowserUrl(trimmed) || trimmed;
-    if (trimmed !== "about:blank" && !sanitizeBrowserUrl(trimmed)) {
+    const http =
+      trimmed === "about:blank" ? trimmed : sanitizeBrowserUrl(trimmed);
+    const local = trimmed !== "about:blank" && !http && isLocalPreviewTarget(trimmed);
+    if (trimmed !== "about:blank" && !http && !local) {
       setMessage(`无效地址（已剥离 markdown/中文残留）: ${trimmed}`);
       return;
     }
+    let target = http || trimmed;
     const seq = ++openSeqRef.current;
     setUrl(target);
     setBusy(true);
     setMessage(live ? t("browserOpeningLive") : "");
     try {
+      if (local) {
+        const info = await browserPreviewLocal(trimmed);
+        target = info.url;
+      }
       if (desktop) {
         await showLive();
         await syncBounds();
+        try {
+          const cur = await desktop.browser.getUrl();
+          if (cur && cur !== "about:blank" && sameHttpUrl(cur, target)) {
+            if (seq !== openSeqRef.current) return;
+            setSessionUrl(cur);
+            setUrl(cur);
+            setMessage("");
+            await syncBounds();
+            return;
+          }
+        } catch {
+          /* navigate below */
+        }
         const info = await desktop.browser.navigate(target);
         if (seq !== openSeqRef.current) return;
         setSessionUrl(info.url);
@@ -210,9 +237,23 @@ export function BrowserPanel({ onPickElement, openRequest }: Props) {
         setMessage("");
       }
     } catch (e) {
-      if (seq === openSeqRef.current) {
-        setMessage(e instanceof Error ? e.message : String(e));
+      if (seq !== openSeqRef.current) return;
+      const msg = e instanceof Error ? e.message : String(e);
+      if (desktop && /\(\s*-3\s*\)|ERR_ABORTED/i.test(msg)) {
+        try {
+          const cur = await desktop.browser.getUrl();
+          if (cur && cur !== "about:blank") {
+            setSessionUrl(cur);
+            setUrl(cur);
+            setMessage("");
+            await syncBounds();
+            return;
+          }
+        } catch {
+          /* fall through */
+        }
       }
+      setMessage(msg);
     } finally {
       if (seq === openSeqRef.current) setBusy(false);
     }
@@ -221,6 +262,19 @@ export function BrowserPanel({ onPickElement, openRequest }: Props) {
   async function startOrGo() {
     await openTarget(url);
   }
+
+  // A modal dialog opened above us — the native BrowserView still paints on
+  // top of it, so hide it while the dialog is up and restore afterwards.
+  useEffect(() => {
+    if (!live || !desktop) return;
+    if (suspended) {
+      void desktop.browser.hide();
+      return;
+    }
+    if (sessionUrlRef.current) {
+      void showLive().then(() => void syncBounds());
+    }
+  }, [suspended, live, desktop, showLive, syncBounds]);
 
   useEffect(() => {
     if (!openRequest?.url || !openRequest.nonce) return;
@@ -405,6 +459,24 @@ export function BrowserPanel({ onPickElement, openRequest }: Props) {
       ) : null}
     </div>
   );
+}
+
+function sameHttpUrl(a: string, b: string): boolean {
+  const norm = (raw: string) => {
+    try {
+      const u = new URL(raw);
+      let host = (u.hostname || "").toLowerCase();
+      if (host.startsWith("www.")) host = host.slice(4);
+      let path = u.pathname || "/";
+      if (path.length > 1 && path.endsWith("/")) path = path.slice(0, -1);
+      return `${u.protocol}//${host}${path}${u.search}`;
+    } catch {
+      return String(raw || "").replace(/\/+$/, "");
+    }
+  };
+  const na = norm(a);
+  const nb = norm(b);
+  return Boolean(na && nb && na === nb);
 }
 
 function chipLabelSession(u: string) {

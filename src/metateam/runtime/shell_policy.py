@@ -19,7 +19,9 @@ _LONG_RUNNING_RE = re.compile(
     r"npx\s+serve|"
     r"nodemon\b|"
     r"tail\s+-f|"
-    r"--watch\b"
+    r"--watch\b|"
+    r"torchrun\b|accelerate\s+launch|"
+    r"python\s+\S*(train|finetune|experiment)"
     r")",
     re.I,
 )
@@ -139,3 +141,80 @@ def is_dangerous_shell(command: str) -> bool:
     if _DANGEROUS_SHELL_RE.search(low):
         return True
     return bool(_REMOVE_ITEM_ROOT_RE.search(low))
+
+
+# Leading command of a pipe segment that only reads/lists — never mutates.
+_READONLY_LEAD_RE = re.compile(
+    r"^(?:"
+    r"ls|dir|gci|get-childitem|"
+    r"pwd|get-location|"
+    r"cat|type|gc|get-content|"
+    r"head|tail|"
+    r"find|where|"
+    r"grep|rg|findstr|select-string|"
+    r"echo|write-output|write-host|"
+    r"git\s+(?:status|log|diff|branch|show|remote(?:\s+-v)?)|"
+    r"npm\s+(?:list|ls|outdated|view)|"
+    r"pip\s+(?:list|show|freeze)|"
+    r"(?:python3?|node|npm|pip|git)\s+(?:--version|-v|-V)\b|"
+    r"whoami|hostname|uname|"
+    r"test-path|"
+    r"tree|"
+    r"wc|sort|uniq|more|less"
+    r")\b",
+    re.I,
+)
+
+# Non-leading pipe segments that only reformat/filter — never mutate.
+_READONLY_FILTER_RE = re.compile(
+    r"^(?:"
+    r"select-object|format-table|format-list|sort-object|where-object|measure-object|"
+    r"convertto-json|convertto-csv|out-string|out-host|"
+    r"grep|rg|findstr|select-string|wc|sort|uniq|head|tail|more|less"
+    r")\b",
+    re.I,
+)
+
+# Anywhere in the command — any of these means it can mutate; block outright.
+_MUTATING_ANYWHERE_RE = re.compile(
+    r"(\brm\s|\bdel\s|remove-item|new-item|set-content|add-content|out-file|"
+    r"copy-item|move-item|rename-item|\bmkdir\b|\brmdir\b|\btouch\s|"
+    r"git\s+(?:commit|push|reset|checkout|merge|rebase|apply|clean|add)|"
+    r"npm\s+(?:install|i\s|uninstall|update)|pip\s+(?:install|uninstall)|"
+    r"yarn\s+(?:add|remove)|pnpm\s+(?:add|remove|install)|"
+    r"chmod|chown|\bkill\s|taskkill|shutdown|reboot|\bformat\s|"
+    r"\bdd\b|mkfs|sed\s+-i|"
+    r"set-location|\bcd\s"
+    r")",
+    re.I,
+)
+
+
+def is_readonly_shell_command(command: str) -> bool:
+    """Conservative allowlist: true only for commands that cannot mutate anything.
+
+    Used to let the agent inspect the workspace with ``run_shell`` (e.g. a
+    directory listing) during plan-prep / explore-only phases, the same way
+    ``list_dir``/``read_file`` are already allowed there.
+    """
+    text = (command or "").strip()
+    if not text or ">" in text:
+        return False
+    if _MUTATING_ANYWHERE_RE.search(text):
+        return False
+    statements = re.split(r"[;\n]|&&|\|\|", text)
+    for stmt in statements:
+        stmt = stmt.strip()
+        if not stmt:
+            continue
+        segments = stmt.split("|")
+        for i, seg in enumerate(segments):
+            seg = seg.strip()
+            if not seg:
+                return False
+            if _READONLY_LEAD_RE.match(seg):
+                continue
+            if i > 0 and _READONLY_FILTER_RE.match(seg):
+                continue
+            return False
+    return True

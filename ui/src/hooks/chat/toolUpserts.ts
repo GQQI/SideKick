@@ -6,6 +6,10 @@ import { seedDelegateCanvas } from "./canvasSync";
 
 export type ToolUpsertCtx = {
   sealStreamBubble: () => void;
+  /** Seal only if the bubble already has text/reasoning; otherwise keep it
+   * open so reasoning that streams AFTER the first tool-arg delta still lands
+   * in the bubble above the tool chip instead of being dropped. */
+  sealStreamBubbleIfContent: () => void;
   findToolMsg: (opts: {
     callId?: string;
     name?: string;
@@ -89,7 +93,10 @@ function revealWriteFileDetail(
 }
 
 export function upsertToolStart(ev: RuntimeEvent, ctx: ToolUpsertCtx) {
-  ctx.sealStreamBubble();
+  // Seal thinking/text that already arrived, but never wipe a reasoning bubble
+  // that was mid-stream (sealStreamBubbleIfContent keeps empty openers for late
+  // reasoning; sealStreamBubble would delete them and the "思考" vanishes).
+  ctx.sealStreamBubbleIfContent();
   const callId = String(ev.data.call_id || uid());
   const name = String(ev.data.name || "tool");
   const pending = Boolean(ev.data.needs_approval);
@@ -162,11 +169,12 @@ export function upsertToolDelta(ev: RuntimeEvent, ctx: ToolUpsertCtx) {
     : undefined;
   const active = existing || delegateExisting;
 
-  // Seal the assistant bubble only once when tool streaming *starts*.
-  // Sealing on every tool_call_delta breaks models that interleave content
-  // tokens with argument deltas — each content token became its own bubble.
+  // Seal the assistant bubble only once when tool streaming *starts*, and
+  // only if it already holds text/reasoning. Sealing an EMPTY bubble removed
+  // it, and reasoning that streamed after the first arg delta then re-opened
+  // a new bubble BELOW the tool chip (or was lost) — "thinking not shown".
   if (!active?.tool) {
-    ctx.sealStreamBubble();
+    ctx.sealStreamBubbleIfContent();
   }
 
   const summary = formatToolSummary(name || active?.tool?.name || "", args);

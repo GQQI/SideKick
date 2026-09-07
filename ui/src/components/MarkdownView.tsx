@@ -4,7 +4,7 @@ import remarkGfm from "remark-gfm";
 import rehypeHighlight from "rehype-highlight";
 import mermaid from "mermaid";
 import "highlight.js/styles/github.css";
-import { prepMarkdownForUrls, sandboxUrlGesture, sanitizeBrowserUrl, splitDirtyUrlLabel, splitTextWithUrls } from "../browser/urlDetect";
+import { isLocalPreviewTarget, localPreviewPath, prepMarkdownForUrls, sandboxUrlGesture, sanitizeBrowserUrl, splitDirtyUrlLabel, splitTextWithUrls } from "../browser/urlDetect";
 
 mermaid.initialize({
   startOnLoad: false,
@@ -174,25 +174,33 @@ export function MarkdownView({ content, streaming, onCtrlClickUrl }: Props) {
       a({ href, children }: { href?: string; children?: ReactNode }) {
         const childStr = nodeText(children);
         const split = splitDirtyUrlLabel(childStr);
-        const clean = sanitizeBrowserUrl(href || "") || split?.href || "";
+        const localRaw = [href || "", childStr].find((x) => isLocalPreviewTarget(x)) || "";
+        const local = localRaw ? localPreviewPath(localRaw) : "";
+        const http = sanitizeBrowserUrl(href || "") || split?.href || "";
+        const target = local || http;
 
-        // Label contains an http(s) URL (often with ** / CJK glued on): link only the URL.
-        if (clean && split && /https?:\/\//i.test(childStr)) {
+        const intercept = (e: { ctrlKey: boolean; metaKey: boolean; clientX: number; clientY: number; preventDefault: () => void; stopPropagation: () => void }, mode: "click" | "contextmenu") => {
+          if (target && sandboxUrlGesture(target, e, onCtrlClickUrl, { mode })) return;
+          // Relative report.html must never navigate the Sidekick shell (8787 SPA).
+          if (local || (href && !/^https?:\/\//i.test(href))) {
+            e.preventDefault();
+            e.stopPropagation();
+            if (local && onCtrlClickUrl) onCtrlClickUrl(local, e.clientX, e.clientY);
+          }
+        };
+
+        if (http && split && /https?:\/\//i.test(childStr)) {
           return (
             <>
               {split.before}
               <a
-                href={clean}
+                href={http}
                 target="_blank"
                 rel="noreferrer"
                 className="sandbox-hot-link"
                 title={LINK_TITLE}
-                onClick={(e) => {
-                  sandboxUrlGesture(clean, e, onCtrlClickUrl, { mode: "click" });
-                }}
-                onContextMenu={(e) => {
-                  sandboxUrlGesture(clean, e, onCtrlClickUrl, { mode: "contextmenu" });
-                }}
+                onClick={(e) => intercept(e, "click")}
+                onContextMenu={(e) => intercept(e, "contextmenu")}
               >
                 {split.text}
               </a>
@@ -203,17 +211,13 @@ export function MarkdownView({ content, streaming, onCtrlClickUrl }: Props) {
 
         return (
           <a
-            href={clean || href}
+            href={http || "#"}
             target="_blank"
             rel="noreferrer"
-            className={clean ? "sandbox-hot-link" : undefined}
-            title={clean ? LINK_TITLE : undefined}
-            onClick={(e) => {
-              if (clean) sandboxUrlGesture(clean, e, onCtrlClickUrl, { mode: "click" });
-            }}
-            onContextMenu={(e) => {
-              if (clean) sandboxUrlGesture(clean, e, onCtrlClickUrl, { mode: "contextmenu" });
-            }}
+            className={target ? "sandbox-hot-link" : undefined}
+            title={target ? LINK_TITLE : undefined}
+            onClick={(e) => intercept(e, "click")}
+            onContextMenu={(e) => intercept(e, "contextmenu")}
           >
             {children}
           </a>

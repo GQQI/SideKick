@@ -2,6 +2,9 @@ const { contextBridge, ipcRenderer } = require("electron");
 
 contextBridge.exposeInMainWorld("sidekickDesktop", {
   isDesktop: true,
+  workspace: {
+    pickFolder: (opts) => ipcRenderer.invoke("workspace:pickFolder", opts || {}),
+  },
   browser: {
     show: (bounds) => ipcRenderer.invoke("browser:show", bounds),
     hide: () => ipcRenderer.invoke("browser:hide"),

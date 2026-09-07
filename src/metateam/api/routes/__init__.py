@@ -2,11 +2,12 @@
 
 from fastapi import FastAPI
 
-from . import auth, browser, chat, files, git, sessions, system, workspaces
+from . import auth, browser, chat, files, git, sessions, shell_jobs, skills, system, workspaces
 
 
 def register_routes(app: FastAPI) -> None:
     app.include_router(system.router)
+    app.include_router(skills.router)
     app.include_router(auth.router)
     app.include_router(workspaces.router)
     app.include_router(files.router)
@@ -14,3 +15,4 @@ def register_routes(app: FastAPI) -> None:
     app.include_router(sessions.router)
     app.include_router(chat.router)
     app.include_router(browser.router)
+    app.include_router(shell_jobs.router)

@@ -9,20 +9,30 @@ from fastapi import APIRouter, HTTPException
 from ...runtime.context import context_budget_tokens, messages_tokens, schemas_tokens
 from ...services.store import STORE
 from ..http import require_session
-from ..schemas import ApprovalDecision, AskAnswer, PlanConfirm, ReplayBody, TruncateBody
+from ..schemas import ApprovalDecision, AskAnswer, PlanConfirm, ReplayBody, SessionCreate, TruncateBody
 
 router = APIRouter(tags=["sessions"])
 
 
 @router.get("/api/sessions")
-def list_sessions(page: int = 1, page_size: int = 20) -> dict[str, Any]:
-    return STORE.list(page=page, page_size=page_size)
+def list_sessions(
+    page: int = 1, page_size: int = 20, workspace: str | None = None
+) -> dict[str, Any]:
+    return STORE.list(page=page, page_size=page_size, workspace=workspace)
 
 
 @router.post("/api/sessions")
-def create_session() -> dict[str, Any]:
-    sess = STORE.create()
-    return {"id": sess.id, "demo": sess.agent.settings.demo_mode}
+def create_session(body: SessionCreate = SessionCreate()) -> dict[str, Any]:
+    try:
+        sess = STORE.create(workspace=body.workspace or None)
+    except ValueError as exc:
+        raise HTTPException(400, str(exc)) from exc
+    ws = str(getattr(sess.agent.settings, "workspace", "") or "")
+    return {
+        "id": sess.id,
+        "demo": sess.agent.settings.demo_mode,
+        "workspace": {"path": ws, "name": ws.rsplit("/", 1)[-1].rsplit("\\", 1)[-1]} if ws else None,
+    }
 
 
 @router.get("/api/sessions/{session_id}")
@@ -34,9 +44,11 @@ def get_session(session_id: str) -> dict[str, Any]:
     # The in-memory agent knows about workers already spawned in this turn.
     # Prefer it over the prior persisted tree while a stopped worker unwinds.
     live_tree = sess.agent.canvas_tree()
+    ws = str(getattr(sess.agent.settings, "workspace", "") or "")
     return {
         "id": sess.id,
         "title": sess.title,
+        "workspace": {"path": ws, "name": ws.rsplit("/", 1)[-1].rsplit("\\", 1)[-1]} if ws else None,
         "messages": STORE.ui_messages(sess),
         "tokens": budget,
         "messages_tokens": messages_tokens(sess.agent.messages),

@@ -91,9 +91,6 @@ export function useDialogs(deps: DialogsDeps) {
     onNewChat,
   } = deps;
 
-  const applySeq = useRef(0);
-  const switchSeq = useRef(0);
-
   const openSettings = useCallback(
     (tab: SettingsTab = "workspace") => {
       setSettingsTab(tab);
@@ -106,17 +103,15 @@ export function useDialogs(deps: DialogsDeps) {
     async (next?: ModelSetup, opts?: { restartChat?: boolean }) => {
       const cfg = next ?? model;
       if (!cfg) return;
-      const seq = ++applySeq.current;
       setModelSaving(true);
       try {
         const res = await saveModel({ ...cfg, version: 3 });
-        if (seq !== applySeq.current) return;
         setModel(res.config);
         setHealth(await fetchHealth());
         setToast(res.note);
         if (opts?.restartChat) await onNewChat();
       } finally {
-        if (seq === applySeq.current) setModelSaving(false);
+        setModelSaving(false);
       }
     },
     [model, setModelSaving, setModel, setHealth, setToast, onNewChat],
@@ -133,20 +128,17 @@ export function useDialogs(deps: DialogsDeps) {
         ...(role === "subagent" ? { compress: ref } : {}),
       };
       setModel(optimistic);
-      const seq = ++switchSeq.current;
       setModelSaving(true);
       try {
         const res = await saveModel({ ...optimistic, version: 3 });
-        if (seq !== switchSeq.current) return;
         setModel(res.config);
         setHealth(await fetchHealth());
         setToast(res.note);
       } catch (e) {
-        if (seq !== switchSeq.current) return;
         setModel(snapshot);
         setToast(e instanceof Error ? e.message : String(e));
       } finally {
-        if (seq === switchSeq.current) setModelSaving(false);
+        setModelSaving(false);
       }
     },
     [model, setModel, setModelSaving, setHealth, setToast],
@@ -161,7 +153,7 @@ export function useDialogs(deps: DialogsDeps) {
       confirmLabel: "保存",
       run: async () => {
         if (!detail || detail.type !== "file") return;
-        await writeFileContent(detail.path, detail.content);
+        await writeFileContent(detail.path, detail.content, detail.workspace);
         setDetail({ ...detail, dirty: false });
         setFsRefresh((n) => n + 1);
         setToast(`已保存 ${detail.path}`);
@@ -171,25 +163,28 @@ export function useDialogs(deps: DialogsDeps) {
 
   const resolveApproval = useCallback(
     async (approved: boolean, remember = false, patchArgs?: Record<string, unknown>) => {
-      if (!approval || !sessionId) return;
+      if (!approval) return;
+      const sid = sessionIdRef.current || sessionId;
+      if (!sid) {
+        setToast("会话未就绪，请稍后重试。");
+        return;
+      }
       const id = approval.approvalId;
       const toolName = approval.name;
+      const snapshot = approval;
       setApproval(null);
       try {
-        await decideApproval(sessionId, id, approved, remember, approved ? patchArgs : undefined);
+        await decideApproval(sid, id, approved, remember, approved ? patchArgs : undefined);
         if (!approved) setToast(t("approvalRejected"));
         else if (remember) setToast(t("approvalApprovedClass", toolName));
         else setToast(t("approvalApproved"));
       } catch (e) {
         const msg = e instanceof Error ? e.message : String(e);
-        if (/not found|already resolved/i.test(msg)) {
-          if (!approved) setToast("已取消待确认操作");
-          return;
-        }
+        setApproval(snapshot);
         setToast(msg);
       }
     },
-    [approval, sessionId, setApproval, setToast, t],
+    [approval, sessionId, sessionIdRef, setApproval, setToast, t],
   );
 
   const resolveAsk = useCallback(

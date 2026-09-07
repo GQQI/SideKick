@@ -11,6 +11,7 @@ from __future__ import annotations
 import copy
 import json
 import os
+import re
 import secrets
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -56,6 +57,16 @@ def _config_path() -> Path:
 
 # Back-compat alias (legacy global path)
 CONFIG_PATH = ROOT / "data" / "model.json"
+
+# Sentinel ref for "Auto" — pick the best configured model per task (see
+# auto_pick_ref below). Stored in model.json like any other ModelRef so it
+# survives save/reload; only resolved to a concrete model at request time.
+AUTO_ID = "auto"
+
+
+def is_auto_ref(ref: "ModelRef | None") -> bool:
+    return bool(ref) and (ref.provider_id == AUTO_ID or ref.model_id == AUTO_ID)
+
 
 VENDOR_TEMPLATES: dict[str, dict[str, Any]] = {
     "custom": {
@@ -216,6 +227,20 @@ class ModelSetup:
         _, model, base_url, _ = self.resolve(self.main)
         _, sub_model, _, _ = self.resolve(self.subagent)
         _, compress_model, _, _ = self.resolve(self.compress)
+
+        def _auto_preview(role_ref: ModelRef, resolved_name: str) -> str:
+            """When a role is 'Auto' and unresolved, show what it would pick right now."""
+            if resolved_name or not is_auto_ref(role_ref):
+                return resolved_name
+            preview = auto_pick_ref(self, "")
+            if not preview:
+                return resolved_name
+            _, entry = self.find_entry(preview)
+            return entry.name if entry else resolved_name
+
+        model = _auto_preview(self.main, model)
+        sub_model = _auto_preview(self.subagent, sub_model)
+        compress_model = _auto_preview(self.compress, compress_model)
         d["model"] = model
         d["subagent_model"] = sub_model or model
         d["compress_model"] = compress_model or sub_model or model
@@ -229,6 +254,116 @@ class ModelSetup:
 
 # --- Back-compat alias used by older imports ---
 ModelConfig = ModelSetup
+
+
+# --- "Auto" model selection (heuristic, not a real router) ---
+#
+# Cursor-style "pick the best model for this task" without any extra network
+# call: classify the task text locally, then rank the user's *already keyed*
+# models by a name-based power tier and take the closest match. Good enough to
+# stop always burning the flagship model on "翻译这句话" style asks; nowhere
+# near a real capability-aware router, but it degrades safely (falls back to
+# the first keyed model — see apply_to_settings) when nothing matches.
+
+_FAST_MODEL_MARKERS = (
+    "mini", "flash", "lite", "turbo", "haiku", "nano", "small", "fast",
+    "instant", "8b", "7b", "3b", "1.5b", "4b", "2b",
+)
+_POWER_MODEL_MARKERS = (
+    "o1", "o3", "o4", "gpt-5", "gpt-4.5", "gpt-4.1", "opus", "claude-3.7",
+    "claude-4", "deepseek-r1", "deepseek-v3", "gemini-2.5-pro", "gemini-2-pro",
+    "gemini-1.5-pro", "qwen-max", "qwen3-max", "qwen2.5-max", "glm-4.6",
+    "glm-4-plus", "kimi-k2", "minimax-m2", "minimax-m3", "grok-4", "grok-3",
+    "ultra", "480b", "236b", "685b",
+)
+
+
+def _model_power_tier(name: str) -> int:
+    """1=fast/cheap, 2=balanced, 3=flagship — guessed from the model name only."""
+    n = (name or "").lower()
+    if any(mk in n for mk in _FAST_MODEL_MARKERS):
+        return 1
+    if any(mk in n for mk in _POWER_MODEL_MARKERS):
+        return 3
+    return 2
+
+
+_COMPLEX_TASK_RE = re.compile(
+    r"(重构|架构|设计模式|debug|调试|排查|故障|性能优化|优化性能|完整实现|完整的项目|"
+    r"整个项目|多个文件|端到端|深入分析|系统性|全面重写|大型|综合|全部文件|所有文件|"
+    r"refactor|architect(?:ure)?|end-to-end|comprehensive|entire project|"
+    r"multiple files|deep dive)",
+    re.IGNORECASE,
+)
+_SIMPLE_TASK_RE = re.compile(
+    r"^(翻译|总结|摘要|润色|校对|改写|重写一句|简单问一下|solve|translate|summarize|"
+    r"define|what is|explain briefly)",
+    re.IGNORECASE,
+)
+_CODE_HINT_RE = re.compile(r"```|\bdef \b|\bclass \w+|function\s*\(|=>|#include|import [a-zA-Z_]")
+
+_TIER_BY_COMPLEXITY = {"simple": 1, "medium": 2, "complex": 3}
+
+
+def _task_complexity(text: str) -> str:
+    t = (text or "").strip()
+    if not t:
+        return "simple"
+    length = len(t)
+    if _CODE_HINT_RE.search(t) or _COMPLEX_TASK_RE.search(t) or length > 400:
+        return "complex"
+    if _SIMPLE_TASK_RE.search(t) or length < 60:
+        return "simple"
+    return "medium"
+
+
+def auto_pick_ref(
+    setup: ModelSetup, task_text: str, *, force_tier: int | None = None
+) -> ModelRef | None:
+    """Best-effort 'Auto' pick among the user's keyed models for this task."""
+    candidates = [
+        (p, m) for p in setup.providers for m in p.models if (m.api_key or "").strip()
+    ]
+    if not candidates:
+        return None
+    tier = force_tier if force_tier is not None else _TIER_BY_COMPLEXITY[_task_complexity(task_text)]
+
+    def score(pair: tuple[ModelProvider, ModelEntry]) -> tuple[int, int]:
+        _, entry = pair
+        return (abs(_model_power_tier(entry.name) - tier), -len(entry.name or ""))
+
+    best_provider, best_entry = min(candidates, key=score)
+    return ModelRef(provider_id=best_provider.id, model_id=best_entry.id)
+
+
+def resolve_setup_for_task(setup: ModelSetup, task_text: str) -> ModelSetup:
+    """Copy of `setup` with any 'Auto' role resolved to a concrete pick for this task."""
+    if not (is_auto_ref(setup.main) or is_auto_ref(setup.subagent) or is_auto_ref(setup.compress)):
+        return setup
+    resolved = copy.deepcopy(setup)
+    if is_auto_ref(resolved.main):
+        resolved.main = auto_pick_ref(setup, task_text) or setup.main
+    if is_auto_ref(resolved.subagent):
+        resolved.subagent = auto_pick_ref(setup, task_text) or setup.subagent
+    if is_auto_ref(resolved.compress):
+        # Compression summaries are cheap busywork — bias toward the fastest keyed model.
+        resolved.compress = (
+            auto_pick_ref(setup, task_text, force_tier=1) or resolved.subagent or setup.compress
+        )
+    return resolved
+
+
+def apply_auto_for_task(settings: Any, task_text: str, cfg: ModelSetup | None = None) -> bool:
+    """Re-apply model config onto `settings`, resolving any 'Auto' role for this task.
+
+    Returns True when something was Auto (caller should rebuild its LLM clients).
+    Never persisted — Auto's pick is per-turn; model.json keeps the 'auto' ref.
+    """
+    cfg = cfg or load_model_config()
+    if not (is_auto_ref(cfg.main) or is_auto_ref(cfg.subagent) or is_auto_ref(cfg.compress)):
+        return False
+    apply_to_settings(settings, resolve_setup_for_task(cfg, task_text))
+    return True
 
 
 def _parse_ref(raw: Any) -> ModelRef:
@@ -376,6 +511,8 @@ def _ensure_refs(setup: ModelSetup) -> None:
     )
 
     def fix(ref: ModelRef) -> ModelRef:
+        if is_auto_ref(ref):
+            return ref
         prov, entry = setup.find_entry(ref)
         if entry:
             return ref
@@ -427,6 +564,8 @@ def _read_setup(path: Path) -> ModelSetup | None:
 def _setup_main_key(setup: ModelSetup | None) -> str:
     if not setup:
         return ""
+    if is_auto_ref(setup.main):
+        return "auto" if setup.any_key_set() else ""
     return (setup.resolve(setup.main)[3] or "").strip()
 
 
@@ -613,6 +752,19 @@ def update_model_config(patch: dict[str, Any]) -> ModelSetup:
 
 def select_model_role(role: str, provider_id: str, model_id: str) -> ModelSetup:
     cfg = load_model_config()
+    if provider_id == AUTO_ID or model_id == AUTO_ID:
+        ref = ModelRef(provider_id=AUTO_ID, model_id=AUTO_ID)
+        if role == "main":
+            cfg.main = ref
+        elif role == "subagent":
+            cfg.subagent = ref
+            cfg.compress = ModelRef(AUTO_ID, AUTO_ID)
+        elif role == "compress":
+            cfg.compress = ref
+        else:
+            raise ValueError(f"unknown role: {role}")
+        save_model_config(cfg)
+        return cfg
     ref = ModelRef(provider_id=provider_id, model_id=model_id)
     prov, entry = cfg.find_entry(ref)
     if not entry:

@@ -9,6 +9,7 @@ from pathlib import Path
 from typing import Any
 
 from ..core.pathutil import path_outside_workspace
+from .shell_policy import is_dangerous_shell
 
 
 @dataclass
@@ -26,7 +27,9 @@ class ApprovalGate:
 
     ``_allowed_tools`` holds remember-keys for the current agent turn
     (cleared via ``begin_turn``). File ops outside the workspace share
-    ``outside_workspace`` so a single 「本轮记住」covers later out-of-tree reads/writes.
+    ``outside_workspace``; shell commands that mention outside paths share
+    ``shell_outside_workspace``; drive/home-root deletes share
+    ``dangerous_shell``. A single 「本轮记住」covers later same-scope calls.
     """
 
     def __init__(self, timeout_sec: float = 300.0) -> None:
@@ -160,6 +163,7 @@ APPROVAL_TOOLS = {
     "browser_navigate",
     "browser_click",
     "browser_type",
+    "browser_press_key",
 }
 
 # File tools that take a path and may escape the workspace.
@@ -174,6 +178,9 @@ FILE_PATH_TOOLS = frozenset(
     }
 )
 OUTSIDE_WORKSPACE_SCOPE = "outside_workspace"
+SHELL_COMMAND_TOOLS = frozenset({"run_shell", "verify_run"})
+SHELL_OUTSIDE_SCOPE = "shell_outside_workspace"
+DANGEROUS_SHELL_SCOPE = "dangerous_shell"
 
 
 def _tool_path_arg(args: dict[str, Any] | None) -> str:
@@ -181,18 +188,37 @@ def _tool_path_arg(args: dict[str, Any] | None) -> str:
     return str(rec.get("path") or rec.get("dir") or "").strip()
 
 
+def _command_outside_workspace(
+    args: dict[str, Any] | None,
+    workspace: Path | str,
+) -> bool:
+    cmd = str((args if isinstance(args, dict) else {}).get("command") or "").strip()
+    if not cmd:
+        return False
+    from ..services.shell_sandbox import ShellSandboxPolicy, outside_shell_paths
+
+    ws = Path(workspace)
+    policy = ShellSandboxPolicy.for_workspace(ws)
+    return bool(outside_shell_paths(cmd, cwd=ws, policy=policy))
+
+
 def approval_scope(
     name: str,
     args: dict[str, Any] | None = None,
     workspace: Path | str | None = None,
 ) -> str:
-    """Remember-key for this call. Outside-workspace file ops share one scope."""
+    """Remember-key for this call. Outside file/shell ops have their own scopes."""
     tool_name = (name or "").strip()
     root = str(workspace or "").strip()
+    rec = args if isinstance(args, dict) else {}
+    if tool_name in SHELL_COMMAND_TOOLS and is_dangerous_shell(str(rec.get("command") or "")):
+        return DANGEROUS_SHELL_SCOPE
     if tool_name in FILE_PATH_TOOLS and root:
         raw = _tool_path_arg(args)
         if raw and path_outside_workspace(raw, root):
             return OUTSIDE_WORKSPACE_SCOPE
+    if tool_name in SHELL_COMMAND_TOOLS and root and _command_outside_workspace(args, root):
+        return SHELL_OUTSIDE_SCOPE
     return tool_name
 
 
@@ -212,8 +238,9 @@ def approval_required(
     args: dict[str, Any] | None = None,
     workspace: Path | str | None = None,
 ) -> bool:
-    """Single gate: outside-workspace file ops, Tool.requires_approval, or table."""
-    if approval_scope(name, args, workspace) == OUTSIDE_WORKSPACE_SCOPE:
+    """Single gate: outside-workspace file/shell ops, Tool.requires_approval, or table."""
+    scope = approval_scope(name, args, workspace)
+    if scope in (OUTSIDE_WORKSPACE_SCOPE, SHELL_OUTSIDE_SCOPE, DANGEROUS_SHELL_SCOPE):
         return True
     if tool is not None and bool(getattr(tool, "requires_approval", False)):
         return True
@@ -255,8 +282,26 @@ def _tool_summary_body(name: str, args: dict[str, Any]) -> str:
         cmd = str(args.get("command") or "")
         bg = " · 后台" if args.get("background") else ""
         return f"shell{bg}: {_short(cmd, 100)}"
+    if name == "shell_job_list":
+        return "列出后台脚本"
+    if name == "shell_job_log":
+        return f"后台日志 {args.get('job_id') or ''}"
+    if name == "shell_job_wait":
+        return f"等待后台任务 {args.get('job_id') or ''}"
+    if name == "shell_job_stop":
+        return f"停止后台任务 {args.get('job_id') or ''}"
     if (name or "").startswith("mcp_"):
         return f"MCP {name}: {_short(str(args), 100)}"
+    if name == "browser_navigate":
+        return f"浏览器打开: {_short(str(args.get('url') or ''), 80)}"
+    if name == "browser_click":
+        return f"浏览器点击: {_short(str(args.get('selector') or ''), 60)}"
+    if name == "browser_type":
+        return f"浏览器输入 {_short(str(args.get('selector') or ''), 40)}: {_short(str(args.get('text') or ''), 40)}"
+    if name == "browser_press_key":
+        key = str(args.get("key") or "")
+        sel = str(args.get("selector") or "")
+        return f"浏览器按键 {key}" + (f" @ {_short(sel, 40)}" if sel else "")
     if name == "skill_save":
         return f"保存技能 {args.get('name') or ''}"
     if name == "memory_append":
@@ -310,6 +355,9 @@ def summarize_tool_call(
     workspace: Path | str | None = None,
 ) -> str:
     body = _tool_summary_body(name, args)
-    if approval_scope(name, args, workspace) == OUTSIDE_WORKSPACE_SCOPE:
+    scope = approval_scope(name, args, workspace)
+    if scope == DANGEROUS_SHELL_SCOPE:
+        return f"危险删除 · {body}"
+    if scope in (OUTSIDE_WORKSPACE_SCOPE, SHELL_OUTSIDE_SCOPE):
         return f"工作区外 · {body}"
     return body

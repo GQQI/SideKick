@@ -12,10 +12,12 @@ from __future__ import annotations
 import asyncio
 import base64
 import json
+import os
 import queue
 import re
 import threading
 import time
+import urllib.request
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Awaitable, Callable, Optional
@@ -87,6 +89,236 @@ def resolve_browser_target(raw: str) -> str:
     if local is None or root is None:
         return ""
     return preview_http_url(local, root)
+
+
+_IMAGE_SUFFIXES = (
+    ".png",
+    ".jpg",
+    ".jpeg",
+    ".gif",
+    ".webp",
+    ".bmp",
+    ".svg",
+    ".ico",
+    ".avif",
+)
+_BARE_HOST_RE = re.compile(
+    r"^(?:www\.)?(?:[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?\.)+[A-Za-z]{2,}"
+    r"(?::\d{2,5})?(?:[/?#].*)?$"
+)
+_LOCALHOST_RE = re.compile(
+    r"^(?:localhost|127\.0\.0\.1)(?::\d{2,5})?(?:[/?#].*)?$",
+    re.IGNORECASE,
+)
+def urls_match(left: str, right: str) -> bool:
+    """True if two http(s) URLs point at the same document (ignore www / slash)."""
+
+    def norm(raw: str) -> str:
+        text = (raw or "").strip()
+        if not text or text == "about:blank":
+            return text
+        try:
+            parsed = urlparse(text)
+        except Exception:
+            return text.rstrip("/")
+        host = (parsed.hostname or "").lower()
+        if host.startswith("www."):
+            host = host[4:]
+        path = parsed.path or "/"
+        if path != "/" and path.endswith("/"):
+            path = path[:-1]
+        scheme = (parsed.scheme or "https").lower()
+        query = parsed.query
+        return f"{scheme}://{host}{path}" + (f"?{query}" if query else "")
+
+    a, b = norm(left), norm(right)
+    return bool(a and b and a == b)
+
+
+def _looks_like_asset_filename(text: str) -> bool:
+    stem = (text or "").split("?")[0].split("#")[0].strip().replace("\\", "/")
+    if not stem or "://" in stem:
+        return False
+    lower = stem.lower()
+    return any(lower.endswith(ext) for ext in _IMAGE_SUFFIXES)
+
+
+def lookup_screenshot_page_url(raw: str, workspace: Optional[Path] = None) -> str:
+    """If ``raw`` is a saved screenshot, return the page URL it was taken from."""
+    text = (raw or "").strip().replace("\\", "/")
+    if not text:
+        return ""
+    last = ""
+    try:
+        last = str(SANDBOX.last_url() or "").strip()
+    except Exception:
+        last = ""
+    candidates: list[Path] = []
+    root: Optional[Path] = workspace
+    if root is None:
+        try:
+            from .workspace_store import get_active_workspace
+
+            ws = get_active_workspace()
+            root_s = str(ws.get("path") or "").strip() if ws.get("configured") else ""
+            root = Path(root_s) if root_s else None
+        except Exception:
+            root = None
+    name = Path(text).name
+    if root is not None:
+        candidates.append(root / text)
+        candidates.append(root / ".sidekick" / "browser" / name)
+    candidates.append(Path(text))
+    for cand in candidates:
+        meta = Path(str(cand) + ".json")
+        if not meta.is_file():
+            meta = cand.with_suffix(cand.suffix + ".json") if cand.suffix else cand
+        if not meta.is_file():
+            continue
+        try:
+            data = json.loads(meta.read_text(encoding="utf-8"))
+        except Exception:
+            continue
+        url = sanitize_browser_url(str((data or {}).get("url") or ""))
+        if url:
+            return url
+    if root is not None:
+        latest = root / ".sidekick" / "browser" / "latest.json"
+        if latest.is_file():
+            try:
+                data = json.loads(latest.read_text(encoding="utf-8"))
+                url = sanitize_browser_url(str((data or {}).get("url") or ""))
+                if url:
+                    return url
+            except Exception:
+                pass
+    if last and last not in {"about:blank", "chrome://newtab/"}:
+        return last
+    return ""
+
+
+def coerce_navigate_target(raw: str) -> str:
+    """Turn a chat/tool argument into a navigable http(s) URL.
+
+    Accepts full URLs, ``example.com``, ``localhost:5173``, or a workspace
+    HTML file. Screenshot filenames like ``real_1_top.png`` recover the page
+    they were taken from (sidecar / last session). If that fails they raise
+    ValueError so the model can pass a real URL instead.
+    """
+    text = (raw or "").strip().strip("'\"")
+    if not text:
+        return ""
+    if text == "about:blank":
+        return text
+    if _looks_like_asset_filename(text):
+        recovered = lookup_screenshot_page_url(text)
+        if recovered:
+            return recovered
+        raise ValueError(
+            f"{text!r} is a screenshot path, not a web page. "
+            "browser_navigate needs a full http(s) URL such as https://example.com "
+            "(the page the shot was taken from). "
+            "To inspect the image itself, call read_file on that path."
+        )
+    http = sanitize_browser_url(text)
+    if http:
+        return http
+    if _LOCALHOST_RE.match(text):
+        return sanitize_browser_url("http://" + text) or ("http://" + text)
+    if _BARE_HOST_RE.match(text):
+        host = text.split("/")[0].split("?")[0].split("#")[0]
+        tld = host.rsplit(".", 1)[-1].lower()
+        if tld not in {ext.lstrip(".") for ext in _IMAGE_SUFFIXES} | {
+            "html",
+            "htm",
+            "js",
+            "css",
+            "json",
+            "txt",
+            "md",
+        }:
+            return sanitize_browser_url("https://" + text) or ("https://" + text)
+    return resolve_browser_target(text)
+
+
+_cdp_cached = ""
+
+
+def discover_cdp_url() -> str:
+    """Loopback CDP endpoint of the desktop BrowserView, if running."""
+    global _cdp_cached
+    if _cdp_cached:
+        return _cdp_cached
+    env = (os.getenv("SIDEKICK_CDP_URL") or "").strip()
+    if env:
+        _cdp_cached = env
+        return env
+    port = (os.getenv("SIDEKICK_CDP_PORT") or "8315").strip() or "8315"
+    url = f"http://127.0.0.1:{port}"
+    try:
+        req = urllib.request.Request(f"{url}/json/version")
+        with urllib.request.urlopen(req, timeout=0.35) as resp:
+            data = json.loads(resp.read().decode("utf-8", "replace"))
+        browser = str(data.get("Browser") or "")
+        if "Electron" in browser or "Chrome" in browser:
+            _cdp_cached = url
+            return url
+    except Exception:
+        pass
+    return ""
+
+
+def _is_workbench_url(url: str) -> bool:
+    u = (url or "").lower()
+    prefixes = []
+    ui = (os.getenv("SIDEKICK_UI_URL") or "").strip().rstrip("/").lower()
+    if ui:
+        prefixes.append(ui)
+    port = os.getenv("META_PORT", "8787")
+    prefixes.extend(
+        [
+            f"http://127.0.0.1:{port}",
+            f"http://localhost:{port}",
+            "http://127.0.0.1:5177",
+            "http://localhost:5177",
+            "http://127.0.0.1:8787",
+            "http://localhost:8787",
+        ]
+    )
+    return any(u.startswith(p) for p in prefixes)
+
+
+async def _find_guest_page(browser: Any) -> Any:
+    """Locate the in-app BrowserView page; never the workbench renderer."""
+    deadline = time.monotonic() + 8.0
+    fallback = None
+    while time.monotonic() < deadline:
+        for ctx in list(getattr(browser, "contexts", None) or []):
+            for page in list(getattr(ctx, "pages", None) or []):
+                url = ""
+                try:
+                    url = page.url or ""
+                except Exception:
+                    continue
+                if _is_workbench_url(url):
+                    continue
+                try:
+                    if await page.evaluate("() => Boolean(window.__sidekickGuest)"):
+                        return page
+                except Exception:
+                    pass
+                # about:blank / empty guest view is fine; the workbench is not.
+                if fallback is None:
+                    fallback = page
+        await asyncio.sleep(0.15)
+    if fallback is not None:
+        try:
+            url = fallback.url or ""
+        except Exception:
+            url = ""
+        if _is_workbench_url(url):
+            return None
+    return fallback
 
 
 def loopback_url_candidates(url: str) -> list[str]:
@@ -340,6 +572,77 @@ _SELECT_BOOTSTRAP = r"""
 )
 
 
+# Enumerate clickable/typeable elements so the agent can act without guessing
+# selectors from raw HTML. Mirrors the cssPath() logic in _SELECT_BOOTSTRAP but
+# is self-contained (evaluated standalone, not part of the Select Mode bundle).
+_LIST_ELEMENTS_JS = r"""
+(() => {
+  function cssEscape(s) {
+    if (window.CSS && CSS.escape) return CSS.escape(s);
+    return String(s).replace(/[^a-zA-Z0-9_-]/g, "\\$&");
+  }
+  function cssPath(el) {
+    if (!el || el.nodeType !== 1) return "";
+    if (el.id) return "#" + cssEscape(el.id);
+    const parts = [];
+    let cur = el;
+    let depth = 0;
+    while (cur && cur.nodeType === 1 && depth < 6) {
+      let part = cur.tagName.toLowerCase();
+      if (cur.id) { parts.unshift("#" + cssEscape(cur.id)); break; }
+      const parent = cur.parentElement;
+      if (parent) {
+        const siblings = Array.from(parent.children).filter((c) => c.tagName === cur.tagName);
+        if (siblings.length > 1) part += ":nth-of-type(" + (siblings.indexOf(cur) + 1) + ")";
+      }
+      parts.unshift(part);
+      cur = parent;
+      depth++;
+    }
+    return parts.join(" > ");
+  }
+  function visible(el) {
+    const r = el.getBoundingClientRect();
+    if (r.width <= 0 || r.height <= 0) return false;
+    const cs = window.getComputedStyle(el);
+    if (cs.visibility === "hidden" || cs.display === "none" || Number(cs.opacity) === 0) return false;
+    return true;
+  }
+  function textOf(el) {
+    const t = (
+      el.innerText || el.value || el.getAttribute("aria-label") ||
+      el.getAttribute("placeholder") || el.getAttribute("title") || ""
+    ).trim();
+    return t.replace(/\s+/g, " ").slice(0, 120);
+  }
+  const SEL = 'a[href], button, [role="button"], [role="link"], [role="tab"], ' +
+    '[role="menuitem"], [role="checkbox"], [role="switch"], input, select, ' +
+    'textarea, summary, [onclick], [tabindex]:not([tabindex="-1"])';
+  const nodes = Array.from(document.querySelectorAll(SEL));
+  const out = [];
+  const seen = new Set();
+  for (const el of nodes) {
+    if (out.length >= __LIMIT__) break;
+    if (!visible(el)) continue;
+    const path = cssPath(el);
+    if (!path || seen.has(path)) continue;
+    seen.add(path);
+    const tag = el.tagName.toLowerCase();
+    const rec = {
+      index: out.length,
+      tag,
+      type: el.getAttribute("type") || "",
+      text: textOf(el),
+      selector: path,
+    };
+    if (tag === "a") rec.href = el.getAttribute("href") || "";
+    out.push(rec);
+  }
+  return out;
+})()
+"""
+
+
 @dataclass
 class _Job:
     factory: Callable[[], Awaitable[Any]]
@@ -434,6 +737,26 @@ class BrowserSandbox:
     def __init__(self) -> None:
         self._lock = threading.RLock()
         self._sessions: dict[str, dict[str, Any]] = {}
+        self._cdp_browser: Any = None
+        self._last_url: dict[str, str] = {}
+
+    def last_url(self, user_id: Optional[str] = None) -> str:
+        uid = user_id or get_user_id()
+        with self._lock:
+            sess = self._sessions.get(uid)
+            if sess and sess.get("url"):
+                return str(sess.get("url") or "")
+            return self._last_url.get(uid, "")
+
+    def _remember_url(self, uid: str, url: str) -> None:
+        text = (url or "").strip()
+        if not text:
+            return
+        with self._lock:
+            self._last_url[uid] = text
+            sess = self._sessions.get(uid)
+            if sess is not None:
+                sess["url"] = text
 
     def host_kind(self) -> str:
         return HOST_KIND
@@ -480,7 +803,12 @@ class BrowserSandbox:
         if not ok:
             raise RuntimeError(err)
         uid = user_id or get_user_id()
-        target = resolve_browser_target(url) if (url or "").strip() else ""
+        target = ""
+        if (url or "").strip():
+            try:
+                target = coerce_navigate_target(url)
+            except ValueError:
+                target = resolve_browser_target(url)
 
         async def _op() -> dict[str, Any]:
             with self._lock:
@@ -523,12 +851,15 @@ class BrowserSandbox:
 
     def navigate(self, url: str, *, user_id: Optional[str] = None) -> dict[str, Any]:
         uid = user_id or get_user_id()
-        target = resolve_browser_target(url)
+        try:
+            target = coerce_navigate_target(url)
+        except ValueError as exc:
+            raise ValueError(str(exc)) from exc
         if not target:
             raise ValueError(
-                f"invalid url: {url!r} — browser_navigate opens http(s) links only. "
-                "For a local HTML file, pass a workspace-relative path (e.g. report.html), "
-                "not file://. Dev servers: http://127.0.0.1:PORT"
+                f"invalid url: {url!r} — browser_navigate needs a full http(s) URL "
+                "(e.g. https://example.com), localhost:port, or a workspace HTML file "
+                "(e.g. report.html). Do not pass screenshot filenames."
             )
 
         async def _op() -> dict[str, Any]:
@@ -548,7 +879,21 @@ class BrowserSandbox:
             with self._lock:
                 return self._public(sess)
 
-        return _WORKER.call(_op, timeout=90.0)
+        try:
+            info = _WORKER.call(_op, timeout=90.0)
+        except Exception as exc:
+            # Desktop: let the UI/Electron loadURL the same target so the
+            # in-app panel still opens even if Playwright CDP attach lags.
+            self._remember_url(uid, target)
+            return {
+                "host": HOST_KIND,
+                "url": target,
+                "ready": False,
+                "deferred": True,
+                "note": str(exc),
+            }
+        self._remember_url(uid, str(info.get("url") or target))
+        return info
 
     def screenshot_png(
         self,
@@ -560,7 +905,7 @@ class BrowserSandbox:
 
         async def _op() -> bytes:
             with self._lock:
-                page = self._page_unlocked(uid)
+                page = await self._alive_page(uid)
             return await page.screenshot(full_page=full_page, type="png")
 
         return _WORKER.call(_op, timeout=60.0)
@@ -583,7 +928,7 @@ class BrowserSandbox:
 
         async def _op() -> dict[str, Any]:
             with self._lock:
-                page = self._page_unlocked(uid)
+                page = await self._alive_page(uid)
             title = await page.title()
             text = await page.locator("body").inner_text(timeout=15000)
             payload: dict[str, Any] = {
@@ -626,7 +971,7 @@ class BrowserSandbox:
 
         async def _op() -> Optional[DomElementPayload]:
             with self._lock:
-                page = self._page_unlocked(uid)
+                page = await self._alive_page(uid)
             await page.evaluate(_SELECT_BOOTSTRAP)
             raw = await page.evaluate(
                 "(timeoutMs) => window.__sidekickSelectArm(timeoutMs)",
@@ -690,7 +1035,7 @@ class BrowserSandbox:
 
         async def _op() -> str:
             with self._lock:
-                page = self._page_unlocked(uid)
+                page = await self._alive_page(uid)
                 sess = self._sessions[uid]
             await page.click(sel, timeout=15000)
             with self._lock:
@@ -714,12 +1059,153 @@ class BrowserSandbox:
 
         async def _op() -> str:
             with self._lock:
-                page = self._page_unlocked(uid)
+                page = await self._alive_page(uid)
             if clear:
                 await page.fill(sel, text or "", timeout=15000)
             else:
                 await page.type(sel, text or "", timeout=15000)
             return f"typed into {sel}"
+
+        return _WORKER.call(_op, timeout=30.0)
+
+    def scroll(
+        self,
+        *,
+        user_id: Optional[str] = None,
+        direction: str = "down",
+        amount: Optional[int] = None,
+        selector: str = "",
+    ) -> dict[str, Any]:
+        uid = user_id or get_user_id()
+        sel = (selector or "").strip()
+        dirn = (direction or "down").strip().lower()
+
+        async def _op() -> dict[str, Any]:
+            with self._lock:
+                page = await self._alive_page(uid)
+            if sel:
+                await page.locator(sel).scroll_into_view_if_needed(timeout=15000)
+            elif dirn == "top":
+                await page.evaluate("() => window.scrollTo(0, 0)")
+            elif dirn == "bottom":
+                await page.evaluate("() => window.scrollTo(0, document.body.scrollHeight)")
+            else:
+                delta = abs(int(amount)) if amount else 800
+                if dirn == "up":
+                    delta = -delta
+                await page.mouse.wheel(0, delta)
+            pos = await page.evaluate(
+                "() => ({x: window.scrollX, y: window.scrollY, "
+                "maxY: document.body.scrollHeight - window.innerHeight})"
+            )
+            return {"url": page.url, **(pos or {})}
+
+        return _WORKER.call(_op, timeout=30.0)
+
+    def hover_selector(self, selector: str, *, user_id: Optional[str] = None) -> str:
+        uid = user_id or get_user_id()
+        sel = (selector or "").strip()
+        if not sel:
+            return "ERROR: empty selector"
+
+        async def _op() -> str:
+            with self._lock:
+                page = await self._alive_page(uid)
+            await page.hover(sel, timeout=15000)
+            return f"hovered {sel}"
+
+        return _WORKER.call(_op, timeout=30.0)
+
+    def press_key(
+        self, key: str, *, user_id: Optional[str] = None, selector: str = ""
+    ) -> str:
+        uid = user_id or get_user_id()
+        k = (key or "").strip()
+        if not k:
+            return "ERROR: empty key"
+        sel = (selector or "").strip()
+
+        async def _op() -> str:
+            with self._lock:
+                page = await self._alive_page(uid)
+                sess = self._sessions[uid]
+            if sel:
+                await page.focus(sel, timeout=15000)
+                await page.press(sel, k, timeout=15000)
+            else:
+                await page.keyboard.press(k)
+            with self._lock:
+                sess["url"] = page.url
+            return f"pressed {k}" + (f" on {sel}" if sel else "")
+
+        return _WORKER.call(_op, timeout=30.0)
+
+    def wait_for(
+        self,
+        *,
+        user_id: Optional[str] = None,
+        selector: str = "",
+        state: str = "visible",
+        timeout_ms: int = 8000,
+    ) -> str:
+        uid = user_id or get_user_id()
+        sel = (selector or "").strip()
+        st = (state or "visible").strip().lower()
+        if st not in ("visible", "hidden", "attached", "detached"):
+            st = "visible"
+        ms = max(200, min(int(timeout_ms or 8000), 30000))
+
+        async def _op() -> str:
+            with self._lock:
+                page = await self._alive_page(uid)
+            if sel:
+                await page.locator(sel).wait_for(state=st, timeout=ms)
+                return f"{sel} is now {st}"
+            await asyncio.sleep(ms / 1000.0)
+            return f"waited {ms}ms"
+
+        return _WORKER.call(_op, timeout=(ms / 1000.0) + 15.0)
+
+    def go_back(self, *, user_id: Optional[str] = None) -> dict[str, Any]:
+        uid = user_id or get_user_id()
+
+        async def _op() -> dict[str, Any]:
+            with self._lock:
+                page = await self._alive_page(uid)
+                sess = self._sessions[uid]
+            resp = await page.go_back(timeout=20000, wait_until="domcontentloaded")
+            with self._lock:
+                sess["url"] = page.url
+            return {"url": page.url, "ok": resp is not None}
+
+        return _WORKER.call(_op, timeout=30.0)
+
+    def go_forward(self, *, user_id: Optional[str] = None) -> dict[str, Any]:
+        uid = user_id or get_user_id()
+
+        async def _op() -> dict[str, Any]:
+            with self._lock:
+                page = await self._alive_page(uid)
+                sess = self._sessions[uid]
+            resp = await page.go_forward(timeout=20000, wait_until="domcontentloaded")
+            with self._lock:
+                sess["url"] = page.url
+            return {"url": page.url, "ok": resp is not None}
+
+        return _WORKER.call(_op, timeout=30.0)
+
+    def list_interactive_elements(
+        self, *, user_id: Optional[str] = None, limit: int = 60
+    ) -> list[dict[str, Any]]:
+        uid = user_id or get_user_id()
+        n = max(1, min(int(limit or 60), 150))
+
+        async def _op() -> list[dict[str, Any]]:
+            with self._lock:
+                page = await self._alive_page(uid)
+            js = _LIST_ELEMENTS_JS.replace("__LIMIT__", str(n))
+            raw = await page.evaluate(js)
+            return list(raw or [])
 
         return _WORKER.call(_op, timeout=30.0)
 
@@ -739,6 +1225,23 @@ class BrowserSandbox:
             fname += ".png"
         path = out_dir / fname
         path.write_bytes(png)
+        page_url = self.last_url(user_id)
+        meta = {
+            "url": page_url,
+            "path": fname,
+            "saved_at": time.time(),
+        }
+        try:
+            path.with_name(path.name + ".json").write_text(
+                json.dumps(meta, ensure_ascii=False, indent=2),
+                encoding="utf-8",
+            )
+            (out_dir / "latest.json").write_text(
+                json.dumps(meta, ensure_ascii=False, indent=2),
+                encoding="utf-8",
+            )
+        except Exception:
+            pass
         return path
 
     async def _ensure_on_worker(self, uid: str, url: str, *, headless: bool) -> dict[str, Any]:
@@ -764,6 +1267,10 @@ class BrowserSandbox:
         pw = _WORKER.playwright
         if pw is None:
             raise RuntimeError("Playwright worker not ready")
+        cdp = discover_cdp_url()
+        if cdp:
+            return await self._attach_desktop(uid, url)
+
         browser = await pw.chromium.launch(headless=headless)
         context = await browser.new_context(viewport={"width": 1280, "height": 800})
         page = await context.new_page()
@@ -796,18 +1303,103 @@ class BrowserSandbox:
             self._sessions[uid] = sess
             return self._public(sess)
 
+    async def _attach_desktop(self, uid: str, url: str) -> dict[str, Any]:
+        """Drive the Electron BrowserView over CDP — no extra Chromium window."""
+        pw = _WORKER.playwright
+        cdp = discover_cdp_url()
+        if pw is None or not cdp:
+            raise RuntimeError("desktop CDP endpoint is not available")
+        browser = self._cdp_browser
+        if browser is None:
+            try:
+                browser = await pw.chromium.connect_over_cdp(cdp)
+            except Exception as exc:
+                raise RuntimeError(
+                    f"cannot attach to the in-app browser panel ({exc}). "
+                    "Open the Browser sidebar and retry."
+                ) from exc
+            self._cdp_browser = browser
+        page = await _find_guest_page(browser)
+        if page is None:
+            raise RuntimeError(
+                "in-app browser panel not ready. Open the Browser sidebar once and retry."
+            )
+        try:
+            page.on("console", lambda msg: self._on_console(uid, msg))
+        except Exception:
+            pass
+        go = url or ""
+        if go and go != "about:blank":
+            await self._sync_desktop_url(page, go)
+        sess = {
+            "user_id": uid,
+            "browser": browser,
+            "context": page.context,
+            "page": page,
+            "cdp": True,
+            "url": page.url,
+            "started_at": time.time(),
+            "console": [],
+            "host": HOST_KIND,
+        }
+
+        def _gone(_=None) -> None:
+            with self._lock:
+                if self._sessions.get(uid) is sess:
+                    self._sessions.pop(uid, None)
+
+        try:
+            page.on("close", _gone)
+        except Exception:
+            pass
+        with self._lock:
+            self._sessions[uid] = sess
+            return self._public(sess)
+
+    async def _alive_page(self, uid: str) -> Any:
+        with self._lock:
+            sess = self._sessions.get(uid)
+            page = sess.get("page") if sess else None
+        if self._page_alive(page):
+            return page
+        if discover_cdp_url():
+            await self._attach_desktop(uid, self._last_url.get(uid, ""))
+            with self._lock:
+                page = (self._sessions.get(uid) or {}).get("page")
+            if self._page_alive(page):
+                return page
+        raise RuntimeError(
+            "browser session not started — open a URL in the Browser panel first "
+            "(or Ctrl+click a link → Open in sandbox)"
+        )
+
     def _page_unlocked(self, uid: str) -> Any:
         sess = self._sessions.get(uid)
         page = sess.get("page") if sess else None
-        if not self._page_alive(page):
-            raise RuntimeError(
-                "browser session not started — open a URL in the Browser panel first "
-                "(or Ctrl+click a link → Open in sandbox)"
+        if self._page_alive(page):
+            return page
+        raise RuntimeError(
+            "browser session not started — open a URL in the Browser panel first "
+            "(or Ctrl+click a link → Open in sandbox)"
+        )
+
+    async def _sync_desktop_url(self, page: Any, url: str) -> None:
+        """Wait for Electron's loadURL instead of racing it with Playwright goto."""
+        if urls_match(getattr(page, "url", "") or "", url):
+            return
+        try:
+            await page.wait_for_url(
+                lambda u: urls_match(u, url),
+                timeout=15000,
             )
-        return page
+        except Exception:
+            # Panel may still be loading; do not page.goto — that aborts Electron.
+            pass
 
     async def _goto_page(self, page: Any, url: str) -> None:
         last_exc: Optional[BaseException] = None
+        if urls_match(getattr(page, "url", "") or "", url):
+            return
         for cand in loopback_url_candidates(url):
             try:
                 await page.goto(cand, wait_until="domcontentloaded", timeout=60000)
@@ -816,6 +1408,8 @@ class BrowserSandbox:
                 last_exc = exc
                 if self._is_target_closed(exc):
                     raise
+                if self._is_nav_aborted(exc) and urls_match(getattr(page, "url", "") or "", url):
+                    return
                 if _is_connection_refused(exc):
                     continue
                 try:
@@ -824,6 +1418,10 @@ class BrowserSandbox:
                 except Exception as exc2:
                     last_exc = exc2
                     if self._is_target_closed(exc2) or not _is_connection_refused(exc2):
+                        if self._is_nav_aborted(exc2) and urls_match(
+                            getattr(page, "url", "") or "", url
+                        ):
+                            return
                         raise
         if last_exc:
             raise last_exc
@@ -832,12 +1430,20 @@ class BrowserSandbox:
         page = sess["page"]
         if not self._page_alive(page):
             raise RuntimeError("Target page, context or browser has been closed")
-        await self._goto_page(page, url)
-        try:
-            await page.wait_for_load_state("networkidle", timeout=8000)
-        except Exception:
-            pass
-        sess["url"] = page.url
+        if sess.get("cdp"):
+            await self._sync_desktop_url(page, url)
+        else:
+            await self._goto_page(page, url)
+            try:
+                await page.wait_for_load_state("networkidle", timeout=8000)
+            except Exception:
+                pass
+        sess["url"] = page.url or url
+
+    @staticmethod
+    def _is_nav_aborted(exc: BaseException) -> bool:
+        msg = str(exc).lower()
+        return "err_aborted" in msg or "(-3)" in msg or "net::err_aborted" in msg
 
     @staticmethod
     def _page_alive(page: Any) -> bool:
@@ -872,6 +1478,8 @@ class BrowserSandbox:
             if current is sess or (sess is None and current is not None):
                 self._sessions.pop(uid, None)
         if not sess:
+            return
+        if sess.get("cdp"):
             return
         for key in ("context", "browser"):
             obj = sess.get(key)

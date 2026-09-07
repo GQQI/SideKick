@@ -32,5 +32,10 @@ def test_app_registers_core_routes() -> None:
         "/api/memory/library",
         "/api/files/undo",
         "/api/sessions/{session_id}/events",
+        "/api/skills",
+        "/api/skills/validate",
+        "/api/skills/import",
+        "/api/skills/import-dir",
+        "/api/skills/import-files",
     ):
         assert needed in paths, f"missing route {needed}"

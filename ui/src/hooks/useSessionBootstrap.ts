@@ -40,7 +40,7 @@ export type SessionBootstrapDeps = {
   streamTextRef: React.MutableRefObject<string>;
   streamReasoningRef: React.MutableRefObject<string>;
   nativeReasoningRef: React.MutableRefObject<boolean>;
-  setSidePanel: (p: "files" | "search" | "history" | "browser" | "git" | "undo") => void;
+  setSidePanel: (p: "files" | "search" | "history" | "browser" | "git" | "undo" | "jobs") => void;
   onResumeRuntime?: (detail: SessionDetail) => void;
   setExplorerCollapsed: (v: boolean) => void;
 };
@@ -93,6 +93,9 @@ export function useSessionBootstrap(deps: SessionBootstrapDeps) {
   const applySessionDetail = useCallback(
     (detail: SessionDetail) => {
       setSessionId(detail.id);
+      if (detail.workspace?.path) {
+        setActiveWs(detail.workspace);
+      }
       syncContextFromSession(detail);
       const mapped = mapSessionMessages(detail.messages, detail.agent_tree);
       commit(mapped);
@@ -110,6 +113,7 @@ export function useSessionBootstrap(deps: SessionBootstrapDeps) {
     },
     [
       setSessionId,
+      setActiveWs,
       syncContextFromSession,
       commit,
       streamIdRef,

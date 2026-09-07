@@ -15,7 +15,10 @@ extraResources:
     to: sidekick
     filter:
       - "**/*"
+      - "**/*.zip"
+      - "**/*._pth"
 win:
+  executableName: sidekick
   target:
     - target: nsis
       arch:

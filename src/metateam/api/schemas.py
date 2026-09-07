@@ -12,6 +12,13 @@ class ChatRequest(BaseModel):
     session_id: str | None = None
     mode: str = "agent"
     display: str | None = None
+    # When creating a new session (no session_id), pin it to this folder so the
+    # chat follows the UI's selected workspace instead of the tenant default.
+    workspace: str | None = None
+
+
+class SessionCreate(BaseModel):
+    workspace: str | None = None
 
 
 class MemoryUpdate(BaseModel):
@@ -62,25 +69,30 @@ class WorkspaceCreate(BaseModel):
 class FileWrite(BaseModel):
     path: str = Field(..., min_length=1)
     content: str = ""
+    workspace: str | None = None
 
 
 class FileCreate(BaseModel):
     path: str = Field(..., min_length=1)
     kind: str = "file"
+    workspace: str | None = None
 
 
 class FileRename(BaseModel):
     path: str = Field(..., min_length=1)
     new_name: str = Field(..., min_length=1)
+    workspace: str | None = None
 
 
 class FileMove(BaseModel):
     path: str = Field(..., min_length=1)
     dest_dir: str = "."
+    workspace: str | None = None
 
 
 class FileReveal(BaseModel):
     path: str = "."
+    workspace: str | None = None
 
 
 class UndoBody(BaseModel):
@@ -90,20 +102,24 @@ class UndoBody(BaseModel):
 
 class GitPathsBody(BaseModel):
     paths: list[str] = Field(default_factory=list)
+    workspace: str | None = None
 
 
 class GitCommitBody(BaseModel):
     message: str = ""
+    workspace: str | None = None
 
 
 class GitCheckoutBody(BaseModel):
     branch: str = Field(..., min_length=1, max_length=200)
     create: bool = False
+    workspace: str | None = None
 
 
 class GitRemoteBody(BaseModel):
     url: str = Field(..., min_length=3, max_length=500)
     name: str = "origin"
+    workspace: str | None = None
 
 
 class AuthSetupBody(BaseModel):
@@ -139,6 +155,26 @@ class McpTestBody(BaseModel):
     url: str = ""
     headers: dict[str, str] = Field(default_factory=dict)
     enabled: bool = True
+
+
+class SkillWriteBody(BaseModel):
+    name: str = Field(..., min_length=2, max_length=64)
+    description: str = Field(..., min_length=1, max_length=800)
+    content: str = Field(..., min_length=1)
+    overwrite: bool = True
+    previous: str | None = None
+
+
+class SkillValidateBody(BaseModel):
+    name: str = ""
+    description: str = ""
+    content: str = ""
+    markdown: str = ""
+
+
+class SkillImportDirBody(BaseModel):
+    path: str = Field(..., min_length=2, max_length=1024)
+    overwrite: bool = False
 
 
 class TruncateBody(BaseModel):

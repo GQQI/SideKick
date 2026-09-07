@@ -210,16 +210,6 @@ export function IconUndo(p: IconProps) {
   );
 }
 
-export function IconReplay(p: IconProps) {
-  return (
-    <svg {...base(p)}>
-      <path d="M3 12a9 9 0 1 0 3-6.7" {...stroke} />
-      <path d="M3 4v5h5" {...stroke} />
-      <path d="M10 8.5v7l6-3.5-6-3.5Z" {...stroke} />
-    </svg>
-  );
-}
-
 export function IconExternal(p: IconProps) {
   return (
     <svg {...base(p)}>
@@ -273,6 +263,15 @@ export function IconGit(p: IconProps) {
       <circle cx="18" cy="12" r="2.2" {...stroke} />
       <circle cx="6" cy="18" r="2.2" {...stroke} />
       <path d="M6 8.2v7.6M6 12h9.8" {...stroke} />
+    </svg>
+  );
+}
+
+export function IconTerminal(p: IconProps) {
+  return (
+    <svg {...base(p)}>
+      <rect x="3" y="5" width="18" height="14" rx="2" {...stroke} />
+      <path d="m7 10 3 2-3 2M13 14h4" {...stroke} />
     </svg>
   );
 }

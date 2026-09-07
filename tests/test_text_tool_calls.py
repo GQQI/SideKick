@@ -218,6 +218,17 @@ def test_parse_partial_delegate_json() -> None:
     raw = '{"goal": "Search the web for the following topics and return structured Chinese bullet po'
     args = parse_tool_args(raw)
     assert "Search the web" in str(args.get("goal") or "")
+    assert args.get("_incomplete") is True
+
+
+def test_parse_complete_write_file_json_not_marked_incomplete() -> None:
+    from metateam.runtime.llm import parse_tool_args
+
+    raw = '{"path": "docs/a.md", "content": "line1\\nline2"}'
+    args = parse_tool_args(raw)
+    assert args.get("path") == "docs/a.md"
+    assert args.get("content") == "line1\nline2"
+    assert "_incomplete" not in args
 
 
 def test_unclosed_limit_does_not_swallow_offset() -> None:

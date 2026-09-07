@@ -35,6 +35,11 @@ class ToolRegistry:
     def register(self, tool: Tool) -> None:
         self._tools[tool.name] = tool
 
+    def drop_skill_tools(self) -> None:
+        for name in list(self._tools):
+            if name.startswith("skill_") and name != "skill_save":
+                self._tools.pop(name, None)
+
     def get(self, name: str) -> Optional[Tool]:
         return self._tools.get(name)
 
@@ -55,32 +60,115 @@ class ToolRegistry:
 _ARG_ALIASES: dict[str, dict[str, tuple[str, ...]]] = {
     "search_text": {
         "query": ("query", "pattern", "text", "search", "q", "needle", "keyword"),
-        "path": ("path", "file", "filepath", "dir", "directory"),
+        "path": ("path", "file", "filepath", "file_path", "filename", "dir", "directory"),
         "glob": ("glob", "include", "file_glob"),
     },
     "read_file": {
-        "path": ("path", "file", "filepath", "filename"),
+        "path": (
+            "path",
+            "file",
+            "filepath",
+            "file_path",
+            "filename",
+            "file_name",
+            "target",
+        ),
         "offset": ("offset", "start", "start_line"),
         "limit": ("limit", "count", "max_lines"),
+        "encoding": ("encoding", "charset", "codec"),
     },
     "write_file": {
-        "path": ("path", "file", "filepath"),
-        "content": ("content", "text", "body", "data"),
+        "path": (
+            "path",
+            "file",
+            "filepath",
+            "file_path",
+            "filename",
+            "file_name",
+            "target",
+            "dest",
+            "destination",
+        ),
+        "content": (
+            "content",
+            "contents",
+            "text",
+            "body",
+            "data",
+            "source",
+            "source_code",
+            "code",
+            "markdown",
+            "html",
+        ),
+        "encoding": ("encoding", "charset", "codec"),
     },
     "str_replace": {
-        "path": ("path", "file", "filepath"),
+        "path": (
+            "path",
+            "file",
+            "filepath",
+            "file_path",
+            "filename",
+            "file_name",
+            "target",
+        ),
         "old_string": ("old_string", "old_str", "oldString", "search"),
         "new_string": ("new_string", "new_str", "newString", "replace"),
+        "encoding": ("encoding", "charset", "codec"),
+    },
+    "delete_file": {
+        "path": (
+            "path",
+            "file",
+            "filepath",
+            "file_path",
+            "filename",
+            "file_name",
+            "target",
+        ),
     },
     "list_dir": {
-        "path": ("path", "dir", "directory", "folder"),
+        "path": ("path", "dir", "directory", "folder", "filepath", "file_path"),
+    },
+    "skill_save": {
+        "from_path": ("from_path", "path", "folder", "source", "src", "skill_path"),
+        "content": ("content", "contents", "body", "text"),
+        "description": ("description", "desc", "summary"),
+        "name": ("name", "skill", "skill_name", "title"),
     },
 }
+
+_NESTED_ARG_KEYS = ("file", "payload", "params", "arguments", "input", "data")
+
+
+def flatten_tool_args(
+    args: dict[str, Any] | None, *, _depth: int = 0
+) -> dict[str, Any]:
+    """Lift nested {file: {path, content}} style payloads onto the top level."""
+    if not isinstance(args, dict):
+        return {}
+    raw = dict(args)
+    out = dict(raw)
+    if _depth > 3:
+        return out
+    for nest_key in _NESTED_ARG_KEYS:
+        inner = raw.get(nest_key)
+        if not isinstance(inner, dict):
+            continue
+        lifted = flatten_tool_args(inner, _depth=_depth + 1)
+        for key, value in lifted.items():
+            if str(key).startswith("_"):
+                continue
+            present = out.get(key)
+            if present in (None, ""):
+                out[key] = value
+    return out
 
 
 def alias_tool_args(name: str, args: dict[str, Any] | None) -> dict[str, Any]:
     """Map common model aliases (pattern→query) onto the handler's real names."""
-    raw = dict(args or {})
+    raw = flatten_tool_args(args)
     mapping = _ARG_ALIASES.get((name or "").strip(), {})
     out = dict(raw)
     for dest, sources in mapping.items():
@@ -91,6 +179,8 @@ def alias_tool_args(name: str, args: dict[str, Any] | None) -> dict[str, Any]:
             if src == dest:
                 continue
             value = raw.get(src)
+            if isinstance(value, dict):
+                continue
             if value not in (None, ""):
                 out[dest] = value
                 break
@@ -144,6 +234,29 @@ def _as_bool(value: Any, default: bool) -> bool:
     if text in {"0", "false", "no", "off", ""}:
         return False
     return default
+
+
+def missing_required_args(handler: Callable[..., Any], args: dict[str, Any] | None) -> list[str]:
+    """Names the handler requires that are absent (None/omitted), after aliasing."""
+    try:
+        sig = inspect.signature(handler)
+    except (TypeError, ValueError):
+        return []
+    bound = dict(args or {})
+    missing: list[str] = []
+    for key, param in sig.parameters.items():
+        if key in ("self", "cls"):
+            continue
+        if param.kind in (
+            inspect.Parameter.VAR_POSITIONAL,
+            inspect.Parameter.VAR_KEYWORD,
+        ):
+            continue
+        if param.default is not inspect.Parameter.empty:
+            continue
+        if key not in bound or bound[key] is None:
+            missing.append(key)
+    return missing
 
 
 def prepare_tool_args(

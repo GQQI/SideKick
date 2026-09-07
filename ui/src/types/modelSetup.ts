@@ -10,6 +10,7 @@ export type ModelEntry = {
   api_key?: string;
   api_key_masked?: string;
   api_key_set?: boolean;
+  max_tokens?: number;
 };
 
 export type ModelProvider = {
@@ -41,6 +42,18 @@ export type ModelSetup = {
 };
 
 export type ModelRole = "main" | "subagent";
+
+/** Sentinel provider/model id for "Auto" — server picks the best keyed model per task. */
+export const AUTO_ID = "auto";
+
+export function isAutoRef(ref: ModelRef | null | undefined): boolean {
+  if (!ref) return false;
+  return ref.provider_id === AUTO_ID || ref.model_id === AUTO_ID;
+}
+
+export function autoRef(): ModelRef {
+  return { provider_id: AUTO_ID, model_id: AUTO_ID };
+}
 
 export const DEFAULT_VENDOR_TEMPLATES: Record<string, VendorTemplate> = {
   custom: {

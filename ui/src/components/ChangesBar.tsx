@@ -9,19 +9,20 @@ type Props = {
   t: (key: MsgKey, ...args: string[]) => string;
   refreshKey?: number;
   sessionId?: string | null;
+  workspace?: string | null;
   onOpenReview?: () => void;
 };
 
-export function ChangesBar({ t, refreshKey = 0, sessionId = null, onOpenReview }: Props) {
+export function ChangesBar({ t, refreshKey = 0, sessionId = null, workspace = null, onOpenReview }: Props) {
   const [snap, setSnap] = useState<GitSnapshot | null>(null);
 
   const load = useCallback(async () => {
     try {
-      setSnap(await fetchGitReview(sessionId));
+      setSnap(await fetchGitReview(sessionId, workspace || undefined));
     } catch {
       setSnap(null);
     }
-  }, [sessionId]);
+  }, [sessionId, workspace]);
 
   useEffect(() => {
     void load();
@@ -73,12 +74,14 @@ export function ReviewPanel({
   t,
   refreshKey = 0,
   sessionId = null,
+  workspace = null,
   selectedPath,
   onSelectPath,
 }: {
   t: (key: MsgKey, ...args: string[]) => string;
   refreshKey?: number;
   sessionId?: string | null;
+  workspace?: string | null;
   selectedPath: string | null;
   onSelectPath: (path: string | null) => void;
 }) {
@@ -89,11 +92,11 @@ export function ReviewPanel({
 
   const load = useCallback(async () => {
     try {
-      setSnap(await fetchGitReview(sessionId));
+      setSnap(await fetchGitReview(sessionId, workspace || undefined));
     } catch {
       setSnap(null);
     }
-  }, [sessionId]);
+  }, [sessionId, workspace]);
 
   useEffect(() => {
     void load();
@@ -109,7 +112,7 @@ export function ReviewPanel({
     let cancelled = false;
     setLoading(true);
     setErr("");
-    void fetchGitFileDiff(selectedPath, sessionId)
+    void fetchGitFileDiff(selectedPath, sessionId, workspace || undefined)
       .then((pair) => {
         if (cancelled) return;
         if (pair.binary) {
@@ -135,7 +138,7 @@ export function ReviewPanel({
     return () => {
       cancelled = true;
     };
-  }, [selectedPath, refreshKey, sessionId, t]);
+  }, [selectedPath, refreshKey, sessionId, workspace, t]);
 
   const files = snap?.files || [];
   const totals = snap?.totals || { files: 0, added: 0, deleted: 0 };

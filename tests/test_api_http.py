@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from pathlib import Path
+
 import pytest
 from fastapi.testclient import TestClient
 
@@ -93,3 +95,29 @@ def test_create_user_requires_header_token(monkeypatch: pytest.MonkeyPatch) -> N
     assert denied.status_code == 401
     ok = client.get("/api/sessions", headers={"X-Sidekick-Token": "ok"})
     assert ok.status_code == 200
+
+
+def test_skills_validate_and_create(client: TestClient, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    from metateam.core.config import get_settings
+
+    settings = get_settings()
+    monkeypatch.setattr(settings, "skills_dir", tmp_path)
+    bad = client.post("/api/skills/validate", json={"markdown": "no frontmatter"})
+    assert bad.status_code == 200
+    assert bad.json()["ok"] is False
+    created = client.post(
+        "/api/skills",
+        json={
+            "name": "http-demo",
+            "description": "Use when testing the skills HTTP API.",
+            "content": "# Demo\n\n## Steps\n1. Validate\n2. Save\n",
+            "overwrite": True,
+        },
+    )
+    assert created.status_code == 200
+    assert created.json()["skill"]["name"] == "http-demo"
+    listed = client.get("/api/skills")
+    assert listed.status_code == 200
+    assert any(x["name"] == "http-demo" for x in listed.json())
+    gone = client.delete("/api/skills/http-demo")
+    assert gone.status_code == 200

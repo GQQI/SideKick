@@ -4,9 +4,6 @@ from __future__ import annotations
 
 import json
 import os
-import subprocess
-import threading
-import time
 from pathlib import Path
 from typing import Any, Optional
 
@@ -90,56 +87,18 @@ def _sandboxed_env(settings: Settings) -> dict[str, str]:
 
 
 def _run_shell_background(command: str, *, cwd: str, collect_secs: float = 8.0, env: Optional[dict[str, str]] = None) -> str:
-    """Start a process and return after collecting early logs (does not wait for exit)."""
-    popen_kwargs: dict[str, Any] = {
-        "cwd": cwd,
-        "stdout": subprocess.PIPE,
-        "stderr": subprocess.STDOUT,
-        **_subprocess_text_kwargs(),
-        "env": env or {**os.environ, "PYTHONIOENCODING": "utf-8"},
-    }
-    if os.name == "nt":
-        popen_kwargs["creationflags"] = getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0)
-    else:
-        # Detach from parent session so Ctrl+C on the server doesn't kill child servers
-        popen_kwargs["start_new_session"] = True
+    """Start a tracked job and return after collecting early logs (does not wait for exit)."""
+    from ...services.shell_jobs import JOBS, format_job_result
 
-    proc = subprocess.Popen(_shell_argv(command), **popen_kwargs)
-    chunks: list[str] = []
-    done = threading.Event()
-
-    def _reader() -> None:
-        assert proc.stdout is not None
-        try:
-            while not done.is_set():
-                line = proc.stdout.readline()
-                if not line:
-                    break
-                chunks.append(line)
-                if sum(len(c) for c in chunks) > 12_000:
-                    break
-        except Exception:
-            pass
-
-    t = threading.Thread(target=_reader, daemon=True)
-    t.start()
-    t.join(timeout=collect_secs)
-    done.set()
-    # Give reader a moment to finish current line
-    t.join(timeout=0.3)
-
-    still = proc.poll() is None
-    preview = "".join(chunks)[-8000:] or "(no output yet)"
-    if still:
-        return (
-            f"background=true pid={proc.pid} status=running\n"
-            f"command={command!r}\n"
-            f"Collected first ~{collect_secs:.0f}s of logs (process keeps running; "
-            f"agent will NOT wait for it to exit).\n"
-            f"--- log ---\n{preview}"
-        )
-    out = preview
-    return f"background=true pid={proc.pid} status=exited code={proc.returncode}\n--- log ---\n{out}"
+    job = JOBS.start(command, cwd=cwd, env=env, background=True)
+    JOBS.wait(job.id, max(0.4, float(collect_secs or 0)))
+    if job.alive():
+        JOBS.mark_released(job)
+    return format_job_result(
+        job,
+        background=True,
+        note=f"Collected first ~{collect_secs:.0f}s of logs; the job keeps running.",
+    )
 
 
 def _safe_path(workspace: Path, raw: str, *, write: bool = False) -> Path:
@@ -149,16 +108,29 @@ def _safe_path(workspace: Path, raw: str, *, write: bool = False) -> Path:
     Linux/麒麟) are remapped into the workspace so write_file keeps working.
     """
     if isinstance(raw, dict):
-        raw = raw.get("path") or raw.get("dir") or "."
+        raw = (
+            raw.get("path")
+            or raw.get("file_path")
+            or raw.get("filepath")
+            or raw.get("filename")
+            or raw.get("dir")
+            or "."
+        )
     text = str(raw or ".").strip()
     if text.startswith("{") and "path" in text:
         try:
             obj = json.loads(text)
-            if isinstance(obj, dict) and obj.get("path"):
-                text = str(obj["path"])
+            if isinstance(obj, dict):
+                text = str(
+                    obj.get("path")
+                    or obj.get("file_path")
+                    or obj.get("filepath")
+                    or obj.get("filename")
+                    or text
+                )
         except Exception:
             pass
-    text = text.strip().strip('"').strip("'") or "."
+    text = text.strip() or "."
     return normalize_user_path(text, workspace)
 
 
@@ -199,15 +171,16 @@ def _skill_as_tool(skill: Skill) -> Tool:
 
 
 def save_skill_file(settings: Settings, name: str, description: str, content: str) -> Path:
-    safe = "".join(c if c.isalnum() or c in "-_" else "-" for c in name.lower()).strip("-")
-    if not safe:
-        raise ValueError("invalid skill name")
-    dest = settings.skills_dir / "learned" / safe
-    dest.mkdir(parents=True, exist_ok=True)
-    text = f"---\nname: {safe}\ndescription: {description[:80]}\n---\n\n{content.strip()}\n"
-    path = dest / "SKILL.md"
-    path.write_text(text, encoding="utf-8")
-    return path
+    from ...services.skills import write_skill
+
+    sk = write_skill(
+        settings.skills_dir,
+        name=name,
+        description=description,
+        content=content,
+        overwrite=True,
+    )
+    return sk.path
 
 
 # back-compat alias for review.py

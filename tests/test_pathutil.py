@@ -7,9 +7,11 @@ import pytest
 
 from metateam.core.pathutil import (
     is_relative_to,
+    nearby_file_names,
     normalize_user_path,
     path_outside_workspace,
     relative_to_posix,
+    resolve_existing_tool_path,
     resolve_path,
 )
 
@@ -128,3 +130,35 @@ def test_path_outside_workspace(tmp_path: Path) -> None:
     outside = tmp_path.parent / f"out-{tmp_path.name}.txt"
     outside.write_text("no", encoding="utf-8")
     assert path_outside_workspace(str(outside), tmp_path)
+
+
+@pytest.mark.skipif(os.name != "nt", reason="Windows drive letters")
+def test_normalize_keeps_ready_drive_missing_folder(tmp_path: Path) -> None:
+    letter = tmp_path.resolve().drive.rstrip(":\\/")
+    ghost = Path(f"{letter}:/sidekick-no-such-dir-{tmp_path.name}/file.txt")
+    got = normalize_user_path(str(ghost), tmp_path)
+    assert not is_relative_to(got, tmp_path)
+    assert path_outside_workspace(str(ghost), tmp_path)
+
+
+def test_special_filename_kept_and_resolved(tmp_path: Path) -> None:
+    name = "报告 (终稿)#v2.md"
+    target = tmp_path / name
+    target.write_text("ok", encoding="utf-8")
+    wrapped = f"`{name}`"
+    got = resolve_existing_tool_path(wrapped, tmp_path)
+    assert got == target.resolve()
+    hashed = normalize_user_path("notes/foo#1.md", tmp_path)
+    assert hashed.name == "foo#1.md"
+    hashed_file = tmp_path / "foo#1.md"
+    hashed_file.write_text("hash", encoding="utf-8")
+    naive_uri = "file:///" + str(hashed_file).replace("\\", "/")
+    got_uri = resolve_existing_tool_path(naive_uri, tmp_path)
+    assert got_uri == hashed_file.resolve()
+
+
+def test_nearby_names_lists_siblings(tmp_path: Path) -> None:
+    (tmp_path / "报告 (终稿).md").write_text("a", encoding="utf-8")
+    missing = tmp_path / "报告.md"
+    names = nearby_file_names(missing)
+    assert "报告 (终稿).md" in names

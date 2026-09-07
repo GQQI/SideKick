@@ -3,6 +3,7 @@ import { readFileContent, searchFiles, type SearchHit } from "../api";
 import { usePrefs } from "../prefs";
 import { FileTypeIcon } from "./FileTypeIcon";
 import { IconSearch } from "./icons";
+import { sameFsPath } from "../utils/fsPath";
 
 type OpenOpts = {
   highlightQuery?: string;
@@ -12,9 +13,16 @@ type OpenOpts = {
 type Props = {
   onOpenFile: (file: import("../api").FilePayload, opts?: OpenOpts) => void;
   refreshKey?: number;
+  activeFilePath?: string | null;
+  workspace?: string | null;
 };
 
-export function FileSearchPanel({ onOpenFile, refreshKey = 0 }: Props) {
+export function FileSearchPanel({
+  onOpenFile,
+  refreshKey = 0,
+  activeFilePath = null,
+  workspace = null,
+}: Props) {
   const { t } = usePrefs();
   const [query, setQuery] = useState("");
   const [hits, setHits] = useState<SearchHit[]>([]);
@@ -35,7 +43,7 @@ export function FileSearchPanel({ onOpenFile, refreshKey = 0 }: Props) {
     }
     setLoading(true);
     timer.current = window.setTimeout(() => {
-      void searchFiles(q)
+      void searchFiles(q, ".", workspace || undefined)
         .then((res) => {
           setHits(res.hits || []);
           setError("");
@@ -50,13 +58,13 @@ export function FileSearchPanel({ onOpenFile, refreshKey = 0 }: Props) {
     return () => {
       if (timer.current) window.clearTimeout(timer.current);
     };
-  }, [query, refreshKey]);
+  }, [query, refreshKey, workspace]);
 
   async function openFile(path: string, focusLine = 0) {
     try {
-      const file = await readFileContent(path);
+      const file = await readFileContent(path, workspace || undefined);
       const q = query.trim();
-      onOpenFile(file, {
+      onOpenFile(workspace ? { ...file, workspace } : file, {
         highlightQuery: q || undefined,
         focusLine: focusLine > 0 ? focusLine : undefined,
       });
@@ -123,7 +131,7 @@ export function FileSearchPanel({ onOpenFile, refreshKey = 0 }: Props) {
             <div key={key} className={`search-hit-group${isOpen ? " open" : ""}`}>
               <button
                 type="button"
-                className="search-hit"
+                className={`search-hit${sameFsPath(h.path, activeFilePath) ? " selected" : ""}`}
                 onClick={() => void onHitClick(h)}
                 title={isContent ? t("searchExpandLines") : h.snippet}
               >

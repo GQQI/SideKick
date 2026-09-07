@@ -1,12 +1,15 @@
 from __future__ import annotations
 
+import os
 import threading
 import time
 from pathlib import Path
 
 from metateam.runtime.approval import (
     APPROVAL_TOOLS,
+    DANGEROUS_SHELL_SCOPE,
     OUTSIDE_WORKSPACE_SCOPE,
+    SHELL_OUTSIDE_SCOPE,
     ApprovalGate,
     approval_required,
     approval_scope,
@@ -156,3 +159,46 @@ def test_remember_outside_workspace_does_not_preapprove_inside_writes(tmp_path: 
     assert not gate.is_preapproved("write_file")
     assert not gate.is_preapproved("read_file")
     assert gate.is_preapproved(approval_scope("write_file", {"path": str(outside)}, tmp_path))
+
+
+def test_outside_shell_uses_separate_scope(tmp_path: Path) -> None:
+    if os.name == "nt":
+        cmd = r"& 'C:\Windows\System32\notepad.exe'"
+        outside_token = r"C:\Windows\System32\notepad.exe"
+    else:
+        cmd = "cat /etc/passwd"
+        outside_token = "/etc/passwd"
+    args = {"command": cmd}
+    assert approval_scope("run_shell", args, tmp_path) == SHELL_OUTSIDE_SCOPE
+    assert approval_scope("verify_run", args, tmp_path) == SHELL_OUTSIDE_SCOPE
+    assert approval_scope("run_shell", {"command": "echo hi"}, tmp_path) == "run_shell"
+    summary = summarize_tool_call("run_shell", args, workspace=tmp_path)
+    assert summary.startswith("工作区外 ·")
+    assert outside_token.split("\\")[-1].split("/")[-1] in summary or "shell" in summary
+    inside = summarize_tool_call("run_shell", {"command": "echo hi"}, workspace=tmp_path)
+    assert not inside.startswith("工作区外")
+
+
+def test_remember_shell_does_not_preapprove_outside_shell(tmp_path: Path) -> None:
+    if os.name == "nt":
+        cmd = r"type C:\Windows\System32\drivers\etc\hosts"
+    else:
+        cmd = "cat /etc/passwd"
+    gate = ApprovalGate(timeout_sec=5)
+    gate.remember_tool("run_shell")
+    assert gate.is_preapproved("run_shell")
+    assert not gate.is_preapproved(SHELL_OUTSIDE_SCOPE)
+    assert approval_scope("run_shell", {"command": cmd}, tmp_path) == SHELL_OUTSIDE_SCOPE
+
+
+def test_dangerous_shell_uses_separate_scope(tmp_path: Path) -> None:
+    args = {"command": "rm -rf /"}
+    assert approval_scope("run_shell", args, tmp_path) == DANGEROUS_SHELL_SCOPE
+    assert approval_scope("verify_run", args, tmp_path) == DANGEROUS_SHELL_SCOPE
+    assert approval_required("run_shell", args=args, workspace=tmp_path)
+    summary = summarize_tool_call("run_shell", args, workspace=tmp_path)
+    assert summary.startswith("危险删除 ·")
+    gate = ApprovalGate(timeout_sec=5)
+    gate.remember_tool("run_shell")
+    gate.remember_tool(SHELL_OUTSIDE_SCOPE)
+    assert not gate.is_preapproved(DANGEROUS_SHELL_SCOPE)

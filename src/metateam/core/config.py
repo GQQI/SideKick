@@ -126,15 +126,17 @@ class Settings:
     )
 
     context_limit: int = field(default_factory=lambda: int(os.getenv("META_CONTEXT_LIMIT", "0") or "0") or 48000)
-    keep_recent_tokens: int = int(os.getenv("META_KEEP_RECENT", "12000"))
+    keep_recent_tokens: int = int(os.getenv("META_KEEP_RECENT", "16000"))
     compress_trigger_ratio: float = float(os.getenv("META_COMPRESS_RATIO", "0.72"))
-    max_compress_attempts: int = int(os.getenv("META_COMPRESS_ATTEMPTS", "3"))
+    # LLM summarization is at most one pass; remaining shrink is cheap trim.
+    max_compress_attempts: int = int(os.getenv("META_COMPRESS_ATTEMPTS", "1"))
 
     # 0 = 40% of main context_limit, capped. Each child uses this budget, not the parent's.
     subagent_context_limit: int = int(os.getenv("META_SUB_CONTEXT_LIMIT", "0") or "0")
 
-    max_iterations: int = int(os.getenv("META_MAX_ITERS", "48"))
-    subagent_max_iterations: int = int(os.getenv("META_SUB_MAX_ITERS", "28"))
+    # 0 = no cap; the loop runs until the model stops or the user hits Stop.
+    max_iterations: int = int(os.getenv("META_MAX_ITERS", "0") or "0")
+    subagent_max_iterations: int = int(os.getenv("META_SUB_MAX_ITERS", "0") or "0")
     max_concurrent_children: int = int(os.getenv("META_MAX_CHILDREN", "3"))
     max_spawn_depth: int = int(os.getenv("META_MAX_SPAWN_DEPTH", "2"))
     # No stream token for this many seconds → interrupt this LLM call and continue.
@@ -145,7 +147,7 @@ class Settings:
     # instead of being discarded while it is still reasoning.
     subagent_timeout: int = int(os.getenv("META_SUBAGENT_TIMEOUT", "0"))
 
-    same_call_fail_limit: int = int(os.getenv("META_SAME_CALL_FAIL", "4"))
+    same_call_fail_limit: int = int(os.getenv("META_SAME_CALL_FAIL", "2"))
     tool_result_cap: int = int(os.getenv("META_TOOL_RESULT_CAP", "18000"))
 
     review_every_n_turns: int = int(os.getenv("META_REVIEW_EVERY", "6"))
@@ -161,7 +163,7 @@ class Settings:
 
     # On by default for local desktop use; mutating shell still requires approval.
     allow_shell: bool = field(default_factory=lambda: _bool("META_ALLOW_SHELL", True))
-    # Path-allowlist sandbox for shell/verify (host cwd=workspace; not a copy FS)
+    # Shell cwd stays in workspace; outside paths need approval (not a copy FS)
     shell_sandbox: bool = field(default_factory=lambda: _bool("META_SHELL_SANDBOX", True))
     shell_timeout: int = int(os.getenv("META_SHELL_TIMEOUT", "90"))
     # Enable MCP tool discovery when mcp package + mcp.json servers are present
@@ -178,7 +180,7 @@ class Settings:
     # Larger budget so delegate_task/subagent tool args & final summaries don't
     # get cut mid-JSON (was 0 → provider default, too small for structured calls).
     subagent_max_tokens: int = int(os.getenv("META_SUB_MAX_TOKENS", "8192") or "8192")
-    compress_max_tokens: int = 0
+    compress_max_tokens: int = int(os.getenv("META_COMPRESS_MAX_TOKENS", "2500") or "2500")
     main_endpoint: Any = None
     subagent_endpoint: Any = None
     compress_endpoint: Any = None

@@ -12,6 +12,7 @@ import { ASK_CUSTOM_KEY } from "../types/chat";
 import {
   buildSuggestions,
   fileToDetail,
+  formatTime,
   greetingKey,
   isSkillInjectMessage,
   writeFilePreview,
@@ -60,6 +61,8 @@ export type ChatThreadProps = {
   onResolveAsk?: (choice: string, otherText?: string) => void;
   onAskChoice?: (key: string) => void;
   onAskOtherText?: (text: string) => void;
+  runningJobs?: { job_id: string; command: string; elapsed_sec?: number }[];
+  onOpenJobs?: (jobId?: string) => void;
 };
 
 export function ChatThread({
@@ -93,9 +96,26 @@ export function ChatThread({
   onResolveAsk,
   onAskChoice,
   onAskOtherText,
+  runningJobs = [],
+  onOpenJobs,
 }: ChatThreadProps) {
   return (
     <>
+      {runningJobs.length > 0 && (
+        <button
+          type="button"
+          className="jobs-banner"
+          onClick={() => onOpenJobs?.(runningJobs[0]?.job_id)}
+        >
+          <span className="jobs-banner-dot" />
+          <strong>{t("jobsBanner")}</strong>
+          <span>
+            {runningJobs[0]?.command || ""}
+            {runningJobs.length > 1 ? ` · +${runningJobs.length - 1}` : ""}
+          </span>
+          <em>{t("jobsOpen")}</em>
+        </button>
+      )}
       {compressState?.active && (
         <div className="compress-banner">
           <div className="compress-banner-text">
@@ -252,7 +272,9 @@ export function ChatThread({
               key={m.id}
               className={`bubble ${m.role}${m.streaming ? " streaming" : ""}${
                 editingId === m.id ? " editing" : ""
-              }${m.role === "user" && isSkillInjectMessage(m.content) ? " skill-inject" : ""}`}
+              }${m.role === "user" && isSkillInjectMessage(m.content) ? " skill-inject" : ""}${
+                m.jobNotice ? " job-notice" : ""
+              }`}
             >
               <div className="bubble-head">
                 <div className="role">
@@ -274,11 +296,13 @@ export function ChatThread({
                   <span className="role-label">
                     {m.role === "user" && isSkillInjectMessage(m.content)
                       ? t("skillInjected")
-                      : m.role === "user"
-                        ? t("you")
-                        : m.role === "system"
-                          ? t("command")
-                          : t("assistant")}
+                      : m.jobNotice
+                        ? t("navJobs")
+                        : m.role === "user"
+                          ? t("you")
+                          : m.role === "system"
+                            ? t("command")
+                            : t("assistant")}
                     {m.streaming
                       ? streamPhaseSuffix(true, {
                           reasoningStreaming: m.reasoningStreaming,
@@ -287,6 +311,11 @@ export function ChatThread({
                         }, t)
                       : ""}
                   </span>
+                  {m.ts && !m.streaming ? (
+                    <span className="bubble-time" title={new Date(m.ts).toLocaleString()}>
+                      {formatTime(m.ts)}
+                    </span>
+                  ) : null}
                 </div>
                 {!m.streaming &&
                   (m.role === "user" || m.role === "assistant" || m.role === "system") && (

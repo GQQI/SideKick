@@ -7,7 +7,13 @@ import type {
   VendorTemplate,
   ModelRef,
 } from "../types/modelSetup";
-import { newModelEntry, refKey, DEFAULT_VENDOR_TEMPLATES } from "../types/modelSetup";
+import {
+  newModelEntry,
+  refKey,
+  autoRef,
+  isAutoRef,
+  DEFAULT_VENDOR_TEMPLATES,
+} from "../types/modelSetup";
 import type { MsgKey } from "../i18n";
 import {
   IconCheck,
@@ -74,6 +80,12 @@ function newProvider(
     market_id: kind,
     models: [newModelEntry("", { base_url: baseUrl })],
   };
+}
+
+function setRole(setup: ModelSetup, role: "main" | "subagent", ref: ModelRef): ModelSetup {
+  const next: ModelSetup = { ...setup, [role]: ref };
+  if (role === "subagent") next.compress = { ...ref };
+  return next;
 }
 
 function badge(kind: string): string {
@@ -163,9 +175,9 @@ function RfSelect({
             onMouseDown={(e) => e.stopPropagation()}
           >
             {visibleGroups.length
-              ? visibleGroups.map((g) => (
-                  <div key={g.label} className="rf-select-group">
-                    <div className="rf-select-group-label">{g.label}</div>
+              ? visibleGroups.map((g, gi) => (
+                  <div key={g.label || `g${gi}`} className="rf-select-group">
+                    {g.label ? <div className="rf-select-group-label">{g.label}</div> : null}
                     {g.options.map((o) => (
                       <button
                         key={o.value}
@@ -230,17 +242,6 @@ export function ModelSettings({ setup, locale, onChange, onSave, saving, t }: Pr
   const [renamingProv, setRenamingProv] = useState("");
   const [renameValue, setRenameValue] = useState("");
   const [confirmProvId, setConfirmProvId] = useState("");
-  const [roleDraft, setRoleDraft] = useState<{
-    main?: ModelRef;
-    subagent?: ModelRef;
-  }>({});
-
-  const view: ModelSetup = {
-    ...setup,
-    main: roleDraft.main ?? setup.main,
-    subagent: roleDraft.subagent ?? setup.subagent,
-    compress: roleDraft.subagent ?? setup.compress,
-  };
 
   const editingModel = useMemo(() => {
     if (!edit) return null;
@@ -274,15 +275,7 @@ export function ModelSettings({ setup, locale, onChange, onSave, saving, t }: Pr
   }, [setup.providers, mineQuery]);
 
   function persist(next: ModelSetup) {
-    const merged: ModelSetup = {
-      ...next,
-      main: roleDraft.main ?? next.main,
-      subagent: roleDraft.subagent ?? next.subagent,
-      compress: roleDraft.subagent ?? next.compress,
-    };
-    onChange(merged);
-    onSave(merged, { restartChat: false });
-    setRoleDraft({});
+    onChange(next);
   }
 
   function patchModel(
@@ -320,6 +313,12 @@ export function ModelSettings({ setup, locale, onChange, onSave, saving, t }: Pr
   }
 
   function addFromMarket(kind: MarketKind) {
+    const existing =
+      setup.providers.find((p) => (p.market_id || "custom") === kind) || setup.providers[0];
+    if (existing) {
+      addBlankModel(existing);
+      return;
+    }
     const p = newProvider(
       kind,
       templates,
@@ -401,13 +400,12 @@ export function ModelSettings({ setup, locale, onChange, onSave, saving, t }: Pr
   function pickRole(role: "main" | "subagent", key: string) {
     const i = key.indexOf("::");
     if (i <= 0) return;
-    setRoleDraft((d) => ({
-      ...d,
-      [role]: {
+    persist(
+      setRole(setup, role, {
         provider_id: key.slice(0, i),
         model_id: key.slice(i + 2),
-      },
-    }));
+      }),
+    );
   }
 
   function openEdit(providerId: string, modelId: string) {
@@ -417,11 +415,10 @@ export function ModelSettings({ setup, locale, onChange, onSave, saving, t }: Pr
   }
 
   function applyNow() {
-    persist(setup);
+    onSave(setup, { restartChat: false });
   }
 
   function closeEdit() {
-    persist(setup);
     setEdit(null);
     setShowKey(false);
   }
@@ -456,25 +453,38 @@ export function ModelSettings({ setup, locale, onChange, onSave, saving, t }: Pr
             <h3 className="rf-block-title">{t("modelStepAgents")}</h3>
             <div className="rf-defaults">
               {(["main", "subagent"] as const).map((role) => {
-                const ref = role === "main" ? view.main : view.subagent;
+                const ref = role === "main" ? setup.main : setup.subagent;
+                const auto = isAutoRef(ref);
                 return (
-                  <label key={role}>
-                    <span>{role === "main" ? t("mainModel") : t("subModel")}</span>
+                  <label key={role} className={auto ? "rf-default-auto" : undefined}>
+                    <span>
+                      {role === "main" ? t("mainModel") : t("subModel")}
+                      {auto ? <em className="rf-auto-badge">{t("modelAutoBadge")}</em> : null}
+                    </span>
                     <RfSelect
                       value={refKey(ref)}
                       disabled={!hasModels}
                       placeholder={t("modelPickProviderFirst")}
-                      groups={setup.providers
-                        .filter((p) => p.models.length > 0)
-                        .map((p) => ({
-                          label: p.name,
-                          options: p.models.map((m) => ({
-                            value: refKey({ provider_id: p.id, model_id: m.id }),
-                            label: m.name || t("modelUnnamed"),
+                      groups={[
+                        {
+                          label: "",
+                          options: [
+                            { value: refKey(autoRef()), label: `✨ ${t("modelAutoOption")}` },
+                          ],
+                        },
+                        ...setup.providers
+                          .filter((p) => p.models.length > 0)
+                          .map((p) => ({
+                            label: p.name,
+                            options: p.models.map((m) => ({
+                              value: refKey({ provider_id: p.id, model_id: m.id }),
+                              label: m.name || t("modelUnnamed"),
+                            })),
                           })),
-                        }))}
+                      ]}
                       onChange={(v) => pickRole(role, v)}
                     />
+                    {auto ? <p className="hint rf-auto-hint">{t("modelAutoDesc")}</p> : null}
                   </label>
                 );
               })}
@@ -599,10 +609,10 @@ export function ModelSettings({ setup, locale, onChange, onSave, saving, t }: Pr
                             <ul className="rf-model-rows">
                               {p.models.map((m) => {
                                 const mainOn =
-                                  view.main.provider_id === p.id && view.main.model_id === m.id;
+                                  setup.main.provider_id === p.id && setup.main.model_id === m.id;
                                 const subOn =
-                                  view.subagent.provider_id === p.id &&
-                                  view.subagent.model_id === m.id;
+                                  setup.subagent.provider_id === p.id &&
+                                  setup.subagent.model_id === m.id;
                                 const ready = Boolean(m.api_key_set || m.api_key);
                                 const active = edit?.providerId === p.id && edit?.modelId === m.id;
                                 return (

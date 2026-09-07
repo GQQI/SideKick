@@ -29,7 +29,7 @@ import {
   type SubTranscriptItem,
   type ToolCard,
 } from "../types/chat";
-import type { PlanConfirmState } from "../types/plan";
+import type { PlanConfirmState, PlanTask } from "../types/plan";
 import { ThinkTagSplitter, splitThinkTags } from "../utils/thinkTags";
 import { mapSessionMessages, uid, findSubNode, mapSubNode } from "../utils/chatHelpers";
 import type { MsgKey } from "../i18n";
@@ -195,7 +195,11 @@ export function useChatStream(deps: ChatStreamDeps) {
   }
 
 function appendMsg(msg: ChatMsg) {
-  commit([...transcriptRef.current, { ...msg, stage: msg.stage ?? stageRef.current }]);
+  if (msg.id && transcriptRef.current.some((m) => m.id === msg.id)) return;
+  commit([
+    ...transcriptRef.current,
+    { ...msg, stage: msg.stage ?? stageRef.current, ts: msg.ts ?? Date.now() },
+  ]);
 }
 
 function removeMsg(id: string) {
@@ -381,6 +385,19 @@ function looksLikeOptionList(text: string): boolean {
 
 function discardStreamBubble() {
   const id = streamIdRef.current;
+  // Flush tag leftovers into the refs first so we can decide seal vs drop.
+  for (const p of thinkSplitRef.current.flush()) {
+    if (p.kind === "reasoning") streamReasoningRef.current += p.text;
+    else streamTextRef.current += p.text;
+  }
+  thinkSplitRef.current.reset();
+  // Keep any thinking (or text) that already streamed — ask/plan discard must
+  // not erase the "思考" bubble the user just watched. Only drop a truly empty
+  // opener that was created solely to be replaced.
+  if (streamReasoningRef.current.trim() || streamTextRef.current.trim()) {
+    sealStreamBubble();
+    return;
+  }
   if (id) {
     commit(transcriptRef.current.filter((m) => m.id !== id));
   }
@@ -388,7 +405,6 @@ function discardStreamBubble() {
   streamTextRef.current = "";
   streamReasoningRef.current = "";
   nativeReasoningRef.current = false;
-  thinkSplitRef.current.reset();
 }
 
 function stripDuplicateAskBubble(question: string) {
@@ -440,21 +456,29 @@ function sealStreamBubble() {
   nativeReasoningRef.current = false;
 }
 
+function sealStreamBubbleIfContent() {
+  if (!streamIdRef.current) return;
+  if (streamTextRef.current.trim() || streamReasoningRef.current.trim()) {
+    sealStreamBubble();
+  }
+  // Empty bubble: keep it open. Reasoning that streams after the first
+  // tool-arg delta still lands here, above the tool chip.
+}
+
 function ensureStreamBubble(reset: boolean) {
   if (reset) sealStreamBubble();
   if (streamIdRef.current) return;
-  // Continue the same LLM turn only when tool chips sit after the assistant
-  // (content interleaved with tool_call_delta). Never skip subagent cards —
-  // that reopened a sealed thinking bubble and glued the next step into it.
+  // Continue the same LLM turn only while that bubble is still actively
+  // streaming (content interleaved with tool_call_delta for THIS turn).
+  // A sealed (non-streaming) bubble means a previous turn already finished —
+  // reusing it just because a tool chip sits after it glued every later
+  // turn's reasoning into the very first reply. Always start fresh instead.
   if (!reset) {
     for (let i = transcriptRef.current.length - 1; i >= 0; i--) {
       const m = transcriptRef.current[i];
       if (m.role === "tool") continue;
       if (m.role === "assistant") {
-        const toolsAfter = transcriptRef.current
-          .slice(i + 1)
-          .some((x) => x.role === "tool");
-        if (!m.streaming && !toolsAfter) break;
+        if (!m.streaming) break;
         streamIdRef.current = m.id;
         streamTextRef.current = m.content || "";
         streamReasoningRef.current = m.reasoning || "";
@@ -593,6 +617,17 @@ function isLiveListener(gen: number) {
   return listenerGenRef.current === gen;
 }
 
+/** `final` carries the post-turn window usage; settle the meter on it. */
+function syncCtxFromFinal(meta: Record<string, unknown>) {
+  const tokens = Number(meta.context_tokens);
+  const limit = Number(meta.context_limit);
+  if (!Number.isFinite(tokens) || tokens < 0) return;
+  setCtx((c) => ({
+    tokens,
+    limit: Number.isFinite(limit) && limit > 0 ? limit : c.limit,
+  }));
+}
+
 function detachListener() {
   listenerGenRef.current += 1;
   const activeAbort = abortRef.current;
@@ -601,6 +636,9 @@ function detachListener() {
   sealStoppedTurn();
   abortRef.current = null;
   stoppingRef.current = false;
+  // The next session's snapshot (resumeFromSnapshot) restores its own plan.
+  executingPlanIdRef.current = null;
+  setActivePlan(null);
   setBusyState(false);
 }
 
@@ -669,6 +707,9 @@ async function stopChat() {
   // loading state and make history safe to open.
   abortRef.current?.abort();
   if (sid) markSessionIdle(sid);
+  // plan_done may never arrive once we detach; drop the pinned plan now.
+  executingPlanIdRef.current = null;
+  setActivePlan(null);
   setBusyState(false);
   void refreshSessionsRef.current();
   // Server cancel also rejects pending approvals — do not double-call decide here
@@ -681,18 +722,27 @@ function alignCanvasFromSession(sid: string) {
   if (!sid) return;
   void fetchSession(sid)
     .then((d) => {
+      if ((sessionIdRef.current || "") !== sid) return;
       const mapped = mapSessionMessages(d.messages, d.agent_tree);
-      const latest = Math.max(0, ...mapped.map((m) => m.stage ?? 0));
-      const nodes = mapped
-        .filter((m) => m.role === "subagent" && m.subagent && (m.stage ?? 0) === latest)
-        .map((m) => m.subagent!);
-      if (nodes.length) replaceStageSubagents(toolUpsertCtx, nodes, latest);
+      const byStage = new Map<number, SubNode[]>();
+      for (const m of mapped) {
+        if (m.role !== "subagent" || !m.subagent) continue;
+        const st = m.stage ?? 0;
+        const list = byStage.get(st) || [];
+        list.push(m.subagent);
+        byStage.set(st, list);
+      }
+      if (!byStage.size) return;
+      for (const [st, nodes] of byStage) {
+        replaceStageSubagents(toolUpsertCtx, nodes, st);
+      }
     })
     .catch(() => {});
 }
 
 const toolUpsertCtx: ToolUpsertCtx = {
   sealStreamBubble,
+  sealStreamBubbleIfContent,
   findToolMsg,
   updateMsg,
   syncToolPanel,
@@ -832,11 +882,18 @@ async function sendChat(
             tokens: Number(meta.tokens || 0),
             iters: Number(meta.iterations || 0),
           });
+          syncCtxFromFinal(meta);
           if (meta.session_id) setSessionId(String(meta.session_id));
           alignCanvasFromSession(String(meta.session_id || sessionId || ""));
           void fetchSkills().then(setSkills);
           void fetchMemory().then(setMemory);
           setFsRefresh((n) => n + 1);
+          // The turn is logically done the moment "final" arrives — don't
+          // leave the "正在工作…" spinner up while the HTTP stream (which
+          // may take a while to actually close server-side) keeps draining.
+          stoppingRef.current = false;
+          setBusyState(false);
+          void drainQueueSoon();
         },
         onError: (err) => {
           markSessionIdle(sessionIdRef.current || sessionId);
@@ -844,6 +901,9 @@ async function sendChat(
           sealStreamBubble();
           appendMsg({ id: uid(), role: "assistant", content: `错误：${err}` });
           turnDoneRef.current = true;
+          stoppingRef.current = false;
+          setBusyState(false);
+          void drainQueueSoon();
         },
         onAbort: () => {
           if (!isLiveListener(gen)) return;
@@ -851,11 +911,14 @@ async function sendChat(
           const had = streamTextRef.current.trim();
           finalizeAssistant(had, { stopped: true });
           setToast(had ? t("stoppedKeep") : t("stopped"));
+          stoppingRef.current = false;
+          setBusyState(false);
         },
       },
       ac.signal,
       runMode,
       displayForApi,
+      activeWs?.path || null,
     );
     if (isLiveListener(gen) && sid) setSessionId(sid);
     // streamChat resolves after the turn ends (final / abort / error).
@@ -958,15 +1021,22 @@ async function attachLive(sid: string) {
             tokens: Number(meta.tokens || 0),
             iters: Number(meta.iterations || 0),
           });
+          syncCtxFromFinal(meta);
           void fetchSkills().then(setSkills);
           void fetchMemory().then(setMemory);
           setFsRefresh((n) => n + 1);
+          stoppingRef.current = false;
+          setBusyState(false);
+          void drainQueueSoon();
         },
         onError: (err) => {
           markSessionIdle(sid);
           if (!isLiveListener(gen)) return;
           sealStreamBubble();
           appendMsg({ id: uid(), role: "assistant", content: `错误：${err}` });
+          stoppingRef.current = false;
+          setBusyState(false);
+          void drainQueueSoon();
         },
         onAbort: () => {
           /* detached to another chat; server turn keeps running */
@@ -1035,6 +1105,29 @@ function resumeFromSnapshot(detail: SessionDetail) {
   } else {
     planPendingRef.current = false;
     setPlanConfirm(null);
+  }
+  // The pinned plan panel is re-derived from the server on every (re)attach so
+  // a plan from another session, or one whose transcript was deleted, cannot
+  // linger above the composer.
+  const live = detail.active_plan;
+  if (detail.busy && live?.plan_id) {
+    executingPlanIdRef.current = String(live.plan_id);
+    setActivePlan({
+      planId: String(live.plan_id),
+      summary: String(live.summary || ""),
+      mode: "agent",
+      awaitingConfirm: false,
+      shapeContract: null,
+      tasks: (live.tasks || []).map((task, i) => ({
+        id: String(task.id || `task_${i}`),
+        title: String(task.title || `步骤 ${i + 1}`),
+        detail: String(task.detail || ""),
+        status: (task.status as PlanTask["status"]) || "pending",
+      })),
+    });
+  } else {
+    executingPlanIdRef.current = null;
+    setActivePlan(null);
   }
   if (detail.busy) void attachLive(detail.id);
 }

@@ -15,6 +15,7 @@ DEFAULT_USER_ID = "default"
 
 _current_user_id: ContextVar[str] = ContextVar("sidekick_user_id", default=DEFAULT_USER_ID)
 _current_username: ContextVar[str] = ContextVar("sidekick_username", default="")
+_current_session_id: ContextVar[str] = ContextVar("sidekick_session_id", default="")
 
 
 def get_user_id() -> str:
@@ -33,6 +34,21 @@ def set_user(user_id: str, username: str = "") -> None:
 def reset_user() -> None:
     _current_user_id.set(DEFAULT_USER_ID)
     _current_username.set("")
+
+
+def get_session_id() -> str:
+    return (_current_session_id.get() or "").strip()
+
+
+def bind_session_id(session_id: str) -> Any:
+    return _current_session_id.set((session_id or "").strip())
+
+
+def reset_session_id(token: Any) -> None:
+    try:
+        _current_session_id.reset(token)
+    except Exception:
+        _current_session_id.set("")
 
 
 def tenants_root() -> Path:

@@ -179,7 +179,8 @@ export function fileToDetail(
     preview: file.preview || "",
     editable: Boolean(file.editable ?? kind === "text"),
     message: file.message || (kind === "unsupported" ? "暂不支持预览此文件" : ""),
-    rawUrl: fileRawUrl(file.path),
+    rawUrl: fileRawUrl(file.path, file.workspace),
+    workspace: file.workspace,
     highlightQuery: opts?.highlightQuery,
     focusLine: opts?.focusLine,
     forceEdit: false,
@@ -407,6 +408,53 @@ export function canvasRootsForStage(messages: ChatMsg[], stage: number): SubNode
   return nestHelperAgents(dedupeCanvasNodes(limitCanvasRoots(nodes, declared)));
 }
 
+export function isDelegateToolMsg(message: ChatMsg): boolean {
+  return Boolean(
+    message.role === "tool" && message.tool && DELEGATE_TOOL_NAMES.has(message.tool.name),
+  );
+}
+
+/** Index after which canvas cards for `stage` belong (delegate tool, not the thread tail). */
+export function canvasInsertAfterIndex(messages: ChatMsg[], stage: number): number {
+  let lastDelegate = -1;
+  let lastTool = -1;
+  let lastOfStage = -1;
+  for (let i = 0; i < messages.length; i++) {
+    const message = messages[i];
+    if ((message.stage ?? 0) !== stage) continue;
+    if (message.role === "subagent") continue;
+    lastOfStage = i;
+    if (message.role === "tool" && message.tool) {
+      lastTool = i;
+      if (DELEGATE_TOOL_NAMES.has(message.tool.name)) lastDelegate = i;
+    }
+  }
+  if (lastDelegate >= 0) return lastDelegate;
+  if (lastTool >= 0) return lastTool;
+  return lastOfStage;
+}
+
+/** Splice canvas messages into the turn that spawned them — never after later user turns. */
+export function placeCanvasMessages(
+  messages: ChatMsg[],
+  canvasMsgs: ChatMsg[],
+  stage: number,
+): ChatMsg[] {
+  const without = messages.filter(
+    (message) => !(message.role === "subagent" && (message.stage ?? 0) === stage),
+  );
+  if (!canvasMsgs.length) return without;
+  const after = canvasInsertAfterIndex(without, stage);
+  if (after >= 0) {
+    return [...without.slice(0, after + 1), ...canvasMsgs, ...without.slice(after + 1)];
+  }
+  const nextIdx = without.findIndex((message) => (message.stage ?? 0) > stage);
+  if (nextIdx >= 0) {
+    return [...without.slice(0, nextIdx), ...canvasMsgs, ...without.slice(nextIdx)];
+  }
+  return [...without, ...canvasMsgs];
+}
+
 function partyOwnsTask(party: SubNode, task: SubNode): boolean {
   if (task.parent_id && (task.parent_id === party.id || task.parent_id === party.role)) {
     return true;
@@ -627,6 +675,14 @@ function latestCanvasTree(agentTree?: unknown[]): unknown[] {
   return rows;
 }
 
+export function canvasTurnFromAgentTree(agentTree?: unknown[]): number {
+  const rows = latestCanvasTree(agentTree);
+  const turns = rows
+    .map((raw) => Number((raw as Record<string, unknown>).turn || 0))
+    .filter((n) => Number.isFinite(n) && n > 0);
+  return turns.length ? Math.max(...turns) : 0;
+}
+
 export function nodesFromAgentTree(agentTree?: unknown[]): SubNode[] {
   return nestHelperAgents(
     latestCanvasTree(agentTree)
@@ -657,19 +713,30 @@ export function mapSessionMessages(
         attachments: parsed.attachments.length ? parsed.attachments : undefined,
         stage,
         agent_id: m.agent_id,
+        ts: m.ts ? m.ts * 1000 : undefined,
       });
       continue;
     }
     if (m.role === "assistant") {
       const content = stripToolCallMarkup((m.content || "").trim());
       if (!content && !m.reasoning) continue;
+      const jobMeta = m.sidekick?.kind === "shell_job_done" ? m.sidekick : null;
+      const jobId = String(jobMeta?.job_id || "").trim();
       out.push({
-        id: uid(),
+        id: jobId ? `job-done-${jobId}` : uid(),
         role: "assistant",
         content,
         reasoning: m.reasoning || undefined,
         stage,
         agent_id: m.agent_id,
+        ts: m.ts ? m.ts * 1000 : undefined,
+        jobNotice: jobId
+          ? {
+              job_id: jobId,
+              status: String(jobMeta?.status || "exited"),
+              exit_code: jobMeta?.exit_code ?? null,
+            }
+          : undefined,
       });
       continue;
     }
@@ -721,28 +788,33 @@ export function mapSessionMessages(
         content: "",
         tool,
         stage,
+        ts: m.ts ? m.ts * 1000 : undefined,
       });
     }
   }
-  const latestStage = Math.max(1, ...out.map((m) => m.stage ?? 0), stage);
+  const existingStages = [...new Set(out.map((m) => m.stage ?? 0).filter((n) => n > 0))];
+  const latestStage = Math.max(1, ...existingStages, stage);
+  const treeTurn = canvasTurnFromAgentTree(agentTree);
+  const toolStages = [...expandedByStage.keys()];
+  const treeStage = existingStages.includes(treeTurn)
+    ? treeTurn
+    : toolStages.length
+      ? Math.max(...toolStages)
+      : latestStage;
   if (treeRoots.length) {
-    const fromTools = expandedByStage.get(latestStage) || [];
+    const fromTools = expandedByStage.get(treeStage) || [];
     expandedByStage.set(
-      latestStage,
+      treeStage,
       unionCanvasNodes(treeRoots, fromTools, fromTools.length || treeRoots.length),
     );
   }
+  let placed = out;
   for (const [stageKey, nodes] of expandedByStage) {
     const msgs = nodes.map((n) => asSubagentMsg(n, stageKey));
     if (!msgs.length) continue;
-    let last = -1;
-    for (let i = 0; i < out.length; i++) {
-      if ((out[i].stage ?? 0) === stageKey) last = i;
-    }
-    if (last < 0) out.push(...msgs);
-    else out.splice(last + 1, 0, ...msgs);
+    placed = placeCanvasMessages(placed, msgs, stageKey);
   }
-  return out;
+  return placed;
 }
 
 function canvasStatus(raw: unknown): SubNode["status"] {

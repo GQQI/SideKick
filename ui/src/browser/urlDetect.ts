@@ -31,6 +31,49 @@ export function displayHttpUrl(href: string): string {
   }
 }
 
+const PREVIEW_FILE_RE = /\.(html?|pdf)([?#]|$)/i;
+
+/**
+ * Workspace-relative, file://, or same-origin path to HTML/PDF — not a remote link.
+ */
+export function isLocalPreviewTarget(raw: string): boolean {
+  const t = String(raw || "").trim();
+  if (!t || t === "about:blank") return false;
+  if (/^file:/i.test(t)) return PREVIEW_FILE_RE.test(t);
+  if (/^https?:/i.test(t)) {
+    try {
+      const u = new URL(t);
+      const origin = typeof window !== "undefined" ? window.location.origin : "";
+      return Boolean(origin) && u.origin === origin && PREVIEW_FILE_RE.test(u.pathname);
+    } catch {
+      return false;
+    }
+  }
+  if (/^[a-z][a-z0-9+.-]*:/i.test(t)) return false;
+  return PREVIEW_FILE_RE.test(t);
+}
+
+/** @deprecated use isLocalPreviewTarget */
+export function isLocalHtmlTarget(raw: string): boolean {
+  return isLocalPreviewTarget(raw);
+}
+
+/** Workspace-relative path (or file://) to pass to the preview server. */
+export function localPreviewPath(raw: string): string {
+  const t = String(raw || "").trim();
+  if (!t) return "";
+  if (/^file:/i.test(t)) return t;
+  if (/^https?:/i.test(t)) {
+    try {
+      const u = new URL(t);
+      return decodeURIComponent(u.pathname.replace(/^\/+/, ""));
+    } catch {
+      return t;
+    }
+  }
+  return t.replace(/^\.\//, "").replace(/^\/+/, "");
+}
+
 /**
  * Extract a navigable http(s) URL from chat/markdown junk.
  * "http://localhost:5173**，已在/" → "http://localhost:5173"
@@ -106,7 +149,18 @@ export function prepMarkdownForUrls(src: string): string {
     i = start + url.length;
   }
   out += s.slice(i);
-  return out;
+
+  // 3) Bare workspace files (report.html / report.pdf) → markdown links we intercept.
+  return out.replace(
+    /(^|[\s])((?:\.\/)?[\w./\\\-\u4e00-\u9fff]+\.(?:html?|pdf))(?=$|[\s,，。;；])/gi,
+    (full, pre: string, file: string, offset: number, whole: string) => {
+      const idx = offset + pre.length;
+      const prev2 = whole.slice(Math.max(0, idx - 2), idx);
+      const prev1 = idx > 0 ? whole[idx - 1] : "";
+      if (prev2 === "](" || prev1 === "[" || prev1 === "(") return full;
+      return `${pre}[${file}](${file})`;
+    },
+  );
 }
 
 /**
@@ -134,7 +188,7 @@ export function splitDirtyUrlLabel(label: string): {
   };
 }
 
-/** Ctrl/Cmd+click or right-click → offer sandbox open (caller provides prompt UI). */
+/** Ctrl/Cmd+click or right-click http(s); any click on local HTML/PDF → sandbox prompt. */
 export function sandboxUrlGesture(
   url: string | undefined,
   e: {
@@ -148,9 +202,11 @@ export function sandboxUrlGesture(
   onOpen: ((url: string, clientX: number, clientY: number) => void) | undefined,
   opts: { mode: "click" | "contextmenu" },
 ): boolean {
-  const clean = sanitizeBrowserUrl(url || "");
+  const raw = url || "";
+  const local = isLocalPreviewTarget(raw) ? localPreviewPath(raw) : "";
+  const clean = local || sanitizeBrowserUrl(raw);
   if (!clean || !onOpen) return false;
-  if (opts.mode === "click" && !(e.ctrlKey || e.metaKey)) return false;
+  if (opts.mode === "click" && !local && !(e.ctrlKey || e.metaKey)) return false;
   e.preventDefault();
   e.stopPropagation();
   onOpen(clean, e.clientX, e.clientY);

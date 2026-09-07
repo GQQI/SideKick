@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
-from typing import Any, NoReturn
+from contextlib import contextmanager
+from pathlib import Path
+from typing import Any, Iterator, NoReturn, Optional
 
 from fastapi import HTTPException, Request
 
@@ -36,11 +38,57 @@ def raise_fs_http(exc: BaseException) -> NoReturn:
     raise HTTPException(500, str(exc)) from exc
 
 
-def call_fs(fn, *args: Any, **kwargs: Any) -> Any:
+@contextmanager
+def workspace_override(workspace: Optional[str]) -> Iterator[None]:
+    """Point file/git panel calls at a specific open workspace for one request.
+
+    Several chats may be pinned to different folders at once; the file and
+    git side panels pass the workspace of whichever chat is currently
+    focused (or being previewed) instead of always using the tenant's single
+    "default" workspace.
+    """
+    raw = (workspace or "").strip()
+    if not raw:
+        yield
+        return
+    from ..services.fs_api import bind_active_workspace, reset_active_workspace
+
     try:
-        return fn(*args, **kwargs)
+        folder = Path(raw).expanduser().resolve()
+        if not folder.is_dir():
+            yield
+            return
+    except Exception:
+        yield
+        return
+    token = bind_active_workspace(folder)
+    try:
+        yield
+    finally:
+        reset_active_workspace(token)
+
+
+def call_fs(fn, *args: Any, workspace: Optional[str] = None, **kwargs: Any) -> Any:
+    try:
+        with workspace_override(workspace):
+            return fn(*args, **kwargs)
     except (FileNotFoundError, FileExistsError, ValueError, OSError) as exc:
         raise_fs_http(exc)
+
+
+def resolve_panel_workspace(workspace: Optional[str]) -> Path:
+    """Absolute root for git panel calls — falls back to the default workspace."""
+    from ..core.config import get_settings
+
+    raw = (workspace or "").strip()
+    if raw:
+        try:
+            folder = Path(raw).expanduser().resolve()
+            if folder.is_dir():
+                return folder
+        except Exception:
+            pass
+    return Path(get_settings().workspace)
 
 
 def git_result_or_400(result: str) -> str:

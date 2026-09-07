@@ -7,20 +7,28 @@ type Props = {
   streaming?: boolean;
 };
 
-/** Thinking / reasoning block — open while streaming so it is visible immediately. */
+/** Thinking / reasoning block — stays open after streaming so it does not
+ *  "vanish" into a collapsed header the moment the turn finishes. */
 export function ThinkingBlock({ content, streaming }: Props) {
   const { t } = usePrefs();
-  const [open, setOpen] = useState(Boolean(streaming));
+  const [open, setOpen] = useState(true);
+  const [userCollapsed, setUserCollapsed] = useState(false);
   useEffect(() => {
-    if (streaming) setOpen(true);
-  }, [streaming]);
+    if (streaming && !userCollapsed) setOpen(true);
+  }, [streaming, userCollapsed]);
   if (!content && !streaming) return null;
   return (
     <div className={`thinking-block${streaming ? " streaming" : ""}${open ? " open" : ""}`}>
       <button
         type="button"
         className="thinking-toggle"
-        onClick={() => setOpen((v) => !v)}
+        onClick={() => {
+          setOpen((v) => {
+            const next = !v;
+            setUserCollapsed(!next);
+            return next;
+          });
+        }}
         aria-expanded={open}
       >
         <span className="thinking-mark">{streaming ? "…" : "◇"}</span>

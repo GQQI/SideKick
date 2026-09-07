@@ -10,6 +10,7 @@ from ...services.folder_picker import pick_folder
 from ...services.store import STORE
 from ...services.workspace_store import (
     create_workspace,
+    forget_recent,
     get_active_workspace,
     is_configured,
     list_workspaces,
@@ -65,6 +66,23 @@ def api_workspaces_set(body: WorkspaceSet) -> dict[str, Any]:
         "configured": True,
         "active": active,
         "items": list_workspaces(),
+    }
+
+
+@router.delete("")
+def api_workspaces_forget(path: str) -> dict[str, Any]:
+    target = (path or "").strip()
+    if not target:
+        raise HTTPException(400, "path required")
+    try:
+        items = forget_recent(target)
+    except ValueError as exc:
+        raise HTTPException(400, str(exc)) from exc
+    return {
+        "status": "ok",
+        "configured": is_configured(),
+        "active": get_active_workspace(),
+        "items": items,
     }
 
 
