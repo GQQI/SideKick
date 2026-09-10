@@ -47,7 +47,7 @@ export type ChatStreamDeps = {
   locale: string;
   sessionId: string | null;
   sessionIdRef: React.MutableRefObject<string | null>;
-  activeWs: { path: string; name: string } | null;
+  activeWs: { path: string; name: string; id?: string } | null;
   chatMode: "plan" | "agent";
   setMessages: React.Dispatch<React.SetStateAction<ChatMsg[]>>;
   setInput: React.Dispatch<React.SetStateAction<string>>;

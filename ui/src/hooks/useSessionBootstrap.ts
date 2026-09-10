@@ -20,9 +20,14 @@ import type { SkillItem, SessionItem, WorkspaceItem } from "../api";
 
 export type SessionBootstrapDeps = {
   sessionsPage: number;
+  /** History and the chat-tabs strip are scoped to this workspace. Prefer
+   * the stable id; path is only a fallback for the brief window before the
+   * first /api/workspaces response resolves it. */
+  activeWsPath: string | null;
+  activeWorkspaceId: string | null;
   setHealth: (h: Health | null) => void;
   setWorkspaces: (w: WorkspaceItem[]) => void;
-  setActiveWs: (w: { path: string; name: string } | null) => void;
+  setActiveWs: (w: { path: string; name: string; id?: string } | null) => void;
   setBootReady: (v: boolean) => void;
   setSessionId: (id: string | null) => void;
   setSkills: (s: SkillItem[]) => void;
@@ -48,6 +53,8 @@ export type SessionBootstrapDeps = {
 export function useSessionBootstrap(deps: SessionBootstrapDeps) {
   const {
     sessionsPage,
+    activeWsPath,
+    activeWorkspaceId,
     setHealth,
     setWorkspaces,
     setActiveWs,
@@ -73,6 +80,10 @@ export function useSessionBootstrap(deps: SessionBootstrapDeps) {
   } = deps;
   const onResumeRuntimeRef = useRef(deps.onResumeRuntime);
   onResumeRuntimeRef.current = deps.onResumeRuntime;
+  const activeWsPathRef = useRef(activeWsPath);
+  activeWsPathRef.current = activeWsPath;
+  const activeWorkspaceIdRef = useRef(activeWorkspaceId);
+  activeWorkspaceIdRef.current = activeWorkspaceId;
 
   const syncContextFromSession = useCallback(
     (detail: { tokens?: number; limit?: number }) => {
@@ -129,7 +140,22 @@ export function useSessionBootstrap(deps: SessionBootstrapDeps) {
     async (page?: number) => {
       try {
         const target = page ?? sessionsPage;
-        const res = await fetchSessions(target, HISTORY_PAGE_SIZE);
+        // Scope to the workspace on screen — switching workspace must switch
+        // which history shows, not just badge the current one among all of them.
+        const scopeId = activeWorkspaceIdRef.current;
+        const scopePath = activeWsPathRef.current;
+        const res = await fetchSessions(target, HISTORY_PAGE_SIZE, {
+          workspaceId: scopeId,
+          workspace: scopePath,
+        });
+        // A slower request for a workspace the user has since switched away
+        // from must never clobber the list with the wrong project's chats —
+        // that overlapping-poll race is what "flickers back and forth"
+        // between two workspaces after switching. Only apply the response
+        // if we're still looking at the same workspace that requested it.
+        if (activeWorkspaceIdRef.current !== scopeId || activeWsPathRef.current !== scopePath) {
+          return;
+        }
         setSessions(res.items || []);
         setSessionsPage(res.page || 1);
         setSessionsTotal(res.total || 0);
@@ -154,7 +180,7 @@ export function useSessionBootstrap(deps: SessionBootstrapDeps) {
   }, [setWorkspaces, setActiveWs]);
 
   const restoreOrCreateSession = useCallback(
-    async (workspacePath: string | null) => {
+    async (workspacePath: string | null, workspaceId?: string | null) => {
       const tryOpen = async (id: string) => {
         const detail = await fetchSession(id);
         applySessionDetail(detail);
@@ -171,7 +197,10 @@ export function useSessionBootstrap(deps: SessionBootstrapDeps) {
       }
 
       try {
-        const list = await fetchSessions(1, HISTORY_PAGE_SIZE);
+        const list = await fetchSessions(1, HISTORY_PAGE_SIZE, {
+          workspaceId,
+          workspace: workspacePath,
+        });
         const hit = (list.items || []).find((s) => (s.user_turns ?? 0) > 0 || s.messages > 0);
         if (hit) {
           try {
@@ -195,11 +224,12 @@ export function useSessionBootstrap(deps: SessionBootstrapDeps) {
     await ensureApiToken();
     const [h, w] = await Promise.all([fetchHealth(), fetchWorkspaces()]);
     const wsPath = w.active?.path || null;
+    const wsId = w.active?.id || null;
     setHealth(h);
     setWorkspaces(w.items);
     setActiveWs(wsPath ? w.active : null);
     setBootReady(true);
-    await restoreOrCreateSession(wsPath);
+    await restoreOrCreateSession(wsPath, wsId);
     setSkills(await fetchSkills());
     setMemory(await fetchMemory());
     setModel(await fetchModel());

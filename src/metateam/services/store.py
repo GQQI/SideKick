@@ -504,15 +504,20 @@ class SessionStore:
         page: int = 1,
         page_size: int = 20,
         workspace: Optional[str] = None,
+        workspace_id: Optional[str] = None,
     ) -> dict[str, Any]:
-        from .tenant_context import get_user_id
+        from .tenant_context import get_user_id, workspace_settings_key
 
         uid = get_user_id()
         current_ws = getattr(get_settings(), "workspace", "")
         # By default show every chat regardless of which folder it is pinned
         # to — several chats may be running against different workspaces at
-        # once. Pass ``workspace`` to narrow to one project's history.
+        # once. Pass ``workspace`` (path) or ``workspace_id`` (stable id) to
+        # narrow to one project's history. ``workspace_id`` is preferred —
+        # it is looked up directly instead of re-normalizing two path strings
+        # on every row, so it cannot drift from what the workspace picker shows.
         filter_ws = workspace if workspace is not None else None
+        filter_wsid = (workspace_id or "").strip() or None
         items: dict[str, dict[str, Any]] = {}
 
         # Disk history first
@@ -522,6 +527,8 @@ class SessionStore:
                 if meta.user_id and meta.user_id != uid:
                     continue
                 if filter_ws and not workspace_matches(meta.workspace, filter_ws):
+                    continue
+                if filter_wsid and workspace_settings_key(meta.workspace or "") != filter_wsid:
                     continue
                 sid = meta.id or path.stem
                 user_count = _user_turn_count(messages)
@@ -565,6 +572,7 @@ class SessionStore:
                     "busy": False,
                     "source": "disk",
                     "workspace": ws_path,
+                    "workspace_id": workspace_settings_key(ws_path) if ws_path else "",
                     "workspace_name": Path(ws_path).name if ws_path else "",
                     "is_current_workspace": workspace_matches(ws_path, current_ws),
                 }
@@ -578,6 +586,8 @@ class SessionStore:
                 continue
             sess_ws = str(getattr(s.agent.settings, "workspace", "") or "")
             if filter_ws and not workspace_matches(sess_ws, filter_ws):
+                continue
+            if filter_wsid and workspace_settings_key(sess_ws) != filter_wsid:
                 continue
             full_msgs = _full_transcript(s.agent)
             user_turns = _user_turn_count(full_msgs)
@@ -603,6 +613,7 @@ class SessionStore:
                 "busy": bool(s.busy and not s.stop_requested),
                 "source": "memory",
                 "workspace": sess_ws,
+                "workspace_id": workspace_settings_key(sess_ws) if sess_ws else "",
                 "workspace_name": Path(sess_ws).name if sess_ws else "",
                 "is_current_workspace": workspace_matches(sess_ws, current_ws),
             }

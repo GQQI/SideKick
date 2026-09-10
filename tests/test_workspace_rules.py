@@ -5,15 +5,15 @@ from pathlib import Path
 from metateam.services.workspace_rules import find_rules_file, load_workspace_rules
 
 
-def test_prefers_sidekick(tmp_path: Path) -> None:
-    (tmp_path / ".sidekick").mkdir()
-    (tmp_path / ".sidekick" / "rules.md").write_text("wolf", encoding="utf-8")
+def test_prefers_yutianlang(tmp_path: Path) -> None:
+    (tmp_path / ".yutianlang").mkdir()
+    (tmp_path / ".yutianlang" / "rules.md").write_text("wolf", encoding="utf-8")
     (tmp_path / ".sidekick").mkdir()
     (tmp_path / ".sidekick" / "rules.md").write_text("sidekick", encoding="utf-8")
     found = find_rules_file(tmp_path)
     assert found is not None
     assert found.name == "rules.md"
-    assert ".sidekick" in found.as_posix()
+    assert ".yutianlang" in found.as_posix()
     text = load_workspace_rules(tmp_path)
     assert "wolf" in text
     assert "sidekick" not in text

@@ -4,6 +4,10 @@ export type ChatTabRef = {
   id: string;
   workspace: string;
   workspaceName: string;
+  /** Stable workspace id (hash of the resolved path) — tabs are scoped by
+   * this, not by comparing raw path strings, so case/slash drift can't
+   * make a tab from another project "leak" into view. */
+  workspaceId?: string;
 };
 
 const KEY = "sidekick.openTabs";

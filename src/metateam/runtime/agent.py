@@ -22,6 +22,7 @@ from .ask import (
     MIN_ASK_OPTIONS,
     build_ask_options,
     normalize_option_labels,
+    should_keep_as_markdown,
     try_parse_inline_ask,
 )
 from ..core.config import Settings, get_settings
@@ -753,6 +754,12 @@ class Agent(AgentHistoryMixin, AgentExecuteMixin, AgentGroundingMixin):
                 f"ERROR: ask_user needs at least {MIN_ASK_OPTIONS} options; "
                 f"got {len(built)}"
             )
+        if should_keep_as_markdown(q, labels):
+            return (
+                "ERROR: this looks like 要点/a summary, not a user decision. "
+                "Do NOT call ask_user. Write the numbered list as normal markdown "
+                "in the assistant message so it renders as text, not choice buttons."
+            )
 
         allow_other = bool(allow_custom)
         other_label = str(custom_label or "其他（请补充）").strip() or "其他（请补充）"
@@ -1303,7 +1310,7 @@ class Agent(AgentHistoryMixin, AgentExecuteMixin, AgentGroundingMixin):
                 "awaiting_confirm": False,
             },
         )
-        intro = f"## {plan.get('summary') or '执行计划'}\n\n"
+        intro = f"## {summary or '执行计划'}\n\n"
         if any(shape_contract.values()):
             intro += format_shape_contract_markdown(shape_contract) + "\n\n"
         intro += "将按任务列表逐步执行…\n"
@@ -1497,6 +1504,7 @@ class Agent(AgentHistoryMixin, AgentExecuteMixin, AgentGroundingMixin):
             assistant: Optional[dict[str, Any]] = None
             streamed_buf = ""
             stalled = False
+            reasoning_streamed_live = False
             if emit_assistant_text:
                 self._emit("assistant_delta", {"chunk": "", "reset": True})
             try:
@@ -1531,6 +1539,7 @@ class Agent(AgentHistoryMixin, AgentExecuteMixin, AgentGroundingMixin):
                         # reset:true, so every internal round's reasoning glues onto
                         # whatever bubble happened to exist first.
                         if emit_assistant_text:
+                            reasoning_streamed_live = True
                             self._emit(
                                 "assistant_reasoning_delta",
                                 {"chunk": str(payload)},
@@ -1584,6 +1593,18 @@ class Agent(AgentHistoryMixin, AgentExecuteMixin, AgentGroundingMixin):
                 break
             assistant.setdefault("ts", time.time())
             self.messages.append(assistant)
+
+            # Some providers only return reasoning_content on the AGGREGATED
+            # response (never as incremental deltas) when the turn also
+            # includes tool_calls — common for reasoning models doing
+            # function calling. Without this, the "thinking" bubble is
+            # correctly saved to history (so it shows up on reload) but
+            # never appears live before the tool card, since no
+            # reasoning_delta event ever reached the UI.
+            if emit_assistant_text and not reasoning_streamed_live:
+                backfill_reasoning = str(assistant.get("reasoning") or "").strip()
+                if backfill_reasoning:
+                    self._emit("assistant_reasoning_delta", {"chunk": backfill_reasoning})
 
             tool_calls = assistant.get("tool_calls") or []
             preamble = (assistant.get("content") or "").strip()

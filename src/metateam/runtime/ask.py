@@ -20,19 +20,21 @@ _OPTION_LINE_RE = re.compile(
 _TRAILING_PROMPT_RE = re.compile(r"(你是想|请选择|你想|你想要|请选)[：:]\s*$")
 
 # Must look like the model is asking the user to pick, not listing facts/tasks.
+# Keep this tight: words like 还是 / 哪个 appear in ordinary 要点 and must NOT
+# open the Ask UI.
 _CHOICE_CUE_RE = re.compile(
-    r"(请选择|请选|选一个|选哪|哪个|哪项|哪一个|还是|或者选|"
-    r"你想要哪|你更倾向|确认一下|要哪一种|"
-    r"which\s+(one|option)|please\s+choose|pick\s+one|"
-    r"do\s+you\s+want|would\s+you\s+rather)",
+    r"(请选择|请选一个|请选一下|请从中选|请任选|选一个吧|"
+    r"你想要哪[一种个项]|你更倾向|"
+    r"which\s+(one|option)|please\s+choose|pick\s+(one|an?\s+option)|"
+    r"would\s+you\s+rather)",
     re.IGNORECASE,
 )
 
-# Numbered lists that are answers/summaries, not clarifications.
+# Numbered lists that are answers/summaries/要点, not clarifications.
 _SUMMARY_CUE_RE = re.compile(
-    r"(如下|以下|包括|提出了|提到了|总结|回顾|任务有|任务是|"
-    r"做过|完成了|已经|本轮|本次对话|当前对话|历史|"
-    r"as\s+follows|here\s+are|the\s+tasks|you\s+asked)",
+    r"(要点|关键点|如下|以下|包括|提出了|提到了|总结|回顾|任务有|任务是|"
+    r"做过|完成了|已经|本轮|本次对话|当前对话|历史|步骤|清单|结论|"
+    r"as\s+follows|here\s+are|the\s+tasks|you\s+asked|key\s+points?)",
     re.IGNORECASE,
 )
 
@@ -209,11 +211,36 @@ def build_ask_options(labels: list[str]) -> list[dict[str, str]]:
     return [{"key": str(i), "label": label} for i, label in enumerate(clean, start=1)]
 
 
+def _options_look_like_keypoints(labels: list[str]) -> bool:
+    """Long / markdown-heading items are 要点, not button labels."""
+    if not labels:
+        return False
+    if any("**" in x or x.lstrip().startswith("#") for x in labels):
+        return True
+    if any(len(x) > 72 for x in labels):
+        return True
+    avg = sum(len(x) for x in labels) / len(labels)
+    return avg > 42
+
+
+def should_keep_as_markdown(question: str, labels: list[str] | None = None) -> bool:
+    """True when ask_user was misused to present 要点 / a report."""
+    q = (question or "").strip()
+    opts = [str(x).strip() for x in (labels or []) if str(x).strip()]
+    if _options_look_like_keypoints(opts):
+        return True
+    if _SUMMARY_CUE_RE.search(q) and not _CHOICE_CUE_RE.search(q):
+        if "？" not in q and "?" not in q:
+            return True
+    return False
+
+
 def try_parse_inline_ask(text: str) -> Optional[dict[str, Any]]:
     """If the model wrote a real multiple-choice clarification in plain text, parse it.
 
-    Enumerations of past tasks / facts (e.g. listing what the user already asked)
-    must NOT become an ask_user dialog.
+    Enumerations of 要点 / past tasks / facts must NOT become an ask_user dialog.
+    Prefer the native ask_user tool; this is only a last-resort rescue for a
+    short "请选择 + 1. 2. 3." block.
     """
     raw = (text or "").strip()
     if not raw or len(raw) < 8:
@@ -238,19 +265,29 @@ def try_parse_inline_ask(text: str) -> Optional[dict[str, Any]]:
         raw,
         re.MULTILINE,
     )
+    # Long report / plan before the list → markdown, not a quiz.
+    if first and first.start() > 280:
+        return None
     question = raw[: first.start()].strip() if first else raw
     question = _TRAILING_PROMPT_RE.sub("", question).strip()
     question = re.sub(r"[\U0001F300-\U0001FAFF\U00002600-\U000027BF]+", "", question).strip()
     if not question:
         question = "请选择一个选项"
 
+    labels = [label for _, label in ordered[:MAX_ASK_OPTIONS]]
+    if _options_look_like_keypoints(labels):
+        return None
+
     probe = f"{question}\n{raw[:400]}"
-    if _SUMMARY_CUE_RE.search(probe) and not _CHOICE_CUE_RE.search(probe):
+    # Summaries / 要点 never become clickable choices, even if a weak cue appears.
+    if _SUMMARY_CUE_RE.search(probe):
         return None
     if not _CHOICE_CUE_RE.search(probe):
         return None
+    if "？" not in question and "?" not in question and not _CHOICE_CUE_RE.search(question):
+        # Choice cue only in a later 要点 line, not in the question itself.
+        return None
 
-    labels = [label for _, label in ordered[:MAX_ASK_OPTIONS]]
     allow_custom = any(k.upper() == "D" for k, _ in ordered) or any(
         "其他" in lbl or "自定义" in lbl for _, lbl in ordered
     )

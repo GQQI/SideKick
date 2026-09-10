@@ -38,12 +38,12 @@ def register_ask_and_delegate(reg: ToolRegistry, ctx: ToolContext) -> None:
             Tool(
                 "ask_user",
                 "Ask the user to clarify ONLY when a real decision or missing info blocks progress. "
-                "Do NOT use ask_user to summarize the conversation, list past user tasks, or answer "
-                "meta questions answerable from chat history — reply in normal assistant text instead. "
-                "The UI shows clickable buttons; NEVER print numbered/lettered option "
-                "lists in assistant text. Provide question + options (array of 2–12 "
-                "short labels). Set allow_custom=true so the user can type a custom "
-                "answer. Wait for the result before continuing.",
+                "Do NOT use ask_user to present 要点, summaries, plans, status lists, or findings "
+                "— those belong in markdown assistant text. Do NOT use it to list past user tasks "
+                "or answer meta questions from chat history. "
+                "The UI shows clickable buttons for mutually exclusive choices only. "
+                "Provide question + options (array of 2–12 short labels). Set allow_custom=true "
+                "so the user can type a custom answer. Wait for the result before continuing.",
                 {
                     "type": "object",
                     "properties": {

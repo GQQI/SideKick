@@ -7,7 +7,12 @@ from pathlib import Path
 from typing import Any, Optional
 
 from ..core.config import REPO_ROOT, ROOT, get_settings
-from .tenant_context import DEFAULT_USER_ID, get_user_id, tenant_workspace_path
+from .tenant_context import (
+    DEFAULT_USER_ID,
+    get_user_id,
+    tenant_workspace_path,
+    workspace_settings_key,
+)
 
 MAX_RECENT = 12
 
@@ -107,7 +112,10 @@ def list_workspaces() -> list[dict[str, Any]]:
             continue
         items.append(
             {
-                "id": key,
+                # Stable, case/slash-insensitive id (same scheme as per-workspace
+                # model overrides / fs_undo) — the frontend keys tabs/history off
+                # this instead of comparing raw path strings.
+                "id": workspace_settings_key(key),
                 "name": p.name or key,
                 "path": key,
                 "is_default": False,
@@ -123,14 +131,19 @@ def get_active_workspace() -> dict[str, Any]:
     data = _read_state()
     raw = str(data.get("path") or "").strip()
     if not raw:
-        return {"path": "", "name": "", "configured": False}
+        return {"path": "", "name": "", "id": "", "configured": False}
     try:
         path = Path(raw).expanduser().resolve()
         if not path.is_dir():
-            return {"path": "", "name": "", "configured": False}
+            return {"path": "", "name": "", "id": "", "configured": False}
     except Exception:
-        return {"path": "", "name": "", "configured": False}
-    return {"path": str(path), "name": path.name or str(path), "configured": True}
+        return {"path": "", "name": "", "id": "", "configured": False}
+    return {
+        "path": str(path),
+        "name": path.name or str(path),
+        "id": workspace_settings_key(str(path)),
+        "configured": True,
+    }
 
 
 def set_workspace(path_or_name: str, *, create: bool = False) -> dict[str, Any]:
@@ -165,6 +178,7 @@ def set_workspace(path_or_name: str, *, create: bool = False) -> dict[str, Any]:
     return {
         "path": str(candidate),
         "name": candidate.name or str(candidate),
+        "id": workspace_settings_key(str(candidate)),
         "configured": True,
     }
 

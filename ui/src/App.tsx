@@ -82,7 +82,9 @@ export function App() {
   const [modelSaving, setModelSaving] = useState(false);
   const [modelSwitchRole, setModelSwitchRole] = useState<ModelRole>("main");
   const [workspaces, setWorkspaces] = useState<WorkspaceItem[]>([]);
-  const [activeWs, setActiveWs] = useState<{ path: string; name: string } | null>(null);
+  const [activeWs, setActiveWs] = useState<{ path: string; name: string; id?: string } | null>(
+    null,
+  );
   const [wsBusy, setWsBusy] = useState(false);
   const [bootReady, setBootReady] = useState(false);
   const [authPhase, setAuthPhase] = useState<"loading" | "setup" | "login" | "ok">("loading");
@@ -203,6 +205,8 @@ export function App() {
 
   const session = useSessionBootstrap({
     sessionsPage,
+    activeWsPath: activeWs?.path || null,
+    activeWorkspaceId: activeWs?.id || null,
     setHealth,
     setWorkspaces,
     setActiveWs,
@@ -355,6 +359,17 @@ export function App() {
       Boolean(busy && s.id === sessionId),
   }));
 
+  // Identify a workspace by its stable id when we have one; only fall back
+  // to the raw path string for tabs persisted before this field existed.
+  // Every "which tab belongs to which project" comparison in this file goes
+  // through these two so id vs. path can never disagree with itself.
+  function workspaceKey(ws: { id?: string; path?: string } | null | undefined): string {
+    return ws?.id || ws?.path || "";
+  }
+  function tabWorkspaceKey(tab: ChatTabRef): string {
+    return tab.workspaceId || tab.workspace || "";
+  }
+
   /**
    * Switch the active chat to `path` — reuse an already-open tab for that
    * workspace if one exists, otherwise start a fresh chat pinned there.
@@ -363,7 +378,9 @@ export function App() {
    */
   function switchToWorkspace(path: string) {
     if (!path || path === activeWs?.path) return;
-    const existing = openTabs.find((t) => t.workspace === path);
+    const targetId = workspaces.find((w) => w.path === path)?.id;
+    const key = targetId || path;
+    const existing = openTabs.find((t) => tabWorkspaceKey(t) === key);
     if (existing) {
       selectChatTab(existing.id);
     } else {
@@ -379,17 +396,32 @@ export function App() {
       setActiveWs({
         path: tab.workspace,
         name: tab.workspaceName || tab.workspace.split(/[/\\]/).pop() || tab.workspace,
+        id: tab.workspaceId,
       });
     }
     void actions.openSession(id);
   }
 
   function closeTab(id: string) {
+    const closing = openTabs.find((t) => t.id === id);
     setOpenTabs((prev) => prev.filter((t) => t.id !== id));
-    if (id === sessionId) {
-      const remaining = openTabs.filter((t) => t.id !== id);
-      if (remaining.length) selectChatTab(remaining[0].id);
-      else void actions.newChat();
+    if (id !== sessionId) return;
+    const remaining = openTabs.filter((t) => t.id !== id);
+    // Closing the active tab must never jump to a DIFFERENT project's tab —
+    // that's what caused the "closes B, lands on A" bounce. Stay inside the
+    // same workspace (matched by id, not a raw path-string guess): reuse
+    // another of its tabs, or open a fresh draft there.
+    const key = closing ? tabWorkspaceKey(closing) : workspaceKey(activeWs);
+    const sameWs = key ? remaining.find((t) => tabWorkspaceKey(t) === key) : undefined;
+    const ws = closing?.workspace || activeWs?.path || "";
+    if (sameWs) {
+      selectChatTab(sameWs.id);
+    } else if (ws) {
+      void actions.newChatInWorkspace(ws);
+    } else if (remaining.length) {
+      selectChatTab(remaining[0].id);
+    } else {
+      void actions.newChat();
     }
   }
 
@@ -399,7 +431,9 @@ export function App() {
    * chat tab strip) — not just from the "recent folders" list.
    */
   function forgetWorkspaceEverywhere(path: string) {
-    const closing = openTabs.filter((t) => t.workspace === path);
+    const targetId = workspaces.find((w) => w.path === path)?.id;
+    const key = targetId || path;
+    const closing = openTabs.filter((t) => tabWorkspaceKey(t) === key);
     if (closing.length) {
       const closingIds = new Set(closing.map((t) => t.id));
       setOpenTabs((prev) => prev.filter((t) => !closingIds.has(t.id)));
@@ -428,6 +462,7 @@ export function App() {
         additions.push({
           id,
           workspace: hit?.workspace || (id === sessionId ? activeWs?.path || "" : ""),
+          workspaceId: hit?.workspace_id || (id === sessionId ? activeWs?.id : undefined),
           workspaceName: hit?.workspace_name || (id === sessionId ? activeWs?.name || "" : ""),
         });
       }
@@ -450,6 +485,7 @@ export function App() {
       if (
         hit &&
         hit.workspace === activeWs.path &&
+        hit.workspaceId === activeWs.id &&
         hit.workspaceName === (activeWs.name || hit.workspaceName)
       ) {
         return prev;
@@ -460,6 +496,7 @@ export function App() {
             ? {
                 ...t,
                 workspace: activeWs.path,
+                workspaceId: activeWs.id,
                 workspaceName: activeWs.name || t.workspaceName,
               }
             : t,
@@ -470,26 +507,33 @@ export function App() {
         {
           id: sessionId,
           workspace: activeWs.path,
+          workspaceId: activeWs.id,
           workspaceName: activeWs.name || "",
         },
       ].slice(0, 16);
     });
-  }, [sessionId, activeWs?.path, activeWs?.name]);
+  }, [sessionId, activeWs?.path, activeWs?.id, activeWs?.name]);
 
-  const chatTabViews: ChatTabView[] = openTabs.map((tab) => {
-    const hit = historySessions.find((s) => s.id === tab.id);
-    const running =
-      chat.runningSessionIds.includes(tab.id) || Boolean(busy && tab.id === sessionId);
-    const rawTitle = (hit?.title || "").trim();
-    const untitled = !rawTitle || rawTitle === "新会话" || rawTitle === "New chat" || rawTitle === "Untitled";
-    return {
-      id: tab.id,
-      title: untitled ? t("sessionUntitled") : rawTitle,
-      workspaceName: hit?.workspace_name || tab.workspaceName || tab.workspace || "",
-      running,
-      active: tab.id === sessionId,
-    };
-  });
+  // The tab strip above the composer is scoped to the workspace on screen —
+  // other workspaces' chats stay open in the background (openTabs keeps them)
+  // but only surface again once you switch back to that workspace.
+  const activeWsKey = workspaceKey(activeWs);
+  const chatTabViews: ChatTabView[] = openTabs
+    .filter((tab) => !activeWsKey || !tabWorkspaceKey(tab) || tabWorkspaceKey(tab) === activeWsKey)
+    .map((tab) => {
+      const hit = historySessions.find((s) => s.id === tab.id);
+      const running =
+        chat.runningSessionIds.includes(tab.id) || Boolean(busy && tab.id === sessionId);
+      const rawTitle = (hit?.title || "").trim();
+      const untitled = !rawTitle || rawTitle === "新会话" || rawTitle === "New chat" || rawTitle === "Untitled";
+      return {
+        id: tab.id,
+        title: untitled ? t("sessionUntitled") : rawTitle,
+        workspaceName: hit?.workspace_name || tab.workspaceName || tab.workspace || "",
+        running,
+        active: tab.id === sessionId,
+      };
+    });
 
   const openTabWorkspaces = openTabs
     .filter((tab) => tab.workspace)
@@ -575,6 +619,14 @@ export function App() {
   useEffect(() => {
     if (sessionId) saveActiveSessionId(sessionId, activeWs?.path || null);
   }, [sessionId, activeWs?.path]);
+
+  // History (and the chat-tabs strip, filtered below) is scoped to the
+  // workspace on screen — switching workspace must switch which history shows.
+  useEffect(() => {
+    if (!bootReady) return;
+    void session.refreshSessions(1);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [bootReady, activeWs?.id, activeWs?.path]);
 
   useEffect(() => {
     sessionIdRef.current = sessionId;

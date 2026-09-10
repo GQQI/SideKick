@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import os
 import platform
+import re
+import shutil
 import socket
 import threading
 import time
@@ -117,6 +119,225 @@ def unix_shell_argv(command: str) -> list[str]:
     sh = _unix_shell_bin()
     flag = "-lc" if "bash" in os.path.basename(sh) else "-c"
     return [sh, flag, command]
+
+
+_win_shell_lock = threading.Lock()
+_ps_exe_cache: Optional[str] = None
+_bash_exe_cache: Optional[str] = None  # "" = probed, none found
+_cmd_exe_cache: Optional[str] = None
+
+_BASH_FIRST_TOKEN_RE = re.compile(
+    r"^(?:ba)?sh(?:\.exe)?$|^\S+\.sh$",
+    re.IGNORECASE,
+)
+_BASH_BODY_RE = re.compile(
+    r"^(?:set -e(?:uo pipefail)?\b|set -o\b|export \w+=|source\s+|\[\[ )",
+)
+
+
+def looks_like_bash_command(command: str) -> bool:
+    """True when the payload should run under bash, not PowerShell."""
+    text = (command or "").strip()
+    if not text:
+        return False
+    head = text.split("\n", 1)[0].strip()
+    if head.startswith("#!") and re.search(r"(?:ba)?sh\b", head, re.IGNORECASE):
+        return True
+    first = re.split(r"\s+", text, maxsplit=1)[0].strip().strip("\"'")
+    base = os.path.basename(first.replace("\\", "/"))
+    if _BASH_FIRST_TOKEN_RE.match(base):
+        return True
+    if _BASH_BODY_RE.match(text):
+        return True
+    return False
+
+
+def _windows_root() -> str:
+    return os.environ.get("SystemRoot") or os.environ.get("WINDIR") or r"C:\Windows"
+
+
+def windows_system_path_dirs() -> list[str]:
+    """Dirs that CreateProcess needs even when a packaged app inherited a thin PATH."""
+    root = _windows_root()
+    pf = os.environ.get("ProgramFiles") or r"C:\Program Files"
+    pf86 = os.environ.get("ProgramFiles(x86)") or r"C:\Program Files (x86)"
+    local = os.environ.get("LOCALAPPDATA") or ""
+    candidates = [
+        os.path.join(root, "System32"),
+        os.path.join(root, "SysWOW64"),
+        os.path.join(root, "System32", "Wbem"),
+        os.path.join(root, "System32", "WindowsPowerShell", "v1.0"),
+        os.path.join(root, "System32", "OpenSSH"),
+        os.path.join(root, "Sysnative", "WindowsPowerShell", "v1.0"),
+        os.path.join(pf, "PowerShell", "7"),
+        os.path.join(pf, "Git", "cmd"),
+        os.path.join(pf, "Git", "bin"),
+        os.path.join(pf, "Git", "usr", "bin"),
+        os.path.join(pf86, "Git", "cmd"),
+        os.path.join(pf86, "Git", "bin"),
+        os.path.join(local, "Programs", "Git", "cmd") if local else "",
+        os.path.join(local, "Programs", "Git", "bin") if local else "",
+        os.path.join(local, "Programs", "Git", "usr", "bin") if local else "",
+        os.path.join(os.environ.get("ProgramW6432") or pf, "Git", "cmd"),
+    ]
+    out: list[str] = []
+    seen: set[str] = set()
+    for raw in candidates:
+        if not raw:
+            continue
+        key = os.path.normcase(os.path.normpath(raw))
+        if key in seen or not os.path.isdir(raw):
+            continue
+        seen.add(key)
+        out.append(raw)
+    return out
+
+
+def augment_executable_path(env: Optional[dict[str, str]] = None) -> dict[str, str]:
+    """Ensure System32 / PowerShell / Git Bash are on PATH for child processes."""
+    src = dict(env if env is not None else os.environ)
+    if os.name != "nt":
+        return src
+    path_key = "PATH" if "PATH" in src else next((k for k in src if k.upper() == "PATH"), "PATH")
+    parts = [p for p in str(src.get(path_key) or "").split(os.pathsep) if p]
+    seen = {os.path.normcase(os.path.normpath(p)) for p in parts}
+    for extra in windows_system_path_dirs():
+        key = os.path.normcase(os.path.normpath(extra))
+        if key in seen:
+            continue
+        parts.append(extra)
+        seen.add(key)
+    src[path_key] = os.pathsep.join(parts)
+    src.setdefault("SystemRoot", _windows_root())
+    src.setdefault("WINDIR", src["SystemRoot"])
+    src.setdefault("PATHEXT", ".COM;.EXE;.BAT;.CMD;.VBS;.JS;.MSC")
+    return src
+
+
+def windows_powershell_exe() -> str:
+    """Absolute powershell.exe / pwsh.exe — packaged apps often lack it on PATH."""
+    global _ps_exe_cache
+    with _win_shell_lock:
+        if _ps_exe_cache:
+            return _ps_exe_cache
+    root = _windows_root()
+    pf = os.environ.get("ProgramFiles") or r"C:\Program Files"
+    local = os.environ.get("LOCALAPPDATA") or ""
+    candidates = [
+        os.path.join(root, "System32", "WindowsPowerShell", "v1.0", "powershell.exe"),
+        os.path.join(root, "Sysnative", "WindowsPowerShell", "v1.0", "powershell.exe"),
+        os.path.join(root, "SysWOW64", "WindowsPowerShell", "v1.0", "powershell.exe"),
+        os.path.join(root, "System32", "powershell.exe"),
+        os.path.join(pf, "PowerShell", "7", "pwsh.exe"),
+        os.path.join(local, "Microsoft", "WindowsApps", "pwsh.exe") if local else "",
+    ]
+    found = ""
+    for cand in candidates:
+        if cand and os.path.isfile(cand):
+            found = cand
+            break
+    if not found:
+        found = shutil.which("pwsh") or shutil.which("powershell") or shutil.which("powershell.exe") or ""
+    if not found:
+        found = os.path.join(root, "System32", "WindowsPowerShell", "v1.0", "powershell.exe")
+    with _win_shell_lock:
+        _ps_exe_cache = found
+    return found
+
+
+def windows_bash_exe() -> Optional[str]:
+    """Git Bash / MSYS bash when present — needed to actually run .sh scripts on Windows."""
+    global _bash_exe_cache
+    with _win_shell_lock:
+        if _bash_exe_cache is not None:
+            return _bash_exe_cache or None
+    pf = os.environ.get("ProgramFiles") or r"C:\Program Files"
+    pf86 = os.environ.get("ProgramFiles(x86)") or r"C:\Program Files (x86)"
+    local = os.environ.get("LOCALAPPDATA") or ""
+    candidates = [
+        os.path.join(pf, "Git", "bin", "bash.exe"),
+        os.path.join(pf, "Git", "usr", "bin", "bash.exe"),
+        os.path.join(pf86, "Git", "bin", "bash.exe"),
+        os.path.join(local, "Programs", "Git", "bin", "bash.exe") if local else "",
+        os.path.join(local, "Programs", "Git", "usr", "bin", "bash.exe") if local else "",
+        r"C:\msys64\usr\bin\bash.exe",
+        r"C:\msys32\usr\bin\bash.exe",
+    ]
+    found = ""
+    for cand in candidates:
+        if cand and os.path.isfile(cand):
+            found = cand
+            break
+    if not found:
+        which = shutil.which("bash") or shutil.which("bash.exe") or ""
+        # Ignore the WSL stub at System32\bash.exe unless Git/MSYS is missing AND WSL exists;
+        # the stub cannot run workspace .sh files with Windows paths reliably.
+        if which:
+            norm = os.path.normcase(which)
+            if "system32" in norm and os.path.basename(norm) == "bash.exe":
+                which = ""
+            found = which
+    with _win_shell_lock:
+        _bash_exe_cache = found
+    return found or None
+
+
+def windows_cmd_exe() -> str:
+    global _cmd_exe_cache
+    with _win_shell_lock:
+        if _cmd_exe_cache:
+            return _cmd_exe_cache
+    root = _windows_root()
+    candidates = [
+        os.path.join(root, "System32", "cmd.exe"),
+        os.path.join(root, "Sysnative", "cmd.exe"),
+        os.path.join(root, "SysWOW64", "cmd.exe"),
+    ]
+    found = next((c for c in candidates if os.path.isfile(c)), "") or shutil.which("cmd.exe") or "cmd.exe"
+    with _win_shell_lock:
+        _cmd_exe_cache = found
+    return found
+
+
+def windows_shell_argv(command: str) -> list[str]:
+    """Windows argv: Git Bash for .sh, else PowerShell by full path, else cmd.exe."""
+    body = command or ""
+    if looks_like_bash_command(body):
+        bash = windows_bash_exe()
+        if bash:
+            return [bash, "-lc", body]
+    ps = windows_powershell_exe()
+    if os.path.isfile(ps):
+        wrapped = (
+            "[Console]::OutputEncoding = [System.Text.UTF8Encoding]::new($false); "
+            "$OutputEncoding = [Console]::OutputEncoding; "
+            f"{body}"
+        )
+        return [
+            ps,
+            "-NoProfile",
+            "-NonInteractive",
+            "-ExecutionPolicy",
+            "Bypass",
+            "-Command",
+            wrapped,
+        ]
+    return [windows_cmd_exe(), "/d", "/s", "/c", body]
+
+
+def shell_argv(command: str) -> list[str]:
+    """Host-appropriate argv for run_shell / verify_run / background jobs."""
+    if os.name == "nt":
+        return windows_shell_argv(command)
+    return unix_shell_argv(command)
+
+
+def reset_win_shell_cache() -> None:
+    global _ps_exe_cache, _bash_exe_cache, _cmd_exe_cache
+    with _win_shell_lock:
+        _ps_exe_cache = None
+        _bash_exe_cache = None
+        _cmd_exe_cache = None
 
 
 def _probe_online() -> bool:
@@ -234,18 +455,28 @@ def host_prompt_block() -> str:
         f"Network: {net}",
     ]
     if info.os_family == "windows":
+        bash = windows_bash_exe()
+        bash_line = (
+            f"- Git Bash is available at `{bash}`. To run a .sh file, call "
+            "`bash path/to/script.sh` (or `./script.sh`). Do NOT wrap with powershell.exe."
+            if bash
+            else (
+                "- Git Bash is NOT installed. Do not emit bash/.sh scripts — write PowerShell. "
+                "If the user insists on bash, tell them to install Git for Windows."
+            )
+        )
         lines.extend(
             [
-                "Shell executor: PowerShell (`powershell.exe -NoProfile -NonInteractive`).",
-                "- Write PowerShell-compatible commands — do NOT assume bash/zsh.",
-                "- Commands already run inside PowerShell — pass the script body directly "
+                "Shell executor: Windows PowerShell (resolved by full path, not PATH).",
+                "- Default dialect is PowerShell — pass the script body directly "
                 "(e.g. `Test-Path .\\file.html`). Do NOT wrap with `powershell -Command ...`.",
+                bash_line,
                 "- Create dirs: `New-Item -ItemType Directory -Force -Path path` or `mkdir path` "
-                "(no bash `mkdir -p`).",
+                "(no bash `mkdir -p` unless running under Git Bash).",
                 "- Download/HTTP: `curl.exe ...` or `Invoke-WebRequest` / `iwr` "
                 "(prefer `curl.exe` when you need curl flags).",
-                "- Chain with `;` or separate tool calls — avoid bash `&&` / `|` pipelines "
-                "that rely on Unix tools.",
+                "- Chain PowerShell with `;` or separate tool calls — avoid bash `&&` unless "
+                "the command is actually running under Git Bash.",
                 "- Paths: prefer workspace-relative paths with forward slashes. "
                 "Do NOT reuse another machine's drive letter (e.g. E:/Project/...). "
                 "Absolute paths only if they exist on THIS host.",

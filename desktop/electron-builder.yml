@@ -41,3 +41,49 @@ nsis:
     - zh_CN
     - en_US
   artifactName: ${productName}-Setup-${version}-win-${arch}.exe
+linux:
+  category: Development
+  executableName: sidekick
+  synopsis: Local multi-agent AI workbench
+  description: Sidekick — local multi-agent workbench for Linux / Kylin.
+  desktop:
+    entry:
+      Name: Sidekick
+      "Name[zh_CN]": Sidekick
+      Comment: Local multi-agent AI workbench
+      Categories: Development;Office;
+      Type: Application
+      Terminal: "false"
+  extraResources:
+    - from: ../packaging/kylin/payload
+      to: sidekick
+      filter:
+        - "**/*"
+  target:
+    - target: deb
+      arch:
+        - x64
+        - arm64
+    - target: AppImage
+      arch:
+        - x64
+        - arm64
+    - target: tar.gz
+      arch:
+        - x64
+        - arm64
+  artifactName: ${productName}-${version}-kylin-${arch}.${ext}
+deb:
+  packageName: sidekick
+  maintainer: Sidekick
+  depends:
+    - libgtk-3-0
+    - libnotify4
+    - libnss3
+    - libxss1
+    - libxtst6
+    - xdg-utils
+    - libatspi2.0-0
+    - libuuid1
+    - libsecret-1-0
+    - libasound2

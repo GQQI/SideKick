@@ -242,7 +242,9 @@ export const fetchHealth = async () => {
   return r.json() as Promise<Health>;
 };
 
-export type SessionWorkspaceRef = { path: string; name: string };
+/** `id` is a stable hash of the resolved folder path — case/slash-insensitive,
+ * so tabs/history are queried by id, never by comparing raw path strings. */
+export type SessionWorkspaceRef = { path: string; name: string; id?: string };
 
 export const createSession = (workspace?: string) =>
   json<{ id: string; demo: boolean; workspace?: SessionWorkspaceRef | null }>(
@@ -265,6 +267,7 @@ export type SessionItem = {
   demo?: boolean;
   source?: string;
   workspace?: string;
+  workspace_id?: string;
   workspace_name?: string;
   is_current_workspace?: boolean;
 };
@@ -331,10 +334,21 @@ export type SessionDetail = {
 
 export const HISTORY_PAGE_SIZE = 20;
 
-export const fetchSessions = (page = 1, pageSize = HISTORY_PAGE_SIZE) =>
-  json<SessionsPage>(
-    `/api/sessions?page=${encodeURIComponent(String(page))}&page_size=${encodeURIComponent(String(pageSize))}`,
-  );
+export const fetchSessions = (
+  page = 1,
+  pageSize = HISTORY_PAGE_SIZE,
+  scope?: { workspaceId?: string | null; workspace?: string | null },
+) => {
+  let url = `/api/sessions?page=${encodeURIComponent(String(page))}&page_size=${encodeURIComponent(String(pageSize))}`;
+  // Query by stable id when we have one — never fall back to comparing raw
+  // path strings across two different requests (case/slash drift on Windows).
+  if (scope?.workspaceId) {
+    url += `&workspace_id=${encodeURIComponent(scope.workspaceId)}`;
+  } else if (scope?.workspace) {
+    url += `&workspace=${encodeURIComponent(scope.workspace)}`;
+  }
+  return json<SessionsPage>(url);
+};
 export const fetchSession = (id: string) => json<SessionDetail>(`/api/sessions/${id}`);
 export const stopSession = (id: string) =>
   json<{ status: string }>(`/api/sessions/${id}/stop`, { method: "POST" });
@@ -514,13 +528,13 @@ export const fetchWorkspaces = () =>
   json<{
     configured: boolean;
     items: WorkspaceItem[];
-    active: { path: string; name: string; configured?: boolean } | null;
+    active: (SessionWorkspaceRef & { configured?: boolean }) | null;
   }>("/api/workspaces");
 export const createWorkspace = (path: string) =>
   json<{
     status: string;
     configured: boolean;
-    active: { path: string; name: string };
+    active: SessionWorkspaceRef;
     items: WorkspaceItem[];
   }>("/api/workspaces", {
     method: "POST",
@@ -531,14 +545,14 @@ export const forgetWorkspace = (path: string) =>
   json<{
     status: string;
     configured: boolean;
-    active: { path: string; name: string; configured?: boolean } | null;
+    active: (SessionWorkspaceRef & { configured?: boolean }) | null;
     items: WorkspaceItem[];
   }>(`/api/workspaces?path=${encodeURIComponent(path)}`, { method: "DELETE" });
 export const setWorkspace = (path: string, create = false) =>
   json<{
     status: string;
     configured: boolean;
-    active: { path: string; name: string };
+    active: SessionWorkspaceRef;
     items: WorkspaceItem[];
   }>("/api/workspaces/active", {
     method: "PUT",

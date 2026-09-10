@@ -130,18 +130,77 @@ const PYTHON_ENV_BLOCKLIST = new Set([
   "VIRTUAL_ENV",
 ]);
 
-/** Env for bundled Python: never inherit a host PYTHONHOME/PATH. */
-function pythonChildEnv() {
+function windowsPowershellExe() {
+  const root = process.env.SystemRoot || process.env.windir || "C:\\Windows";
+  const cands = [
+    path.join(root, "System32", "WindowsPowerShell", "v1.0", "powershell.exe"),
+    path.join(root, "Sysnative", "WindowsPowerShell", "v1.0", "powershell.exe"),
+    path.join(root, "SysWOW64", "WindowsPowerShell", "v1.0", "powershell.exe"),
+  ];
+  for (const cand of cands) {
+    if (fs.existsSync(cand)) return cand;
+  }
+  return "powershell.exe";
+}
+
+/** Keep System32 / PowerShell / Git on PATH so run_shell can find them. */
+function ensureWindowsSearchPath(pathValue) {
+  if (process.platform !== "win32") return pathValue || "";
+  const root = process.env.SystemRoot || process.env.windir || "C:\\Windows";
+  const pf = process.env.ProgramFiles || "C:\\Program Files";
+  const pf86 = process.env["ProgramFiles(x86)"] || "C:\\Program Files (x86)";
+  const local = process.env.LOCALAPPDATA || "";
+  const extras = [
+    path.join(root, "System32"),
+    path.join(root, "System32", "Wbem"),
+    path.join(root, "System32", "WindowsPowerShell", "v1.0"),
+    path.join(root, "System32", "OpenSSH"),
+    path.join(pf, "Git", "cmd"),
+    path.join(pf, "Git", "bin"),
+    path.join(pf, "Git", "usr", "bin"),
+    path.join(pf86, "Git", "cmd"),
+    path.join(pf86, "Git", "bin"),
+    local ? path.join(local, "Programs", "Git", "cmd") : "",
+    local ? path.join(local, "Programs", "Git", "bin") : "",
+  ].filter(Boolean);
+  const parts = String(pathValue || "")
+    .split(path.delimiter)
+    .filter(Boolean);
+  const seen = new Set(parts.map((p) => p.toLowerCase()));
+  for (const extra of extras) {
+    const key = extra.toLowerCase();
+    if (seen.has(key) || !fs.existsSync(extra)) continue;
+    parts.push(extra);
+    seen.add(key);
+  }
+  return parts.join(path.delimiter);
+}
+
+/** Env for bundled Python: never inherit a host PYTHONHOME; keep a full Windows PATH. */
+function pythonChildEnv(pythonDir) {
   const env = {};
   for (const [k, v] of Object.entries(process.env)) {
     if (PYTHON_ENV_BLOCKLIST.has(String(k).toUpperCase())) continue;
     env[k] = v;
   }
+  // Explicit empty overrides beat any leftover host values on Windows.
+  env.PYTHONHOME = "";
+  env.PYTHONPATH = "";
   env.PYTHONUTF8 = "1";
   env.PYTHONIOENCODING = "utf-8";
   env.PYTHONUNBUFFERED = "1";
   env.PYTHONDONTWRITEBYTECODE = "1";
   env.PYTHONNOUSERSITE = "1";
+  let searchPath = env.PATH || env.Path || "";
+  if (pythonDir) {
+    searchPath = `${pythonDir}${path.delimiter}${searchPath}`;
+  }
+  env.PATH = ensureWindowsSearchPath(searchPath);
+  if (process.platform === "win32") {
+    env.SystemRoot = env.SystemRoot || process.env.SystemRoot || "C:\\Windows";
+    env.WINDIR = env.WINDIR || env.SystemRoot;
+    env.PATHEXT = env.PATHEXT || ".COM;.EXE;.BAT;.CMD;.VBS;.JS;.MSC";
+  }
   return env;
 }
 
@@ -166,15 +225,77 @@ function describePythonRuntime(py) {
   return lines.join("\n");
 }
 
+/** Repair embeddable CPython layout if antivirus/install stripped encodings. */
+function ensureEmbedStdlib(pyDir) {
+  if (process.platform !== "win32" || !pyDir || !fs.existsSync(pyDir)) return;
+  let names;
+  try {
+    names = fs.readdirSync(pyDir);
+  } catch {
+    return;
+  }
+  const zipName = names.find((n) => /^python\d+\.zip$/i.test(n));
+  if (!zipName) return;
+  const pthPath = path.join(pyDir, zipName.replace(/\.zip$/i, "._pth"));
+  const pthBody = `Lib\r\n${zipName}\r\nLib\\site-packages\r\nimport site\r\n`;
+  try {
+    fs.writeFileSync(pthPath, pthBody);
+  } catch (e) {
+    console.error(`[backend] cannot write ${pthPath}: ${e?.message || e}`);
+  }
+  const encPy = path.join(pyDir, "Lib", "encodings", "__init__.py");
+  const encPyc = path.join(pyDir, "Lib", "encodings", "__init__.pyc");
+  if (fs.existsSync(encPy) || fs.existsSync(encPyc)) return;
+  const zipPath = path.join(pyDir, zipName);
+  const lib = path.join(pyDir, "Lib");
+  try {
+    fs.mkdirSync(lib, { recursive: true });
+  } catch {
+    return;
+  }
+  console.warn(`[backend] Lib/encodings missing — extracting ${zipName} into Lib`);
+  try {
+    execFileSync("tar", ["-xf", zipPath, "-C", lib], {
+      windowsHide: true,
+      timeout: 120000,
+      stdio: ["ignore", "ignore", "pipe"],
+    });
+  } catch (e1) {
+    try {
+      const q = (s) => `'${String(s).replace(/'/g, "''")}'`;
+      execFileSync(
+        windowsPowershellExe(),
+        [
+          "-NoProfile",
+          "-NonInteractive",
+          "-Command",
+          `Expand-Archive -LiteralPath ${q(zipPath)} -DestinationPath ${q(lib)} -Force`,
+        ],
+        {
+          windowsHide: true,
+          timeout: 120000,
+          stdio: ["ignore", "ignore", "pipe"],
+        },
+      );
+    } catch (e2) {
+      console.error(
+        `[backend] stdlib extract failed: ${e2?.stderr || e2?.message || e1?.message || e2}`,
+      );
+    }
+  }
+}
+
 function pythonHasFastapi(py) {
   try {
+    const dir = path.dirname(py);
+    if (app.isPackaged && dir && dir !== ".") ensureEmbedStdlib(dir);
     const opts = {
       stdio: ["ignore", "pipe", "pipe"],
       timeout: 20000,
       windowsHide: true,
-      env: pythonChildEnv(),
+      shell: false,
+      env: pythonChildEnv(dir),
     };
-    const dir = path.dirname(py);
     if (dir && dir !== "." && fs.existsSync(dir)) opts.cwd = dir;
     execFileSync(py, ["-c", "import encodings, fastapi, pydantic_core"], opts);
     return true;
@@ -376,7 +497,7 @@ function startBackend() {
     }
     return null;
   }
-  const env = pythonChildEnv();
+  const env = pythonChildEnv(path.dirname(py));
   if (!env.PLAYWRIGHT_DOWNLOAD_HOST) {
     env.PLAYWRIGHT_DOWNLOAD_HOST = "https://npmmirror.com/mirrors/playwright";
   }

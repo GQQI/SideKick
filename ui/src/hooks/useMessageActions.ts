@@ -82,8 +82,8 @@ export type MessageActionsDeps = {
   health: Health | null;
   stats: { tokens: number; iters: number };
   ctx: { tokens: number; limit: number };
-  activeWs: { path: string; name: string } | null;
-  setActiveWs: (w: { path: string; name: string } | null) => void;
+  activeWs: { path: string; name: string; id?: string } | null;
+  setActiveWs: (w: { path: string; name: string; id?: string } | null) => void;
   setWorkspaces: (w: import("../api").WorkspaceItem[]) => void;
   setHealth: (h: Health | null) => void;
   setModel: (m: ModelSetup | null) => void;
@@ -671,7 +671,13 @@ async function removeSession(id: string) {
     setBusy(false);
     setSessionId(null);
   }
-  const res = await fetchSessions(sessionsPage, HISTORY_PAGE_SIZE);
+  // Scoped to the workspace on screen — an unfiltered fetch here would
+  // briefly repopulate the list with every project's chats and undo the
+  // workspace-scoped view the user is looking at.
+  const res = await fetchSessions(sessionsPage, HISTORY_PAGE_SIZE, {
+    workspaceId: activeWs?.id,
+    workspace: activeWs?.path,
+  });
   if ((res.items || []).length === 0 && sessionsPage > 1) {
     await refreshSessions(sessionsPage - 1);
   } else {

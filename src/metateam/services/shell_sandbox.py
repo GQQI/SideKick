@@ -228,7 +228,9 @@ def check_command(
 
 def sandbox_env(base: Optional[dict[str, str]] = None) -> dict[str, str]:
     """Env for sandboxed subprocess — keep PATH/HOME, drop obvious secrets noise optional."""
-    src = dict(base or os.environ)
+    from ..core.hostinfo import augment_executable_path
+
+    src = augment_executable_path(dict(base or os.environ))
     # Always force UTF-8 for Python / console child output (avoid Windows GBK crashes)
     src["PYTHONIOENCODING"] = "utf-8"
     src["PYTHONUTF8"] = "1"

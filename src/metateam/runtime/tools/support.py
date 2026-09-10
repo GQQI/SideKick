@@ -8,7 +8,7 @@ from pathlib import Path
 from typing import Any, Optional
 
 from ...core.config import Settings
-from ...core.hostinfo import get_host_info, unix_shell_argv
+from ...core.hostinfo import get_host_info, shell_argv as _shell_argv, windows_bash_exe
 from ...core.pathutil import normalize_user_path
 from ...services.skills import Skill
 from ..shell_policy import (
@@ -29,6 +29,8 @@ def _shell_host_label() -> str:
     """Short OS + shell dialect for prompts / tool descriptions."""
     info = get_host_info()
     if info.os_family == "windows":
+        if os.name == "nt" and windows_bash_exe():
+            return "Windows / PowerShell (+ Git Bash for .sh)"
         return "Windows / PowerShell"
     if info.is_kylin:
         return f"麒麟 / {info.shell}"
@@ -37,28 +39,6 @@ def _shell_host_label() -> str:
     if info.os_family == "darwin":
         return "macOS / bash"
     return f"{info.os_name} / {info.shell}"
-
-
-def _shell_argv(command: str) -> list[str]:
-    """Run via explicit shell binary — avoids Python shell=True string risks."""
-    if os.name == "nt":
-        # PowerShell so mkdir/curl aliases and modern Windows tooling work as expected.
-        # Force UTF-8 console output so child stdout isn't OEM/GBK (avoids decode crashes).
-        ps = (
-            "[Console]::OutputEncoding = [System.Text.UTF8Encoding]::new($false); "
-            "$OutputEncoding = [Console]::OutputEncoding; "
-            f"{command}"
-        )
-        return [
-            "powershell.exe",
-            "-NoProfile",
-            "-NonInteractive",
-            "-ExecutionPolicy",
-            "Bypass",
-            "-Command",
-            ps,
-        ]
-    return unix_shell_argv(command)
 
 
 def _shell_policy(settings: Settings, workspace: Path):
@@ -84,6 +64,35 @@ def _sandboxed_env(settings: Settings) -> dict[str, str]:
     from ...services.shell_sandbox import sandbox_env
 
     return sandbox_env()
+
+
+def _shell_cwd(workspace: Path) -> tuple[Optional[str], str]:
+    """Resolve + guarantee the shell's cwd exists.
+
+    A stale/deleted/renamed workspace folder makes ``subprocess.Popen`` raise
+    a bare ``[WinError 2] The system cannot find the file specified`` with no
+    hint that it was the *cwd*, not the command, that failed. Self-heal by
+    recreating the folder (it is the user's own selected root) and only
+    surface an ERROR if that is impossible.
+
+    Returns ``(error_or_none, cwd)``.
+    """
+    ws = Path(workspace)
+    try:
+        ws.mkdir(parents=True, exist_ok=True)
+    except Exception as exc:  # noqa: BLE001
+        return (
+            f"ERROR: workspace folder is unusable: {ws} ({exc}). "
+            "Re-select a valid folder in Settings before running shell commands.",
+            "",
+        )
+    if not ws.is_dir():
+        return (
+            f"ERROR: workspace path exists but is not a folder: {ws}. "
+            "Re-select a valid folder in Settings.",
+            "",
+        )
+    return None, str(ws.resolve())
 
 
 def _run_shell_background(command: str, *, cwd: str, collect_secs: float = 8.0, env: Optional[dict[str, str]] = None) -> str:

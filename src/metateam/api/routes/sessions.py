@@ -16,9 +16,24 @@ router = APIRouter(tags=["sessions"])
 
 @router.get("/api/sessions")
 def list_sessions(
-    page: int = 1, page_size: int = 20, workspace: str | None = None
+    page: int = 1,
+    page_size: int = 20,
+    workspace: str | None = None,
+    workspace_id: str | None = None,
 ) -> dict[str, Any]:
-    return STORE.list(page=page, page_size=page_size, workspace=workspace)
+    return STORE.list(page=page, page_size=page_size, workspace=workspace, workspace_id=workspace_id)
+
+
+def _workspace_ref(ws: str) -> dict[str, Any] | None:
+    if not ws:
+        return None
+    from ...services.tenant_context import workspace_settings_key
+
+    return {
+        "path": ws,
+        "name": ws.rsplit("/", 1)[-1].rsplit("\\", 1)[-1],
+        "id": workspace_settings_key(ws),
+    }
 
 
 @router.post("/api/sessions")
@@ -31,7 +46,7 @@ def create_session(body: SessionCreate = SessionCreate()) -> dict[str, Any]:
     return {
         "id": sess.id,
         "demo": sess.agent.settings.demo_mode,
-        "workspace": {"path": ws, "name": ws.rsplit("/", 1)[-1].rsplit("\\", 1)[-1]} if ws else None,
+        "workspace": _workspace_ref(ws),
     }
 
 
@@ -48,7 +63,7 @@ def get_session(session_id: str) -> dict[str, Any]:
     return {
         "id": sess.id,
         "title": sess.title,
-        "workspace": {"path": ws, "name": ws.rsplit("/", 1)[-1].rsplit("\\", 1)[-1]} if ws else None,
+        "workspace": _workspace_ref(ws),
         "messages": STORE.ui_messages(sess),
         "tokens": budget,
         "messages_tokens": messages_tokens(sess.agent.messages),

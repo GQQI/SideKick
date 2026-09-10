@@ -12,31 +12,12 @@ from dataclasses import dataclass, field
 from typing import Any, Optional
 
 from ..core.events import new_id
-from ..core.hostinfo import unix_shell_argv
+from ..core.hostinfo import augment_executable_path, shell_argv
 from .tenant_context import get_session_id, get_user_id
 
 
 def _subprocess_text_kwargs() -> dict[str, Any]:
     return {"text": True, "encoding": "utf-8", "errors": "replace"}
-
-
-def _shell_argv(command: str) -> list[str]:
-    if os.name == "nt":
-        ps = (
-            "[Console]::OutputEncoding = [System.Text.UTF8Encoding]::new($false); "
-            "$OutputEncoding = [Console]::OutputEncoding; "
-            f"{command}"
-        )
-        return [
-            "powershell.exe",
-            "-NoProfile",
-            "-NonInteractive",
-            "-ExecutionPolicy",
-            "Bypass",
-            "-Command",
-            ps,
-        ]
-    return unix_shell_argv(command)
 
 
 @dataclass
@@ -126,12 +107,15 @@ class ShellJobManager:
     ) -> ShellJob:
         uid = user_id or get_user_id()
         sid = (session_id if session_id is not None else get_session_id()) or ""
+        child_env = augment_executable_path(dict(env or os.environ))
+        child_env.setdefault("PYTHONIOENCODING", "utf-8")
+        argv = shell_argv(command)
         popen_kwargs: dict[str, Any] = {
             "cwd": cwd,
             "stdout": subprocess.PIPE,
             "stderr": subprocess.STDOUT,
             **_subprocess_text_kwargs(),
-            "env": env or {**os.environ, "PYTHONIOENCODING": "utf-8"},
+            "env": child_env,
         }
         if stdin_text:
             popen_kwargs["stdin"] = subprocess.PIPE
@@ -139,7 +123,36 @@ class ShellJobManager:
             popen_kwargs["creationflags"] = getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0)
         else:
             popen_kwargs["start_new_session"] = True
-        proc = subprocess.Popen(_shell_argv(command), **popen_kwargs)
+        try:
+            proc = subprocess.Popen(argv, **popen_kwargs)
+        except OSError as exc:
+            winerr = int(getattr(exc, "winerror", 0) or 0)
+            if winerr not in (2, 3) and not isinstance(exc, FileNotFoundError):
+                raise
+            job = ShellJob(
+                id=new_id("job"),
+                pid=0,
+                command=command,
+                cwd=cwd,
+                user_id=uid,
+                session_id=sid,
+                background=bool(background),
+                proc=None,
+                status="exited",
+                exit_code=127,
+                ended_at=time.time(),
+            )
+            exe = argv[0] if argv else "powershell.exe"
+            job.append_line(
+                f"ERROR: Win32 cannot start the shell executable {exe!r} ({exc}).\n"
+                r"PowerShell is resolved at %SystemRoot%\System32\WindowsPowerShell\v1.0\powershell.exe "
+                "(not by a bare PATH lookup). For bash/.sh scripts, install Git for Windows "
+                "so bash.exe exists, then re-run as `bash script.sh`.\n"
+            )
+            with self._lock:
+                self._jobs[job.id] = job
+                self._gc_locked()
+            return job
         if stdin_text and proc.stdin is not None:
             try:
                 proc.stdin.write(stdin_text)

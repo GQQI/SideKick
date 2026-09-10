@@ -10,7 +10,9 @@
     "start": "electron .",
     "dev": "electron . --dev",
     "dist": "electron-builder --win",
-    "dist:dir": "electron-builder --win dir"
+    "dist:dir": "electron-builder --win dir",
+    "dist:kylin": "electron-builder --linux deb AppImage tar.gz",
+    "dist:linux": "electron-builder --linux"
   },
   "devDependencies": {
     "electron": "^35.0.0",

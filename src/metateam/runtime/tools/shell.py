@@ -17,6 +17,7 @@ from .support import (
     _guard_shell,
     _sandboxed_env,
     _shell_argv,
+    _shell_cwd,
     _shell_host_label,
     _subprocess_text_kwargs,
 )
@@ -41,11 +42,14 @@ def register_shell_tools(reg: ToolRegistry, ctx: ToolContext) -> None:
             return blocked
         if _is_long_running_command(cmd):
             return "ERROR: verify_run is for one-shot checks, not long-running servers"
+        cwd_err, cwd = _shell_cwd(live_ws())
+        if cwd_err:
+            return cwd_err
         timeout = max(15, min(int(timeout_sec or 120), 600))
         try:
             proc = subprocess.run(
                 _shell_argv(cmd),
-                cwd=str(live_ws().resolve()),
+                cwd=cwd,
                 capture_output=True,
                 **_subprocess_text_kwargs(),
                 timeout=timeout,
@@ -92,8 +96,10 @@ def register_shell_tools(reg: ToolRegistry, ctx: ToolContext) -> None:
 
         from ...services.shell_jobs import JOBS, format_job_result
 
+        cwd_err, cwd = _shell_cwd(live_ws())
+        if cwd_err:
+            return cwd_err
         env = _sandboxed_env(settings)
-        cwd = str(live_ws().resolve())
         long_running = bool(background) or _is_long_running_command(low)
         try:
             want = int(timeout_sec or 0)
@@ -153,7 +159,9 @@ def register_shell_tools(reg: ToolRegistry, ctx: ToolContext) -> None:
     )
     if settings.allow_shell:
         _shell_desc = (
-            "Run a shell command in the workspace. Prefer read_file for reading files. "
+            "Run a shell command. cwd is ALWAYS the WORKSPACE root — use relative "
+            "paths in the command (e.g. `Get-ChildItem .\\src`), not another machine's "
+            "absolute path. Prefer read_file for reading files. "
             f"Host shell: {_shell_host_label()}. "
             "IMPORTANT: long scripts, training jobs, and servers should use background=true "
             "(or they are auto-moved to background if they exceed timeout). "
@@ -169,9 +177,12 @@ def register_shell_tools(reg: ToolRegistry, ctx: ToolContext) -> None:
         )
         if os.name == "nt":
             _shell_desc += (
-                " On Windows use PowerShell syntax (not bash): mkdir path; "
+                " On Windows the default dialect is PowerShell (located by full path). "
+                "Use PowerShell syntax for ordinary commands: mkdir path; "
                 "New-Item -ItemType Directory -Force; curl.exe or Invoke-WebRequest; "
-                "use ';' or separate calls instead of bash '&&' / 'mkdir -p'."
+                "use ';' instead of bash '&&' / 'mkdir -p'. "
+                "To run a .sh / bash script, invoke `bash script.sh` — Git Bash is used "
+                "when installed; do not wrap with powershell.exe."
             )
         else:
             _shell_desc += (
